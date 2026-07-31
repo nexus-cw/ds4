@@ -686,3 +686,151 @@ streaming-only, later). No NVFP4 GGUF exists for either arch (P2 blocked on ecos
 Prior art: twaggs88/DeepSeek-V4-Flash-REAP25-DSpark-ds4-GGUF — a modified-ds4-only mixed
 MXFP4/MXFP8 REAP25 build running ~24 tok/s decode on DGX Spark; independent proof of
 concept on this hardware class. Read their layout before inventing ours.
+
+
+### P1 status update (2026-08-01, cont'd): regression bisect (clean) + independent llama.cpp
+ground truth (coherent) -- confirms the correctness bug is in ds4's own MXFP4/Q3_K/Q5_K
+GPU inference path, not the artifact or the metadata/tensor-name dialect-compat layers
+
+Follow-on pass to the previous entry's "argmax token wrong" correctness flag
+(`--dump-logits` on `"Hi"`: MXFP4 argmax token 223 " " vs IQ2_XXS baseline's correct
+token 19923 "Hello"). Per the debug plan's own cost-ordering, ran the two cheapest
+discriminators before touching any code.
+
+**1. Regression bisect (verdict: CLEAN)**: ran the known-good IQ2_XXS baseline
+(`gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf`, same
+`deepseek4`/FLASH architecture, no `--ssd-streaming` needed -- fits resident) through the
+**current** binary (`b15cc29`), `--cuda`, `--nothink -p "Hi" --dump-logits`. Argmax:
+token 19923 "Hello", logit 27.97 -- byte-identical to the pre-FP4-port expectation, and
+the run log shows **zero** dialect-compat/conversion notices (`grep -i
+'compat|dialect|clamp'` on the log: no matches). This proves two things at once: (a) the
+shared loader/dense-conversion machinery this port added is a true no-op for a file that
+doesn't need it (no regression to the working path), and (b) baseline never exercises
+*any* of the new FP4-port code (metadata-key compat, tensor-name alias compat,
+BF16/Q6_K/F32 dense conversion, MXFP4/Q3_K/Q5_K dequant, or the streaming
+selected-expert-cache generalization) -- so whatever is wrong is confined to that new
+code, exactly as the debug plan anticipated, with no need to bisect the commit chain.
+
+**2. Ground truth via independent llama.cpp @5f55650 (verdict: ARTIFACT IS CORRECT --
+COHERENT OUTPUT)**: vanilla llama.cpp cannot load this GGUF any more directly than ds4
+originally could -- it hits the identical missing-metadata-key wall ds4's compat layer
+was built to paper over (`key not found in model: deepseek4.attention.output_group_count`,
+then, once patched, `deepseek4.expert_gating_func`, a ninth required key this port's own
+compat layer never needed to touch because ds4 hardcodes sqrt-softplus router scoring
+unconditionally for the deepseek4 family rather than reading it from metadata -- new
+finding, noted below), and then the identical tensor-name dialect mismatch ds4's
+tensor-alias compat layer was built to paper over (`missing tensor 'output_hc_fn.weight'`).
+Rather than treat this as a dead end, built a disposable (not committed --
+`/tmp/patch_gguf_full.py` on robo-dog, same throwaway-tooling precedent as
+`gguf_header_check.py`/`gguf_dump.py` from earlier passes) GGUF metadata+tensor-name
+patcher: it rewrites only the header (KV pairs + tensor-info table) in a new output file,
+adding the 9 metadata keys ds4's own compat layer derives (byte-identical values -- 8,
+1024, 3, 4, 20, 1e-6, 160000.0, the 43-entry compress-ratio array, and the one new key,
+`expert_gating_func=4`/`LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS`) and renaming every
+tensor from this file's alias dialect to llama.cpp's own canonical names (the exact
+reverse of ds4's `find_tensor_alias()` table, cross-checked against
+`src/llama-arch.cpp`'s `LLM_TENSOR_*` string table directly rather than guessed) --
+then appends the original 150GB tensor-data blob **unchanged** (tensor offsets are
+relative to the data section start, so no per-tensor byte editing is needed, only a
+~1-4KB header-growth shift; verified via the delta printed each run, e.g. 640 bytes for
+the metadata-only patch). No tensor bytes are touched at any point -- ground truth is
+against the exact same weight bytes ds4 reads.
+
+Loaded successfully with `llama-cli` (CPU-only build, `-DGGML_CUDA=OFF`, since this
+donor-inventory box's driver/toolkit didn't need testing here -- CPU is sufficient for one
+forward pass per the ticket's own allowance) at `--ctx-size 2048 --temp 0 --top-k 1`:
+
+```
+> Hi
+Hello! How can I help you today?
+[ Prompt: 2.1 t/s | Generation: 1.3 t/s ]
+```
+
+Coherent, on-topic, grammatical -- matching the IQ2_XXS baseline's own correct behavior on
+the same prompt. **This conclusively rules out the artifact itself** (the checkpoint hunt
+picked a good file) **and, more specifically, rules out the metadata-key and
+tensor-name dialect-compat layers as the bug source**: an independently-written loader
+(llama.cpp, sharing no code with ds4 beyond both being MIT ports of the same upstream
+dequant/architecture logic) given the exact same derived metadata values and the exact
+same tensor-to-role bindings produces correct output. The bug is therefore isolated to
+ds4's own MXFP4/Q3_K/Q5_K GPU numerical/wiring path: the dequant kernels
+(`mxfp4_dequant_f16_kernel`/`q3_k_dequant_f16_kernel`/`q5_k_dequant_f16_kernel`,
+`ds4_cuda.cu`), the generic dequant+GEMM dispatch
+(`routed_moe_dequant_gemm_dispatch`/`dequant_gemm_row_f16gemm`), the BF16/Q6_K/F32
+dense-tensor load-time conversion (`model_convert_dense_bf16_q6k`, `ds4.c`), or the
+SSD-streaming selected-expert-cache wiring landed in the immediately preceding commit
+(`b15cc29`) -- not the file, and not the two dialect-compat layers from the two passes
+before that.
+
+**New finding not previously documented**: llama.cpp's deepseek4 loader *requires*
+`deepseek4.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS` (4) and
+throws otherwise (`src/models/deepseek4.cpp:51-53`, "DeepSeek-V4 loader currently expects
+sqrtsoftplus MoE scoring"). This artifact's community conversion omits this key too (a
+tenth metadata gap beyond the eight this port's metadata-compat layer already handles),
+but ds4 was never affected because it never reads this key at all for the deepseek4
+family -- it hardcodes `sqrt(softplus(logit))` router scoring unconditionally
+(`ds4.c`, `softplus_stable()` / the "Router scores use sqrt(softplus(logit))" comment
+ahead of the routing-probability computation), which happens to already be the correct
+(and only, per llama.cpp) DeepSeek-V4 gating function. No ds4 change needed here; noted
+for completeness since it came up investigating ground truth, and as a decision precedent
+if a future artifact ever needs this key surfaced.
+
+**Localization attempted, inconclusive by inspection (root cause NOT found this pass)**:
+manually re-read every candidate area the debug plan's step 3 lists, cross-checking
+against the exact `sizeof(block_*)`/`gguf_type_info` registry entries and the actual
+llama.cpp-donor dequant algorithms line-by-line, and found no structural defect:
+
+- MXFP4/Q3_K/Q5_K CUDA dequant kernels (`ds4_cuda.cu`): `kvalues_mxfp4_dev` table and
+  `mxfp4_e8m0_to_fp32_half_dev` match the standard E2M1/E8M0 constants; block sizes
+  (17/110/176 bytes, 32/256/256 elements) match `gguf_type_info[39]`/`sizeof(block_q3_K)`/
+  `sizeof(block_q5_K)` exactly; the row-major `[out_dim][in_dim]` write layout in each
+  kernel matches the `cublasGemmEx(CUBLAS_OP_T, CUBLAS_OP_N, ...)` call's expected weight
+  orientation in `dequant_gemm_row_f16gemm`. (Independent CPU reference ports in
+  `test_mxfp4_moe.c`/`test_mixed_moe.c` already validated the underlying math in
+  isolation, per the 2026-08-01 P1 entry above; this pass additionally confirmed the CUDA
+  kernels' byte-layout constants against the registry rather than re-deriving the math.)
+- `routed_expert_row_bytes()`/`routed_expert_block_bytes()` (`ds4.c`): generic,
+  registry-driven, no MXFP4/Q3_K/Q5_K-specific special-casing that could introduce an
+  off-by-one; `streaming_layer_routed_expert_bytes()`/`streaming_layer_gate_down_expert_bytes()`
+  compute gate/up/down per-expert byte strides independently per tensor's own type, which
+  is required (and correctly implemented) for the real artifact's mixed MXFP4-gate/
+  Q3_K-or-Q5_K-down layers.
+- Tensor-name aliasing (`find_tensor_alias()` call sites, `ds4.c` ~6490-6650): every
+  canonical/alias pair matches this pass's own independently-derived llama.cpp
+  `LLM_TENSOR_*` name table exactly (cross-checked while building the ground-truth
+  patcher's rename map) -- no swapped or mistargeted alias found.
+- `model_convert_dense_bf16_q6k()` (`ds4.c`): `bf16_to_f32` (zero-extend + bitcast) and
+  `dequantize_row_q6_K` (ported line-for-line, same idiom as Q3_K/Q5_K) look correct by
+  inspection; the `tensor_is_dense_conversion_candidate()` ndim<=2 filter structurally
+  cannot catch a 3D routed-expert tensor.
+- `routed_moe_dequant_gemm_dispatch()`'s per-pair loop (`ds4_cuda.cu`): gate/up/down
+  buffer assignments, the SiLU(gate)*up*routing-weight combine order, and the
+  `moe_sum_kernel`/`moe_sum_owned_kernel` reuse are all consistent with the fused
+  Q4_K/IQ2_XXS paths' own conventions.
+- `b15cc29`'s streaming selected-expert-cache wiring
+  (`metal_graph_dequant_gemm_selected_slots_type()` and its two call sites): small,
+  mechanical, mirrors the pre-existing Q4_K/IQ2_XXS predicates exactly; no asymmetry
+  found between the two populate paths (per-token decode vs batched prefill vs the
+  hash-layer override).
+
+None of this rules out a subtle bug in any of the above (inspection is not proof), but it
+means the remaining root-causing work needs runtime evidence, not more reading: the debug
+plan's own step 3a (dump ds4's post-load/post-dequant tensor bytes for one known routed
+expert row and diff against an independent Python dequant of the same raw file bytes) is
+the next concrete, cheap step and was not reached this pass due to time spent on the
+ground-truth detour above (justified, since it eliminated three of the plan's five
+localization candidate categories -- artifact, metadata compat, tensor-name compat -- in
+one shot, collapsing the remaining search space from "five suspect areas" to "the GPU
+MXFP4/Q3_K/Q5_K numerical/wiring path specifically").
+
+**No code change made this pass** -- nothing to fix yet, root cause not isolated to a
+specific line. Per the ticket's own stop-and-document instruction, reporting rather than
+guessing at a patch. `make cuda-spark` / `./ds4_test` not re-run (no source changed).
+
+**Artifacts left on robo-dog for follow-up** (not committed, disposable):
+`/tmp/patch_gguf_metadata.py`, `/tmp/patch_gguf_full.py` (the ground-truth GGUF patcher,
+reusable for future ds4-vs-llama.cpp comparisons on this or similar community
+conversions), `~/src/llama.cpp/build` (CPU-only build @5f55650), and
+`~/src/ds4/gguf/DeepSeek-V4-Flash-MXFP4_MOE.patched.gguf` (150GB, the fully-patched
+ground-truth file -- safe to delete to reclaim disk if not needed for a follow-up run;
+285GB free on `/` as of this pass).
