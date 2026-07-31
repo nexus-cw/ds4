@@ -178,6 +178,90 @@ per the "Target artifact" section below, so a full-residency load was never goin
 succeed regardless of quant-type support; that's the `--ssd-streaming` P1 validation, not
 yet run against this file).
 
+### P1 status update (2026-07-31): deepseek4 GGUF dialect compat + first non-metadata blocker
+
+First `--inspect` attempt against the real target artifact died immediately:
+`required metadata key is missing: deepseek4.attention.output_lora_rank`. A header-only
+scan (throwaway `gguf_dump.py`, same idiom as the prior pass's `gguf_header_check.py`, not
+committed) plus a full read of `config_validate_deepseek4_model()`
+(`ds4.c`) diffed against llama.cpp `@5f55650`'s own deepseek4 loader
+(`src/models/deepseek4.cpp::load_arch_hparams`, which requires the exact same keys via
+`ml.get_key(..., required=true)` with **no fallback of its own**) established the real
+picture: this is not a key-renaming dialect difference antirez's converter would recognize
+under another name -- the community conversion (produced by an earlier/lighter
+`convert_hf_to_gguf.py` than the one at donor HEAD, whose `DeepseekV4Model.set_gguf_parameters`
+writes these same keys unconditionally from `config.json`) simply **omits** eight required
+keys outright: `attention.output_lora_rank`, `attention.output_group_count`,
+`hash_layer_count`, `hyper_connection.count`, `hyper_connection.sinkhorn_iterations`,
+`hyper_connection.epsilon`, `attention.compress_rope_freq_base`, and the
+`attention.compress_ratios` array. Every other required deepseek4 key in the file (28 of
+36) matches ds4's compiled-in `DS4_SHAPE_FLASH` profile exactly.
+
+**Compat layer** (`ds4.c`, new block ahead of `config_validate_deepseek4_model`): for each
+missing key, recovers the value -- in preference order -- from (1) tensor shapes/presence
+already in the file, tying the value to exactly what llama.cpp's own tensor-creation code
+derives it from, or (2), only where no tensor encodes the value, the exact constant ds4
+already hardcodes and validates every *present* key against for the shape identified from
+the file's other required keys. Nothing is guessed from outside these two sources, and a
+one-line notice prints per compat fallback so a run is honest about it being active:
+
+- `output_lora_rank` / `output_group_count`: llama.cpp creates `wo_a` (`attn_output_a`) =
+  `{n_head*n_embd_head/o_groups, o_lora_rank*o_groups}` and `wo_b` (`attn_output_b`) =
+  `{o_groups*o_lora_rank, n_embd}` -- both hparams are exactly recoverable from the two
+  tensors' `dim0` given already-required `n_head`/`key_length`. Verified: derives 8 / 1024,
+  matching `DS4_SHAPE_FLASH` exactly.
+- `hyper_connection.count`: llama.cpp creates `hc_attn_fn` = `{hc_mult*n_embd,
+  (2+hc_mult)*hc_mult}`, so `hc_mult = dim0(hc_attn_fn) / n_embd`. Verified: derives 4,
+  cross-checked against `dim1` too (`(2+4)*4 = 24`, matches the file's tensor exactly).
+- `hash_layer_count`: llama.cpp only creates `blk.<i>.ffn_gate_tid2eid` for
+  `i < hash_layer_count`; counting the contiguous run of present tensors from layer 0
+  recovers the exact count. Verified: derives 3 (layers 0-2 have the tensor, layer 3
+  doesn't), matching `DS4_SHAPE_FLASH` exactly.
+- `attention.compress_ratios` (array): `ds4_expected_layer_compress_ratio()` (pre-existing,
+  `ds4.c`) already encodes, per shape, the exact per-layer pattern this array is normally
+  *validated against* -- when the array itself is missing, that expected pattern is used
+  directly rather than dying (it's not a guess, it's the ground truth the array is always
+  required to equal anyway). Cross-checked independently against tensor presence/shape: the
+  file's `blk.{40,42}.attn_compress_*` tensors imply ratio 4 and `blk.41.attn_compress_*`
+  implies ratio 128 at those exact layers, matching the FLASH pattern's `il&1` alternation.
+- `hyper_connection.sinkhorn_iterations`, `hyper_connection.epsilon`,
+  `attention.compress_rope_freq_base`: none of these are tensor-derivable (pure algorithm
+  scalars/RoPE base, not shape parameters), and llama.cpp's own loader has no fallback for
+  them either -- so these are the one fallback tier below tensor-derivation: the exact value
+  ds4 already hardcodes for the shape identified via `block_count` (unique across
+  `DS4_SHAPE_FLASH`/`DS4_SHAPE_PRO`) and validates every other key against. Noted as the
+  weakest-evidence tier in code comments; `compress_rope_freq_base`'s fallback value (160000)
+  is at least corroborated by the file's own (otherwise-unused-by-ds4)
+  `deepseek4.rope.freq_base_swa = 160000.0`.
+
+**Result**: `--inspect` (`--cuda --ssd-streaming --ssd-streaming-cold
+--ssd-streaming-cache-experts 8GB`) now gets past all metadata validation (prints all 8
+compat notices, then the pre-existing shape/tensor-layout checks) and reaches the first
+**non-metadata** blocker: `required tensor is missing: output_hc_base.weight`. This is a
+genuine tensor **naming** mismatch, not a metadata gap -- confirmed by header scan: the
+file's top-level (non-per-layer) hyper-connection head tensors are named `hc_head_base`,
+`hc_head_fn`, `hc_head_scale` (no `.weight` suffix, GGML type F32/F16), while
+`weights_bind_output()` (`ds4.c`) requires `output_hc_base.weight`, `output_hc_fn.weight`,
+`output_hc_scale.weight`. Per-layer hc tensors (`blk.<i>.hc_attn_fn` etc.) and the ordinary
+`output.weight`/`output_norm.weight`/`token_embd.weight` names already match between ds4 and
+the file -- only this one top-level triplet differs. Per the ticket's own instruction, this
+is reported rather than improvised: a tensor-name mapping (and a check for whether any other
+top-level or per-layer tensor names differ further into the load path) is real follow-up
+work but out of scope for this pass.
+
+**Verification**: `make cuda-spark` -- clean build from `make clean`, no warnings. `make
+test` / `./ds4_test` -- ran twice against the patched binary and twice against the
+pre-patch binary (`git stash`) for comparison; failure counts fluctuated run-to-run on
+*both* (5-6 on unpatched, 10-11 on patched) with different individual tests (`tool-call-quality`,
+`think-tool-recovery`, `logprob-vectors`, `metal-kernels`, `metal-tensor-equivalence`)
+flipping OK/ERR between runs of the *identical* unpatched binary -- i.e. this suite has
+pre-existing run-to-run nondeterminism on this hardware unrelated to this change. Code
+review also confirms the patch is a no-op whenever a key is present (the compat helpers all
+try `model_get_u32`/`model_get_f32_compat` first and return immediately on success, byte
+identical to the prior `required_u32`/`required_f32` behavior), which the existing/pre-patch
+test fixture GGUF exercises throughout (no compat branch fires when running `make test`'s
+own model). No regression attributable to this change.
+
 ## Target artifact
 
 Chosen (checkpoint hunt 2026-07-31): **lovedheart/DeepSeek-V4-Flash-GGUF**
