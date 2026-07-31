@@ -59,13 +59,14 @@ ds4 head start: E2M1 value table + nearest-value dequant already exist (activati
 
 ## Target artifact
 
-Phase 1 needs an MXFP4_MOE GGUF of an architecture ds4 implements (DeepSeek-V4-Flash or
-GLM-5.2). Options (checkpoint hunt in progress):
+Chosen (checkpoint hunt 2026-07-31): **lovedheart/DeepSeek-V4-Flash-GGUF**
+`DeepSeek-V4-Flash-MXFP4_MOE.gguf` — single file, 150GB, standard GGML MXFP4 experts +
+Q8_0 everything else. Bigger than the 121GB pool → genuine streaming target.
 
-- Ready-made FP4 GGUF from a quantizer account, if one exists.
-- Self-convert: BF16/FP8 original → `convert_hf_to_gguf.py` → `llama-quantize MXFP4_MOE`.
-  Needs staging disk for the source checkpoint (dMon has the fast striped storage; robo-dog
-  frees ~429GB when the colibri int4 copy is reclaimed).
+Alternatives noted: nsparks/DeepSeek-V4-Flash-FP4-FP8-GGUF (156GB, native-precision but
+nonstandard FP8-block dense type); GLM-5.2 via MaliAir MXFP4_MOE (411GB / 77 shards,
+streaming-only, later). No NVFP4 GGUF exists for either arch (P2 blocked on ecosystem).
 
-Expected size, DeepSeek-V4-Flash at MXFP4_MOE (~4.4-5.0 whole-file bpw): ~165-195GB —
-bigger than the 121GB memory pool, i.e. a genuine streaming target, which is the point.
+Prior art: twaggs88/DeepSeek-V4-Flash-REAP25-DSpark-ds4-GGUF — a modified-ds4-only mixed
+MXFP4/MXFP8 REAP25 build running ~24 tok/s decode on DGX Spark; independent proof of
+concept on this hardware class. Read their layout before inventing ours.
