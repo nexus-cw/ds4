@@ -96,6 +96,88 @@ execution is what's covered by this pass.
 - **P3 — speed**: native decode dot-product (vecdotq) then sm_121 tensor-core MMA prefill
   path. Only after P1 quality is proven.
 
+### P1 status update (2026-08-01): Q3_K port + generalized routed-MoE fallback
+
+The real target artifact's routed experts are **not** uniformly MXFP4: a header-only scan
+of `DeepSeek-V4-Flash-MXFP4_MOE.gguf` (see below) shows 98 `ffn_{gate,up}_exps`/`ffn_down_exps`
+tensors as MXFP4 (type 39), 30 as Q3_K (type 11), and 1 as Q5_K (type 13), across 43 MoE
+layers (43*3 = 129 routed-expert tensors total). ds4 had zero Q3_K support before this
+pass (not in `gguf_type_info`'s enum constants/whitelist at all), so any layer with a Q3_K
+tensor previously died at load (`tensor_expect_routed_expert` -> `ds4_die`) before MXFP4 was
+ever exercised. Q5_K was already a supported routed-expert *type* in the whitelist, but had
+no CPU dequant-to-float or CUDA dequant-to-f16 kernel anywhere in the codebase (only fused
+`vec_dot_q5_K_*` dot-product helpers) -- so it worked wherever a fused/vec_dot path covered
+it, but not through the new dequant+GEMM fallback family MXFP4 introduced in 3238a16.
+
+**Q3_K port** (`ds4.c`): `block_q3_K` struct + `DS4_STATIC_ASSERT` (110 bytes), `DS4_TENSOR_Q3_K`
+enum constant (11 -- the `gguf_type_info[11]` registry row already existed, just unused by
+the enum/whitelist), `dequantize_row_q3_K` (CPU, ported line-for-line from llama.cpp
+`ggml-quants.c` @5f55650, MIT), and whitelisting in `tensor_is_routed_expert_type` /
+`routed_expert_block_bytes`. CUDA: `q3_k_dequant_f16_kernel` (`ds4_cuda.cu`), one thread per
+QK_K=256-element super-block, same "phase 1 correctness not throughput" idiom as
+`mxfp4_dequant_f16_kernel`.
+
+**Q5_K dequant added** (had none): CPU `dequantize_row_q5_K` (`ds4.c`, ported from llama.cpp,
+reuses the existing `q4_k_get_scale_min` helper -- Q5_K shares Q4_K's packed 6-bit scale/min
+layout plus a high-bit mask) and CUDA `q5_k_dequant_f16_kernel` (`ds4_cuda.cu`, reuses the
+existing `dev_q4_K_get_scale_min` device helper).
+
+**Generalized dispatch** (`ds4_cuda.cu`): the MXFP4-only branch from 3238a16
+(`mxfp4_path = gate_type == down_type == 39`, `routed_moe_mxfp4_dispatch`,
+`mxfp4_matmul_row_f16gemm`) is now a generic dequant+GEMM fallback family:
+`dequant_gemm_type_supported`/`_block_elems`/`_block_bytes`/`launch_dequant_f16` (a small
+type -> {MXFP4, Q3_K, Q5_K} dequant-kernel table), `dequant_gemm_row_f16gemm` (generalized
+`mxfp4_matmul_row_f16gemm`, takes a `type` param), and `routed_moe_dequant_gemm_dispatch`
+(generalized `routed_moe_mxfp4_dispatch`, takes `gate_type`/`down_type` and looks each up in
+the table independently). `routed_moe_launch`'s branch selection became `dequant_gemm_path =
+!q4k_path && !iq2_q2k_path && dequant_gemm_type_supported(gate_type) &&
+dequant_gemm_type_supported(down_type)` -- a strict fallback: the fused Q4_K / IQ2_XXS+Q2_K
+tile-kernel branches still win whenever they match; this is only taken otherwise. Because
+gate and down are looked up independently, a layer with MXFP4 gate/up and Q3_K (or Q5_K)
+down experts dispatches through the same loop, each half using its own dequant kernel --
+exactly the real artifact's shape.
+
+**Scope note on gate vs. up type**: `routed_moe_launch` (and its whole call chain --
+`ds4_gpu_routed_moe_one_tensor`/`_batch_tensor`/`_batch_owned_tensor`, ~14 call sites in
+`ds4.c`) has only ever taken `gate_type` and `down_type`, never a separate `up_type` --
+this predates the FP4 port. That's not an oversight: ds4 enforces gate_type == up_type as a
+hard **load-time** invariant across every model family (`ds4.c`, e.g. "routed gate/up
+experts use different quant types" -> `exit(1)`/`ds4_die`, ~8 call sites spanning DeepSeek,
+GLM, MTP, DSpark loaders), so by the time any routed-MoE dispatcher runs, gate and up are
+already guaranteed identical. A genuinely independent gate != up type (beyond down
+differing) would require relaxing that invariant everywhere it's enforced -- a real
+cross-cutting architecture change, not attempted here; not needed for the real artifact
+either, confirmed by the header scan below (`gate_type == up_type` holds for all 43 layers).
+
+**Header-only validation of the real artifact** (`research/gb10/gguf_header_check.py`, not
+committed -- see below -- a throwaway metadata-prefix GGUF parser: magic/version/counts, KV
+pairs, then the tensor-info table, stopping before the 150GB tensor-data blob, so it runs in
+~0.1s without touching most of the file): confirms `general.architecture=deepseek4`,
+1328 tensors total, 129 `*_exps` tensors (98 MXFP4 / 30 Q3_K / 1 Q5_K) across 43 layers,
+`gate_type == up_type` for every layer, and down-type distribution `{Q3_K: 10, MXFP4: 32,
+Q5_K: 1}` layers -- i.e. every type combination this pass added support for is exactly what
+the file needs, and nothing else appears among routed-expert tensors. (This script was a
+disposable validation aid, run from `/tmp` on robo-dog against the live file; not added to
+the repo since it duplicates functionality a real `gguf-tools` inspector would better own if
+this becomes a recurring need.)
+
+**Tests**: `research/gb10/test_mixed_moe.c`, new -- extends the `test_mxfp4_moe.c` pattern
+with standalone (non-ds4.c) ports of `dequantize_row_q3_K`/`dequantize_row_q5_K` and runs 6
+cases through the public `ds4_gpu_routed_moe_batch_tensor()`: MXFP4 gate/up + Q3_K down
+(decode- and prefill-shaped), MXFP4 gate/up + Q5_K down (decode- and prefill-shaped), and
+Q3_K-only / Q5_K-only single-type sanity cases, all checked against an independent CPU
+dequant+matvec reference. All 6 pass. The pre-existing `test_mxfp4_dequant.c` and
+`test_mxfp4_moe.c` self-tests still pass unmodified after the generalization (confirms the
+refactor didn't regress the original MXFP4-only path).
+
+**No full-file load test was run**: ds4 has no `--info`/`--show`/header-only CLI mode, and a
+real `./ds4 -m ...` load would mmap and (for CUDA-resident, non-`--ssd-streaming` runs)
+upload the full 150GB to the unified-memory GPU pool -- not attempted here (out of scope for
+a header/dequant-correctness pass, and the file is larger than the documented 121GB pool
+per the "Target artifact" section below, so a full-residency load was never going to
+succeed regardless of quant-type support; that's the `--ssd-streaming` P1 validation, not
+yet run against this file).
+
 ## Target artifact
 
 Chosen (checkpoint hunt 2026-07-31): **lovedheart/DeepSeek-V4-Flash-GGUF**

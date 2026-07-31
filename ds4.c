@@ -763,6 +763,18 @@ typedef struct {
     uint16_t dmin;
 } block_q2_K;
 
+/* Q3_K (GGUF tensor type 11): 3-bit quantization, 16 sub-blocks of 16
+ * elements each within a QK_K=256 super-block; per-sub-block 6-bit scale
+ * plus a super-block f16 scale, with a separate high-bit mask extending
+ * the 2-bit "qs" quants to 3 bits.
+ * ported from llama.cpp (MIT) ggml-common.h block_q3_K @5f55650 */
+typedef struct {
+    uint8_t  hmask[QK_K / 8]; /* quants - high bit */
+    uint8_t  qs[QK_K / 4];    /* quants - low 2 bits */
+    uint8_t  scales[12];      /* scales, quantized with 6 bits */
+    uint16_t d;               /* super-block scale */
+} block_q3_K;
+
 typedef struct {
     uint16_t d;
     uint16_t dmin;
@@ -815,6 +827,7 @@ static const int8_t kvalues_mxfp4[16] = {
 
 #define DS4_STATIC_ASSERT(name, cond) typedef char name[(cond) ? 1 : -1]
 DS4_STATIC_ASSERT(ds4_block_q2_k_size, sizeof(block_q2_K) == 84);
+DS4_STATIC_ASSERT(ds4_block_q3_k_size, sizeof(block_q3_K) == 110);
 DS4_STATIC_ASSERT(ds4_block_q4_k_size, sizeof(block_q4_K) == 144);
 DS4_STATIC_ASSERT(ds4_block_q5_k_size, sizeof(block_q5_K) == 176);
 DS4_STATIC_ASSERT(ds4_block_q6_k_size, sizeof(block_q6_K) == 210);
@@ -2062,6 +2075,7 @@ enum {
     DS4_TENSOR_Q4_0     = 2,
     DS4_TENSOR_Q8_0     = 8,
     DS4_TENSOR_Q2_K     = 10,
+    DS4_TENSOR_Q3_K     = 11,
     DS4_TENSOR_Q4_K     = 12,
     DS4_TENSOR_Q5_K     = 13,
     DS4_TENSOR_Q6_K     = 14,
@@ -3530,6 +3544,49 @@ static inline float mxfp4_value_f32(const block_mxfp4 *blocks, uint32_t k) {
     return (float)kvalues_mxfp4[nibble] * d;
 }
 
+/* CPU dequant: block_q3_K -> contiguous float row of length k (k % 256 == 0).
+ * ported from llama.cpp (MIT) ggml-quants.c dequantize_row_q3_K @5f55650 */
+static DS4_MAYBE_UNUSED void dequantize_row_q3_K(const block_q3_K *x, float *y, int64_t k) {
+    const int64_t nb = k / QK_K;
+    const uint32_t kmask1 = 0x03030303u;
+    const uint32_t kmask2 = 0x0f0f0f0fu;
+    uint32_t aux[4];
+    const int8_t *scales = (const int8_t *)aux;
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float d_all = f16_to_f32(x[i].d);
+        const uint8_t *q = x[i].qs;
+        const uint8_t *hm = x[i].hmask;
+        uint8_t m = 1;
+
+        memcpy(aux, x[i].scales, 12);
+        uint32_t tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+        aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+        aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+        aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+
+        int is = 0;
+        float dl;
+        for (int n = 0; n < QK_K; n += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; ++j) {
+                dl = d_all * (scales[is++] - 32);
+                for (int l = 0; l < 16; ++l) {
+                    *y++ = dl * ((int8_t)((q[l + 0] >> shift) & 3) - ((hm[l + 0] & m) ? 0 : 4));
+                }
+                dl = d_all * (scales[is++] - 32);
+                for (int l = 0; l < 16; ++l) {
+                    *y++ = dl * ((int8_t)((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4));
+                }
+                shift += 2;
+                m <<= 1;
+            }
+            q += 32;
+        }
+    }
+}
+
 static inline float q2_k_value_f32(const block_q2_K *blocks, uint32_t k) {
     const uint32_t block = k / QK_K;
     const uint32_t idx = k - block * QK_K;
@@ -3764,6 +3821,34 @@ static float ds4_vec_dot_q4_K_f32(int n, const block_q4_K *x, const float *y) {
     }
 
     return sumf;
+}
+
+/* CPU dequant: block_q5_K -> contiguous float row of length k (k % 256 == 0).
+ * Reuses q4_k_get_scale_min (Q5_K shares Q4_K's packed 6-bit scale/min
+ * layout, adding a high-bit mask "qh" on top of the 4-bit "qs" quants).
+ * ported from llama.cpp (MIT) ggml-quants.c dequantize_row_q5_K @5f55650 */
+static DS4_MAYBE_UNUSED void dequantize_row_q5_K(const block_q5_K *x, float *y, int64_t k) {
+    const int64_t nb = k / QK_K;
+    for (int64_t i = 0; i < nb; i++) {
+        const uint8_t *ql = x[i].qs;
+        const uint8_t *qh = x[i].qh;
+        const float d = f16_to_f32(x[i].d);
+        const float min = f16_to_f32(x[i].dmin);
+
+        int is = 0;
+        uint8_t sc, m;
+        uint8_t u1 = 1, u2 = 2;
+        for (int j = 0; j < QK_K; j += 64) {
+            q4_k_get_scale_min(is + 0, x[i].scales, &sc, &m);
+            const float d1 = d * (float)sc, m1 = min * (float)m;
+            q4_k_get_scale_min(is + 1, x[i].scales, &sc, &m);
+            const float d2 = d * (float)sc, m2 = min * (float)m;
+            for (int l = 0; l < 32; ++l) *y++ = d1 * ((ql[l] & 0xF) + (qh[l] & u1 ? 16 : 0)) - m1;
+            for (int l = 0; l < 32; ++l) *y++ = d2 * ((ql[l] >> 4) + (qh[l] & u2 ? 16 : 0)) - m2;
+            ql += 32; is += 2;
+            u1 <<= 2; u2 <<= 2;
+        }
+    }
 }
 
 static float ds4_vec_dot_q5_K_f32(int n, const block_q5_K *x, const float *y) {
@@ -4435,6 +4520,7 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 ||
            type == DS4_TENSOR_IQ2_XXS ||
            type == DS4_TENSOR_Q2_K ||
+           type == DS4_TENSOR_Q3_K ||
            type == DS4_TENSOR_Q4_K ||
            type == DS4_TENSOR_Q5_K ||
            type == DS4_TENSOR_Q6_K ||
@@ -4446,6 +4532,7 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     case DS4_TENSOR_Q8_0:    return 34;
     case DS4_TENSOR_IQ2_XXS: return sizeof(block_iq2_xxs);
     case DS4_TENSOR_Q2_K:    return sizeof(block_q2_K);
+    case DS4_TENSOR_Q3_K:    return sizeof(block_q3_K);
     case DS4_TENSOR_Q4_K:    return sizeof(block_q4_K);
     case DS4_TENSOR_Q5_K:    return sizeof(block_q5_K);
     case DS4_TENSOR_Q6_K:    return sizeof(block_q6_K);

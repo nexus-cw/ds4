@@ -20890,28 +20890,188 @@ __global__ static void moe_down_f32_kernel(
     if (threadIdx.x == 0) down_out[(uint64_t)pair * out_dim + row] = partial[0];
 }
 
-/* MXFP4 routed-expert MoE support (P1 correctness path).
+/* Q3_K (GGUF tensor type 11) streaming dequant for the generic
+ * dequant+GEMM routed-MoE fallback below. Mirrors ds4.c's
+ * dequantize_row_q3_K (itself ported from llama.cpp ggml-quants.c
+ * @5f55650, MIT) line-for-line, but writes __half output and covers one
+ * QK_K=256-element super-block per thread -- same "phase 1 correctness,
+ * not throughput" idiom as mxfp4_dequant_f16_kernel above. Block layout
+ * (110 bytes): hmask[32], qs[64], scales[12], d (f16, 2 bytes). */
+__global__ static void q3_k_dequant_f16_kernel(
+        __half *out,
+        const unsigned char *w,
+        uint64_t total_blocks,
+        uint32_t blocks_per_row,
+        uint32_t in_dim) {
+    const uint64_t b = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= total_blocks) return;
+    const unsigned char *blk = w + b * 110u;
+    const unsigned char *hm = blk;
+    const unsigned char *qp0 = blk + 32u;
+    const unsigned char *sc8 = blk + 96u;
+    const float d_all = __half2float(*reinterpret_cast<const __half *>(blk + 108));
+
+    uint32_t aux[4];
+    memcpy(aux, sc8, 12);
+    const uint32_t kmask1 = 0x03030303u;
+    const uint32_t kmask2 = 0x0f0f0f0fu;
+    const uint32_t tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+    aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    const int8_t *scales = reinterpret_cast<const int8_t *>(aux);
+
+    const uint64_t row = b / blocks_per_row;
+    const uint32_t col = (uint32_t)(b - row * blocks_per_row) * 256u;
+    __half *dst = out + row * in_dim + col;
+
+    int is = 0;
+    uint8_t m = 1;
+    const unsigned char *qp = qp0;
+    int oi = 0;
+    for (int n = 0; n < 256; n += 128) {
+        int shift = 0;
+        for (int j = 0; j < 4; j++) {
+            float dl = d_all * (float)(scales[is++] - 32);
+            for (int l = 0; l < 16; l++) {
+                int8_t v = (int8_t)((qp[l + 0] >> shift) & 3) - ((hm[l + 0] & m) ? 0 : 4);
+                dst[oi++] = __float2half(dl * (float)v);
+            }
+            dl = d_all * (float)(scales[is++] - 32);
+            for (int l = 0; l < 16; l++) {
+                int8_t v = (int8_t)((qp[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4);
+                dst[oi++] = __float2half(dl * (float)v);
+            }
+            shift += 2;
+            m = (uint8_t)(m << 1);
+        }
+        qp += 32;
+    }
+}
+
+/* Q5_K (GGUF tensor type 13) streaming dequant, same fallback role as
+ * q3_k_dequant_f16_kernel above. Mirrors ds4.c's dequantize_row_q5_K
+ * (ported from llama.cpp ggml-quants.c @5f55650, MIT), reusing the
+ * existing dev_q4_K_get_scale_min helper (Q5_K shares Q4_K's packed
+ * 6-bit scale/min layout, adding a high-bit mask "qh" on the 4-bit
+ * "qs" quants). Block layout (176 bytes): d, dmin (f16 each), scales[12],
+ * qh[32], qs[128]. */
+__global__ static void q5_k_dequant_f16_kernel(
+        __half *out,
+        const unsigned char *w,
+        uint64_t total_blocks,
+        uint32_t blocks_per_row,
+        uint32_t in_dim) {
+    const uint64_t b = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= total_blocks) return;
+    const unsigned char *blk = w + b * 176u;
+    const float d = __half2float(*reinterpret_cast<const __half *>(blk + 0));
+    const float dmin = __half2float(*reinterpret_cast<const __half *>(blk + 2));
+    const uint8_t *scales = blk + 4;
+    const uint8_t *qh = blk + 16;
+    const uint8_t *ql0 = blk + 48;
+
+    const uint64_t row = b / blocks_per_row;
+    const uint32_t col = (uint32_t)(b - row * blocks_per_row) * 256u;
+    __half *dst = out + row * in_dim + col;
+
+    int is = 0;
+    uint8_t u1 = 1, u2 = 2;
+    const uint8_t *ql = ql0;
+    int oi = 0;
+    for (int j = 0; j < 256; j += 64) {
+        uint8_t sc, m;
+        dev_q4_K_get_scale_min((uint32_t)(is + 0), scales, &sc, &m);
+        const float d1 = d * (float)sc, m1 = dmin * (float)m;
+        dev_q4_K_get_scale_min((uint32_t)(is + 1), scales, &sc, &m);
+        const float d2 = d * (float)sc, m2 = dmin * (float)m;
+        for (int l = 0; l < 32; l++) {
+            dst[oi++] = __float2half(d1 * (float)((ql[l] & 0xF) + (qh[l] & u1 ? 16 : 0)) - m1);
+        }
+        for (int l = 0; l < 32; l++) {
+            dst[oi++] = __float2half(d2 * (float)((ql[l] >> 4) + (qh[l] & u2 ? 16 : 0)) - m2);
+        }
+        ql += 32; is += 2;
+        u1 = (uint8_t)(u1 << 2); u2 = (uint8_t)(u2 << 2);
+    }
+}
+
+/* Generic dequant+GEMM routed-MoE fallback (P1 correctness path).
  *
  * routed_moe_launch's other branches (Q4_K, IQ2_XXS/Q2_K) use hand-tuned
  * sorted-pairs expert-tile kernels that do the dequant and dot-product in
- * one fused pass. MXFP4 does not get one of those yet -- P1 scope is
- * dequant-then-generic-f16-GEMM only (see FP4_PORT_SCOPE.md P3 for the
+ * one fused pass. The types below do not get one of those yet -- P1 scope
+ * is dequant-then-generic-f16-GEMM only (see FP4_PORT_SCOPE.md P3 for the
  * follow-up native dot-product/tensor-core work). Correctness over
  * throughput: this dispatches a naive per-(token,expert)-pair loop, each
  * pair doing three dequant+cuBLAS-f16-GEMM calls (gate, up, down) via
- * mxfp4_matmul_row_f16gemm below (which reuses mxfp4_dequant_f16_kernel,
- * the same streaming-dequant kernel backing ds4_gpu_matmul_mxfp4_tensor),
- * with a small elementwise kernel for the SiLU(gate)*up*routing-weight
- * combine in between. The final expert-sum reuses the existing
- * moe_sum_kernel / moe_sum_owned_kernel exactly as the other paths do, so
- * MXFP4 experts land in the same out->ptr accumulation as everything
- * else. Because expert selection is data-dependent (the `selected`
- * device array), and cuBLAS needs the weight pointer on the host at
- * launch time, we take one device->host readback of the pair->expert
- * table up front rather than threading per-pair addressing through a
- * device-side kernel body (as the fused paths do) -- a one-time sync
- * per MoE layer call, acceptable for a P1 correctness path.
- */
+ * dequant_gemm_row_f16gemm below, with a small elementwise kernel for the
+ * SiLU(gate)*up*routing-weight combine in between. The final expert-sum
+ * reuses the existing moe_sum_kernel / moe_sum_owned_kernel exactly as
+ * the other paths do. Because expert selection is data-dependent (the
+ * `selected` device array), and cuBLAS needs the weight pointer on the
+ * host at launch time, we take one device->host readback of the
+ * pair->expert table up front rather than threading per-pair addressing
+ * through a device-side kernel body (as the fused paths do) -- a
+ * one-time sync per MoE layer call, acceptable for a P1 correctness
+ * path.
+ *
+ * Types are looked up independently for gate/up (one type, per ds4's
+ * existing load-time invariant that gate and up experts always share a
+ * quant type -- enforced at layer-load, e.g. ds4.c's "routed gate/up
+ * experts use different quant types" checks) and down (its own,
+ * possibly-different type), so a layer with e.g. MXFP4 gate/up and
+ * Q3_K down experts dispatches through this same loop with each half
+ * using its own dequant kernel. */
+static bool dequant_gemm_type_supported(uint32_t type) {
+    return type == 39u  /* MXFP4 */ ||
+           type == 11u  /* Q3_K  */ ||
+           type == 13u; /* Q5_K  */
+}
+
+static uint32_t dequant_gemm_block_elems(uint32_t type) {
+    switch (type) {
+    case 39u: return 32u;
+    case 11u: return 256u;
+    case 13u: return 256u;
+    default:  return 0u;
+    }
+}
+
+static uint64_t dequant_gemm_block_bytes(uint32_t type) {
+    switch (type) {
+    case 39u: return 17u;
+    case 11u: return 110u;
+    case 13u: return 176u;
+    default:  return 0u;
+    }
+}
+
+static void launch_dequant_f16(
+        uint32_t type,
+        __half *out,
+        const unsigned char *w,
+        uint64_t total_blocks,
+        uint32_t blocks_per_row,
+        uint32_t in_dim) {
+    const unsigned threads = 256;
+    const unsigned grid = (unsigned)((total_blocks + threads - 1) / threads);
+    switch (type) {
+    case 39u:
+        mxfp4_dequant_f16_kernel<<<grid, threads>>>(out, w, total_blocks, blocks_per_row, in_dim);
+        break;
+    case 11u:
+        q3_k_dequant_f16_kernel<<<grid, threads>>>(out, w, total_blocks, blocks_per_row, in_dim);
+        break;
+    case 13u:
+        q5_k_dequant_f16_kernel<<<grid, threads>>>(out, w, total_blocks, blocks_per_row, in_dim);
+        break;
+    default:
+        break;
+    }
+}
+
 __global__ static void mxfp4_moe_silu_mul_kernel(
         float *mid_out,
         const float *gate_in,
@@ -20931,14 +21091,17 @@ __global__ static void mxfp4_moe_silu_mul_kernel(
     mid_out[i] = (gate / (1.0f + expf(-gate))) * up * (*weight_ptr);
 }
 
-/* Dequant an [out_dim x in_dim] MXFP4 weight matrix (row-major, packed
- * blocks with no inter-row padding: row_bytes must equal
- * (in_dim/32)*17) into an f16 scratch buffer and GEMM it against a
- * single f32 activation row via cuBLAS, writing an f32 output row.
- * Single-row (n_tok=1) sibling of ds4_gpu_matmul_mxfp4_tensor above,
- * built for the per-pair MoE loop where the weight base pointer differs
- * per call (selected expert) so a single batched GEMM isn't available. */
-static int mxfp4_matmul_row_f16gemm(
+/* Dequant an [out_dim x in_dim] weight matrix of a supported fallback
+ * type (row-major, packed blocks with no inter-row padding: row_bytes
+ * must equal (in_dim/block_elems)*block_bytes for that type) into an f16
+ * scratch buffer and GEMM it against a single f32 activation row via
+ * cuBLAS, writing an f32 output row. Single-row (n_tok=1) sibling of
+ * ds4_gpu_matmul_mxfp4_tensor above, built for the per-pair MoE loop
+ * where the weight base pointer differs per call (selected expert) so a
+ * single batched GEMM isn't available. `type` selects the dequant kernel
+ * via launch_dequant_f16 (MXFP4/Q3_K/Q5_K as of this port). */
+static int dequant_gemm_row_f16gemm(
+        uint32_t type,
         float *out_row,
         const char *w,
         uint64_t row_bytes,
@@ -20946,22 +21109,24 @@ static int mxfp4_matmul_row_f16gemm(
         uint32_t in_dim,
         uint32_t out_dim,
         int logical_tier) {
-    if (!out_row || !w || !x_row || !g_cublas_ready || (in_dim & 31u) != 0u) return 0;
-    const uint32_t blocks = in_dim / 32u;
-    if (row_bytes != (uint64_t)blocks * 17u) return 0;
+    if (!out_row || !w || !x_row || !g_cublas_ready) return 0;
+    const uint32_t block_elems = dequant_gemm_block_elems(type);
+    const uint64_t block_bytes = dequant_gemm_block_bytes(type);
+    if (block_elems == 0u || in_dim % block_elems != 0u) return 0;
+    const uint32_t blocks = in_dim / block_elems;
+    if (row_bytes != (uint64_t)blocks * block_bytes) return 0;
     const uint64_t wh_bytes = (uint64_t)in_dim * out_dim * sizeof(__half);
     const uint64_t xh_off = (wh_bytes + 255u) & ~255ull;
     const uint64_t gemm_tmp = xh_off + (uint64_t)in_dim * sizeof(__half);
-    void *tmp16 = cuda_tmp_alloc_on(logical_tier, gemm_tmp, "mxfp4 moe dequant gemm");
+    void *tmp16 = cuda_tmp_alloc_on(logical_tier, gemm_tmp, "routed_moe dequant gemm");
     if (!tmp16) return 0;
     __half *wh = (__half *)tmp16;
     __half *xh = (__half *)((char *)tmp16 + xh_off);
     const uint64_t total_blocks = (uint64_t)out_dim * blocks;
-    mxfp4_dequant_f16_kernel<<<(unsigned)((total_blocks + 255u) / 256u), 256>>>(
-            wh, reinterpret_cast<const unsigned char *>(w),
-            total_blocks, blocks, in_dim);
+    launch_dequant_f16(type, wh, reinterpret_cast<const unsigned char *>(w),
+                        total_blocks, blocks, in_dim);
     f32_to_f16_kernel<<<(unsigned)((in_dim + 255u) / 256u), 256>>>(xh, x_row, in_dim);
-    if (!cuda_ok(cudaGetLastError(), "routed_moe mxfp4 dequant gemm staging")) return 0;
+    if (!cuda_ok(cudaGetLastError(), "routed_moe dequant gemm staging")) return 0;
     const float alpha = 1.0f;
     const float beta = 0.0f;
     cublasStatus_t st = cublasGemmEx(cuda_cublas_for_tier(logical_tier),
@@ -20974,20 +21139,21 @@ static int mxfp4_matmul_row_f16gemm(
                                      out_row, CUDA_R_32F, (int)out_dim,
                                      CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
     if (st != CUBLAS_STATUS_SUCCESS) {
-        fprintf(stderr, "ds4: cuBLAS routed_moe mxfp4 gemm failed: status %d\n", (int)st);
+        fprintf(stderr, "ds4: cuBLAS routed_moe dequant gemm failed: status %d\n", (int)st);
         return 0;
     }
     return 1;
 }
 
-/* Per-(token,expert)-pair MXFP4 gate/up/down dequant+GEMM loop, called
- * from routed_moe_launch once gate_w/up_w/down_w are resolved (works
- * whether those pointers come from the model map directly or the SSD
- * streaming selected-experts cache -- that resolution is unchanged and
+/* Per-(token,expert)-pair gate/up/down dequant+GEMM loop, called from
+ * routed_moe_launch once gate_w/up_w/down_w are resolved (works whether
+ * those pointers come from the model map directly or the SSD streaming
+ * selected-experts cache -- that resolution is unchanged and
  * type-agnostic). Handles both decode (n_tokens==1) and prefill
  * (n_tokens>1) with the same loop; no separate kernels for the two, per
- * the P1 scope (throughput work is P3). */
-static int routed_moe_mxfp4_dispatch(
+ * the P1 scope (throughput work is P3). gate_type covers both gate and
+ * up (ds4's existing invariant, enforced at load); down_type may differ. */
+static int routed_moe_dequant_gemm_dispatch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
         ds4_gpu_tensor *up,
@@ -20996,6 +21162,8 @@ static int routed_moe_mxfp4_dispatch(
         const char *gate_w,
         const char *up_w,
         const char *down_w,
+        uint32_t gate_type,
+        uint32_t down_type,
         uint64_t gate_expert_bytes,
         uint64_t gate_row_bytes,
         uint64_t down_expert_bytes,
@@ -21011,11 +21179,19 @@ static int routed_moe_mxfp4_dispatch(
         uint32_t n_tokens,
         int owned_filtered,
         int logical_tier) {
-    if ((expert_in_dim & 31u) != 0u || (expert_mid_dim & 31u) != 0u) return 0;
-    const uint32_t in_blocks = expert_in_dim / 32u;
-    const uint32_t mid_blocks = expert_mid_dim / 32u;
-    if (gate_row_bytes != (uint64_t)in_blocks * 17u ||
-        down_row_bytes != (uint64_t)mid_blocks * 17u) {
+    if (!dequant_gemm_type_supported(gate_type) || !dequant_gemm_type_supported(down_type)) {
+        return 0;
+    }
+    const uint32_t gate_block_elems = dequant_gemm_block_elems(gate_type);
+    const uint32_t down_block_elems = dequant_gemm_block_elems(down_type);
+    if (expert_in_dim % gate_block_elems != 0u || expert_mid_dim % gate_block_elems != 0u ||
+        expert_mid_dim % down_block_elems != 0u) {
+        return 0;
+    }
+    const uint32_t in_blocks = expert_in_dim / gate_block_elems;
+    const uint32_t mid_blocks = expert_mid_dim / down_block_elems;
+    if (gate_row_bytes != (uint64_t)in_blocks * dequant_gemm_block_bytes(gate_type) ||
+        down_row_bytes != (uint64_t)mid_blocks * dequant_gemm_block_bytes(down_type)) {
         return 0;
     }
 
@@ -21049,10 +21225,10 @@ static int routed_moe_mxfp4_dispatch(
         float *mid_buf = (float *)mid->ptr + (uint64_t)pair * expert_mid_dim;
         float *down_buf = (float *)down->ptr + (uint64_t)pair * out_dim;
 
-        ok = mxfp4_matmul_row_f16gemm(gate_buf, gate_row_base, gate_row_bytes,
+        ok = dequant_gemm_row_f16gemm(gate_type, gate_buf, gate_row_base, gate_row_bytes,
                                       x_row, expert_in_dim, expert_mid_dim, logical_tier);
         if (ok) {
-            ok = mxfp4_matmul_row_f16gemm(up_buf, up_row_base, gate_row_bytes,
+            ok = dequant_gemm_row_f16gemm(gate_type, up_buf, up_row_base, gate_row_bytes,
                                           x_row, expert_in_dim, expert_mid_dim, logical_tier);
         }
         if (!ok) break;
@@ -21060,10 +21236,10 @@ static int routed_moe_mxfp4_dispatch(
         const float *weight_ptr = (const float *)weights->ptr + pair;
         mxfp4_moe_silu_mul_kernel<<<(expert_mid_dim + 255u) / 256u, 256>>>(
                 mid_buf, gate_buf, up_buf, weight_ptr, expert_mid_dim, clamp);
-        ok = cuda_ok(cudaGetLastError(), "routed_moe mxfp4 silu launch");
+        ok = cuda_ok(cudaGetLastError(), "routed_moe dequant gemm silu launch");
         if (!ok) break;
 
-        ok = mxfp4_matmul_row_f16gemm(down_buf, down_row_base, down_row_bytes,
+        ok = dequant_gemm_row_f16gemm(down_type, down_buf, down_row_base, down_row_bytes,
                                       mid_buf, expert_mid_dim, out_dim, logical_tier);
     }
     free(sel_host);
@@ -21078,7 +21254,7 @@ static int routed_moe_mxfp4_dispatch(
         moe_sum_kernel<<<(unsigned)((n + 255) / 256), 256>>>(
                 (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
     }
-    return cuda_ok(cudaGetLastError(), "routed_moe mxfp4 sum launch");
+    return cuda_ok(cudaGetLastError(), "routed_moe dequant gemm sum launch");
 }
 
 static int routed_moe_launch(
@@ -21126,8 +21302,19 @@ static int routed_moe_launch(
         return 0;
     }
     const int q4k_path = (gate_type == 12u && down_type == 12u);
-    const int mxfp4_path = (gate_type == 39u && down_type == 39u);
-    if (!mxfp4_path && !q4k_path && (gate_type != 16u || down_type != 10u)) return 0;
+    const int iq2_q2k_path = (gate_type == 16u && down_type == 10u);
+    /* Generic dequant+GEMM fallback (P1 correctness path, no fused tile
+     * kernels): engages for any gate/down type pair drawn from the small
+     * dequant_gemm_type_supported table (MXFP4, Q3_K, Q5_K as of this
+     * port), independently per tensor -- so a layer with MXFP4 gate/up
+     * and Q3_K down experts, or any other combo from that table, takes
+     * this path. Only a fallback: the fused Q4_K / IQ2_XXS+Q2_K branches
+     * above take priority whenever they match. */
+    const int dequant_gemm_path =
+        !q4k_path && !iq2_q2k_path &&
+        dequant_gemm_type_supported(gate_type) &&
+        dequant_gemm_type_supported(down_type);
+    if (!dequant_gemm_path && !q4k_path && !iq2_q2k_path) return 0;
     /* Q4_K routed-MoE dispatch:
      *   n_tokens == 1 and n_expert == 6:
      *                  use_direct_down_sum + moe_gate_up_mid_decode_q4K_qwarp32
@@ -21196,10 +21383,11 @@ static int routed_moe_launch(
                                 logical_tier, "moe_down");
     if (!gate_w || !up_w || !down_w) return 0;
 
-    if (mxfp4_path) {
-        return routed_moe_mxfp4_dispatch(
+    if (dequant_gemm_path) {
+        return routed_moe_dequant_gemm_dispatch(
                 out, gate, up, mid, down,
                 gate_w, up_w, down_w,
+                gate_type, down_type,
                 gate_expert_bytes, gate_row_bytes,
                 down_expert_bytes, down_row_bytes,
                 expert_in_dim, expert_mid_dim, out_dim,
