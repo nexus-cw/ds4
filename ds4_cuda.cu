@@ -21135,7 +21135,8 @@ static int dequant_gemm_row_f16gemm(
         const float *x_row,
         uint32_t in_dim,
         uint32_t out_dim,
-        int logical_tier) {
+        int logical_tier,
+        int dbg_dump_row0) {
     if (!out_row || !w || !x_row || !g_cublas_ready) return 0;
     const uint32_t block_elems = dequant_gemm_block_elems(type);
     const uint64_t block_bytes = dequant_gemm_block_bytes(type);
@@ -21152,6 +21153,15 @@ static int dequant_gemm_row_f16gemm(
     const uint64_t total_blocks = (uint64_t)out_dim * blocks;
     launch_dequant_f16(type, wh, reinterpret_cast<const unsigned char *>(w),
                         total_blocks, blocks, in_dim);
+    if (dbg_dump_row0) {
+        __half h32[32];
+        (void)cudaMemcpy(h32, wh, sizeof(h32), cudaMemcpyDeviceToHost);
+        fprintf(stderr, "ds4: [dbgdequant] type=%u row0 first32=", type);
+        for (int di = 0; di < 32; di++) {
+            fprintf(stderr, "%g ", __half2float(h32[di]));
+        }
+        fprintf(stderr, "\n");
+    }
     f32_to_f16_kernel<<<(unsigned)((in_dim + 255u) / 256u), 256>>>(xh, x_row, in_dim);
     if (!cuda_ok(cudaGetLastError(), "routed_moe dequant gemm staging")) return 0;
     const float alpha = 1.0f;
@@ -21205,7 +21215,8 @@ static int routed_moe_dequant_gemm_dispatch(
         const ds4_gpu_tensor *x,
         uint32_t n_tokens,
         int owned_filtered,
-        int logical_tier) {
+        int logical_tier,
+        uint32_t dbg_layer_index) {
     if (!dequant_gemm_type_supported(gate_type) || !dequant_gemm_type_supported(down_type)) {
         return 0;
     }
@@ -21234,6 +21245,13 @@ static int routed_moe_dequant_gemm_dispatch(
         return 0;
     }
 
+    const char *dbg_dispatch_env = getenv("DS4_DEBUG_STREAM_CACHE_LAYER");
+    const int32_t dbg_dispatch_want =
+        (dbg_dispatch_env && dbg_dispatch_env[0]) ? atoi(dbg_dispatch_env) : -1;
+    const int32_t dbg_dispatch_layer =
+        (dbg_dispatch_want >= 0 && (uint32_t)dbg_dispatch_want == dbg_layer_index) ?
+            (int32_t)dbg_layer_index : -1;
+
     int ok = 1;
     for (uint32_t pair = 0; pair < pair_count && ok; pair++) {
         int32_t expert_i = sel_host[pair];
@@ -21246,17 +21264,30 @@ static int routed_moe_dequant_gemm_dispatch(
         const char *gate_row_base = gate_w + (uint64_t)(uint32_t)expert_i * gate_expert_bytes;
         const char *up_row_base = up_w + (uint64_t)(uint32_t)expert_i * gate_expert_bytes;
         const char *down_row_base = down_w + (uint64_t)(uint32_t)expert_i * down_expert_bytes;
+        if (dbg_dispatch_layer >= 0) {
+            float w_host = 0.0f;
+            (void)cudaMemcpy(&w_host, (const float *)weights->ptr + pair, sizeof(float),
+                              cudaMemcpyDeviceToHost);
+            fprintf(stderr,
+                    "ds4: [dbgdispatch] layer=%d pair=%u tok=%u expert_i(used-as-index)=%d weight=%f "
+                    "gate_row_off=%llu gate_expert_bytes=%llu\n",
+                    dbg_dispatch_layer, pair, tok, expert_i, w_host,
+                    (unsigned long long)((uint64_t)(uint32_t)expert_i * gate_expert_bytes),
+                    (unsigned long long)gate_expert_bytes);
+        }
 
         float *gate_buf = (float *)gate->ptr + (uint64_t)pair * expert_mid_dim;
         float *up_buf = (float *)up->ptr + (uint64_t)pair * expert_mid_dim;
         float *mid_buf = (float *)mid->ptr + (uint64_t)pair * expert_mid_dim;
         float *down_buf = (float *)down->ptr + (uint64_t)pair * out_dim;
 
+        const int dbg_dump_this_pair = (dbg_dispatch_layer >= 0 && pair == 0);
         ok = dequant_gemm_row_f16gemm(gate_type, gate_buf, gate_row_base, gate_row_bytes,
-                                      x_row, expert_in_dim, expert_mid_dim, logical_tier);
+                                      x_row, expert_in_dim, expert_mid_dim, logical_tier,
+                                      dbg_dump_this_pair);
         if (ok) {
             ok = dequant_gemm_row_f16gemm(gate_type, up_buf, up_row_base, gate_row_bytes,
-                                          x_row, expert_in_dim, expert_mid_dim, logical_tier);
+                                          x_row, expert_in_dim, expert_mid_dim, logical_tier, 0);
         }
         if (!ok) break;
 
@@ -21267,7 +21298,7 @@ static int routed_moe_dequant_gemm_dispatch(
         if (!ok) break;
 
         ok = dequant_gemm_row_f16gemm(down_type, down_buf, down_row_base, down_row_bytes,
-                                      mid_buf, expert_mid_dim, out_dim, logical_tier);
+                                      mid_buf, expert_mid_dim, out_dim, logical_tier, 0);
     }
     free(sel_host);
     if (!ok) return 0;
@@ -21419,7 +21450,7 @@ static int routed_moe_launch(
                 down_expert_bytes, down_row_bytes,
                 expert_in_dim, expert_mid_dim, out_dim,
                 selected, weights, n_expert, clamp, x, n_tokens,
-                owned_filtered, logical_tier);
+                owned_filtered, logical_tier, layer_index);
     }
 
     int ok = 1;
@@ -23514,6 +23545,30 @@ static int cuda_stream_selected_cache_begin_load(
     }
     if (compact_ids.empty() || compact_ids.size() > UINT32_MAX) return 0;
     const uint64_t compact_count = compact_ids.size();
+    {
+        const char *dbg = getenv("DS4_DEBUG_STREAM_CACHE_LAYER");
+        if (dbg && dbg[0] && (uint32_t)atoi(dbg) == table->layer) {
+            fprintf(stderr,
+                    "ds4: [dbgcache] layer=%u slot_count=%u compact_count=%llu gate_offset=%llu "
+                    "up_offset=%llu down_offset=%llu gate_expert_bytes=%llu down_expert_bytes=%llu\n",
+                    table->layer, slot_count, (unsigned long long)compact_count,
+                    (unsigned long long)table->gate_offset,
+                    (unsigned long long)table->up_offset,
+                    (unsigned long long)table->down_offset,
+                    (unsigned long long)table->gate_expert_bytes,
+                    (unsigned long long)table->down_expert_bytes);
+            for (uint32_t i = 0; i < slot_count; i++) {
+                fprintf(stderr,
+                        "ds4: [dbgcache]   slot_input[%u] global_expert=%d -> cache_slot=%d\n",
+                        i, selected_ids[i], slot_ids[i]);
+            }
+            for (uint32_t s = 0; s < compact_ids.size(); s++) {
+                fprintf(stderr,
+                        "ds4: [dbgcache]   cache_slot[%u] = global_expert %d\n",
+                        s, compact_ids[s]);
+            }
+        }
+    }
     if (compact_count > UINT64_MAX / table->gate_expert_bytes ||
         compact_count > UINT64_MAX / table->down_expert_bytes) {
         return 0;
@@ -23573,6 +23628,21 @@ static int cuda_stream_selected_cache_begin_load(
                     "stream down expert copy")) {
             cuda_stream_selected_cache_invalidate();
             return 0;
+        }
+        {
+            const char *dbg = getenv("DS4_DEBUG_STREAM_CACHE_LAYER");
+            if (dbg && dbg[0] && (uint32_t)atoi(dbg) == table->layer && i == 0) {
+                unsigned char hostbuf[32];
+                (void)cudaMemcpy(hostbuf, g_stream_selected_cache.gate_ptr + gate_dst,
+                                  sizeof(hostbuf), cudaMemcpyDeviceToHost);
+                fprintf(stderr, "ds4: [dbgcache] gate cache_slot=0 global_expert=%llu "
+                                "gate_src_off=%llu first32bytes=",
+                        (unsigned long long)expert, (unsigned long long)gate_src);
+                for (size_t bi = 0; bi < sizeof(hostbuf); bi++) {
+                    fprintf(stderr, "%02x", hostbuf[bi]);
+                }
+                fprintf(stderr, "\n");
+            }
         }
     }
     if (!cuda_ok(cudaMemcpy(g_stream_selected_cache.slot_selected_ptr,

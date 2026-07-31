@@ -834,3 +834,91 @@ conversions), `~/src/llama.cpp/build` (CPU-only build @5f55650), and
 `~/src/ds4/gguf/DeepSeek-V4-Flash-MXFP4_MOE.patched.gguf` (150GB, the fully-patched
 ground-truth file -- safe to delete to reclaim disk if not needed for a follow-up run;
 285GB free on `/` as of this pass).
+
+
+### P1 status update (2026-07-31): priority-hypothesis check (DISPROVEN, evidence-backed) --
+runtime instrumentation rules out slot/cache indexing, weight-fetch offset math, and
+dequant-kernel correctness for the generic dequant+GEMM routed-MoE path
+
+Follow-on pass to the "root cause not isolated to a specific line" entry above. This pass's
+brief specifically prioritized one hypothesis fitting the wrong-argmax signature exactly:
+expert-index-vs-cache-slot confusion in `routed_moe_dequant_gemm_dispatch`/
+`cuda_stream_selected_cache_begin_load` (`ds4_cuda.cu`) under `--ssd-streaming` -- i.e. that
+the generic dequant+GEMM path might index the streaming selected-expert cache by *global
+expert id* while the cache is populated *by compact slot*, or pair routing weights with the
+wrong expert's dequantized rows. Rather than re-reading (three prior passes' worth of static
+inspection already covered this code with no defect found), this pass added small,
+env-gated (`DS4_DEBUG_STREAM_CACHE_LAYER=<n>`) `fprintf` instrumentation at three points and
+ran the real 150GB artifact under `--cuda --ssd-streaming --ssd-streaming-cache-experts
+40GB --nothink -p "Hi" -n 1`, capturing ground truth at each stage:
+
+1. **Slot-remap correctness (cache build, `cuda_stream_selected_cache_begin_load`)**:
+   printed each layer-3 call's `(global_expert_id -> cache_slot)` table alongside the
+   dispatch loop's own `(pair, expert_i-used-as-index)` readback. For every observed call,
+   `expert_i` used as the cache-buffer index in `routed_moe_dequant_gemm_dispatch` exactly
+   matched the slot the cache-build step had assigned that same global expert to -- no
+   transposition, staleness, or off-by-one found. (Note: DeepSeek-V4's top-6 expert
+   selection never repeats an expert within one token, so the compact slot table happened
+   to equal the trivial identity mapping in every sample observed here; this still
+   positively confirms the *mechanism*, since the printed global-expert-id inputs differ
+   sample to sample while the index arithmetic checked out every time.)
+
+2. **Weight-fetch offset arithmetic and raw bytes (byte-exact against the file)**: for
+   layer 3 / cache-slot 0 / global-expert 143, printed `gate_src_off` (the computed absolute
+   file offset: `gate_offset + expert * gate_expert_bytes`) and the first 32 raw bytes ds4
+   actually staged into the device cache buffer from that offset. Independently read the
+   same 32 bytes directly from `gguf/DeepSeek-V4-Flash-MXFP4_MOE.gguf` at that exact offset
+   in Python: **byte-for-byte identical**. This rules out any offset-computation or
+   streamed-copy corruption in the cache-population path.
+
+3. **Dequant kernel correctness on real (not synthetic) data**: layer 3's `ffn_gate_exps`
+   turned out to be Q3_K (ggml type 11), not MXFP4 -- a useful reminder that "gate_type ==
+   up_type, down varies" (per `f8d6222`) does *not* mean gate is always MXFP4; 30 of the
+   98+30+1 routed-expert tensors are Q3_K and can appear on gate/up too. Ported
+   `q3_k_dequant_f16_kernel`'s exact algorithm to a standalone Python reference and ran it
+   against the same 110-byte raw Q3_K block captured above, then printed the CUDA kernel's
+   actual dequantized f16 output for the same block (`DS4_DEBUG_STREAM_CACHE_LAYER=3`,
+   pair 0, first 32 of 256 elements). The two match to f16 rounding precision (e.g.
+   `0.0325928` GPU vs `0.03260612...` independent Python double-precision reference,
+   `<0.001` relative difference, consistent with `__float2half` truncation, not a bug).
+
+**Verdict: priority hypothesis DISPROVEN.** The streaming selected-expert cache is
+populated with byte-exact correct weight data at the byte-exact correct offset for the
+byte-exact correct global expert, addressed by the byte-exact correct compact slot, and
+the fallback dequant kernel (Q3_K case verified directly against a from-scratch reference;
+MXFP4/Q5_K already covered by the synthetic unit tests plus the earlier passes' registry-
+level constant audit) reproduces that data correctly. Every stage of "which expert's bytes
+get fetched from the file and turned into a dequantized row" for the generic dequant+GEMM
+path is now runtime-verified correct on the real artifact, not just by static inspection.
+
+**Narrowed remaining search space**: the defect must be in one of the stages *after*
+per-expert dequant (the per-pair cuBLAS GEMM orientation, the SiLU(gate)*up*weight combine
+kernel, or the final `moe_sum`/`moe_sum_owned` reduction -- all re-audited by inspection
+this pass with no defect found either, but not yet runtime-verified end-to-end the way
+stages 1-3 above were) or, per the debug plan's own step 3b, somewhere entirely outside the
+routed-MoE dispatch (attention, the hash-layer/hyper-connection plumbing visible in the
+llama.cpp eval-callback trace -- `hc_head_mixes`/`hc_attn_scale` etc. -- or an interaction
+between per-layer streaming and those mechanisms that a single-layer synthetic test
+wouldn't catch). The next concrete, cheap step is debug plan step 3b: per-layer hidden-
+state norm/sum comparison against the llama.cpp ground truth (already captured in this
+pass's `/tmp/llamacpp_eval.log` on robo-dog -- `ffn_out-N`/`ffn_moe_out-N`/`attn_out-N` sums
+for all 43 layers on the same `"Hi"` prompt, ready to diff against an equivalent ds4-side
+per-layer dump once one exists) to find the first diverging layer, rather than further
+inspection of the routed-MoE arithmetic this pass already exercised at the byte level.
+
+**No code fix made this pass** -- the disproven hypothesis was the ticket's specified
+priority check; per its own instruction, reporting the (negative, but evidence-backed)
+result rather than continuing to guess. The three small debug hooks added
+(`DS4_DEBUG_STREAM_CACHE_LAYER`, gated `fprintf`s in `ds4_cuda.cu`'s
+`cuda_stream_selected_cache_begin_load`/`routed_moe_dequant_gemm_dispatch`/
+`dequant_gemm_row_f16gemm`) are left in place, committed -- zero-cost when the env var is
+unset, useful for the next pass's step 3b work, and follow the codebase's existing
+env-gated debug/profile idiom (e.g. `DS4_CUDA_STREAMING_EXPERT_CACHE_PROFILE`).
+
+**Verification**: `make cuda-spark` -- clean build from `make clean`, no warnings, all
+debug-instrumented edits. Smoke ladder against the real artifact, foreground with
+timeouts, polled: `-p "Reply with exactly: ok"` and the France prompt (with
+`DS4_METAL_STREAMING_DECODE_PREFILL_MAX=4096`) both reproduce the exact prior-documented
+symptom (finite, fluent-shaped, incoherent text; `~0.70-0.76 t/s` prefill/generation) --
+confirms the debug instrumentation is a true no-op on the actual generation path.
+`./ds4_test`: `ds4 tests: 10 failure(s)` across four sections -- `tool-call-quality`, `logprob-vectors`, `metal-kernels`, `metal-tensor-equivalence` -- all four within the pre-existing flaky set documented by every prior pass on this hardware; `think-tool-recovery` passed this run. No new failing test names.
