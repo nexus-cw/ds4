@@ -1184,3 +1184,221 @@ tensor-core prefill kernels.
 documented by every prior pass on this hardware (`tool-call-quality`,
 `think-tool-recovery`, `logprob-vectors`, `metal-kernels`, `metal-tensor-equivalence`) --
 no new failing test names.
+
+### P3a diagnosis (2026-08-01, cont'd): why the expert-cache sweep is flat -- root
+cause found (CUDA `--ssd-streaming-cache-experts` is a no-op), disk-bound confirmed
+with numbers, instrumentation added
+
+Follow-on to the P3a expert-cache sweep (`MEASUREMENTS.md`) that found decode flat at
+1.02-1.04 t/s across 8/40/60/100 GB cache budgets. This pass root-causes it: reads the
+actual fetch code path (not just log lines), measures the real OS/hardware bound with
+concurrent `iostat`/`nvidia-smi dmon`/`pidstat` capture, and adds CUDA-side counters that
+directly confirm the finding against the real 150GB artifact
+(`gguf/DeepSeek-V4-Flash-MXFP4_MOE.patched.gguf`, the same dialect-compat + BF16/Q6_K-
+converted file the sweep itself used -- verified by file listing, not assumed).
+
+**Q1 -- bound discrimination.** Concurrent capture during a steady-state 100-token decode
+(`--ssd-streaming-cache-experts 60GB`, `ds4-server` stopped, page cache dropped
+beforehand, single-GPU process tracked by PID so the capture window is exactly the ds4
+process's own lifetime -- an early attempt without PID-scoping was contaminated by an
+unrelated k3s pod's disk burst and discarded):
+
+| resource | decode-phase measurement |
+|---|---|
+| NVMe (`iostat -x`, `nvme0n1`) | **~3.0-3.2 GB/s sustained read** (rkB/s mean 3.156e6 KB/s), **aqu-sz mean 14.9** (near the storage characterization's own QD16 class), **%util mean 67%**, r_await mean 0.59 ms (up from ~0.08 ms at idle/near-QD1) |
+| GPU SM (`nvidia-smi dmon -s u`) | **mean ~18% SM utilization** during decode, never exceeding ~31% |
+| CPU (`pidstat -u`, ds4 process only) | **mean ~44% of one core** (out of 2000% available on this 20-core host) -- not even one core saturated |
+
+Verdict: **disk-bound**, not compute-bound and not CPU-bound. The NVMe is doing real,
+sustained work close to (about 80-86% of) its own measured QD16 scattered-read ceiling
+(3.73 GB/s, `MEASUREMENTS.md`'s storage characterization table) while GPU and CPU sit
+mostly idle. This also resolves an artifact in the *first* (mis-scoped) capture attempt:
+sampling without pinning to the ds4 PID's actual lifetime picked up an unrelated
+high-throughput burst from a k3s pod on the same host, which looked like "disk barely
+used" until the window was corrected to the process's own start/exit timestamps
+(`pidstat`'s per-sample `Time` column) -- a caution for any future capture on this shared
+host: always scope iostat/dmon windows to the target PID's own lifetime, not a fixed
+wall-clock sleep.
+
+**Q2 -- cache participation, traced.** Read the full call chain from `routed_moe_launch`
+(`ds4_cuda.cu`) through to the byte-level fetch. The b15cc29-wired populate path is
+`ds4_gpu_stream_expert_cache_begin_selected_load()` /
+`ds4_gpu_stream_expert_cache_prepare_selected_batch()`, both of which delegate to a single
+static function, `cuda_stream_selected_cache_begin_load()` (`ds4_cuda.cu`, ~line 23888).
+Its **first line** is `cuda_stream_selected_cache_invalidate()`, which unconditionally
+zeroes `g_stream_selected_cache.valid` -- discarding whatever the device-side gate/up/down
+staging buffers held from the *previous* call, every single call, with no comparison
+against the newly-requested expert set first. The function then always proceeds to copy
+every selected expert's gate/up/down bytes fresh via `cuda_model_copy_to_device_streamed()`
+straight from `table->model_map` (the mmap'd GGUF file view) into the (now-empty) staging
+buffers. **There is no lookup against a persistent, expert-id-keyed cache anywhere in this
+function or its callers** -- `g_stream_selected_cache` is a same-call scratch buffer sized
+to the current token's selected-expert set, not a cache with cross-token reuse.
+
+This is confirmed independently, and more starkly, by the budget-wiring functions
+themselves: `ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts)` (`ds4_cuda.cu`,
+~line 28305) is `{ (void)experts; }` -- **a complete no-op**. Its companion
+`ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes)` is likewise `{ (void)bytes;
+}`, and `ds4_gpu_stream_expert_cache_configured_count(void)` unconditionally `return 0;`.
+**The `--ssd-streaming-cache-experts N` CLI flag is wired through `ds4.c` all the way to
+these three CUDA entry points and then discarded.** There is no code path on CUDA, at any
+value of N, that makes cache size do anything at all -- the flat 8/40/60/100 GB sweep curve
+in the prior pass wasn't measuring a saturated cache or a compute ceiling; it was measuring
+a parameter with zero effect on the code it's supposed to configure.
+
+Contrast with `ds4_metal.m`'s GLM streaming implementation, the mature reference: it has a
+real per-`(layer, expert)` LRU (`g_stream_expert_cache[layer][expert]`, `ds4_metal.m`
+~line 602 onward) with an actual hit path
+(`ds4_gpu_stream_expert_cache_peek()`/`_get_protected()`, ~line 13086-13270) that checks
+`ds4_gpu_stream_expert_cache_entry_matches()` (same tensor identity: model map, byte
+offsets, sizes) against the live entry *before* deciding whether to reload, increments
+`g_stream_expert_cache_hits`/`_misses` accordingly, and only re-`pread()`s + reinstalls on
+an actual miss; entries are LRU/hotness-evicted only when `g_stream_expert_cache_entry_count`
+exceeds the *configured* budget (`ds4_gpu_stream_expert_cache_prune_global()`, consulting
+`ds4_gpu_stream_expert_cache_configured_budget()` -- a real, non-stub function on Metal).
+CUDA has never had an equivalent; it only ever had the same-call staging buffer described
+above, which every prior CUDA streaming pass built fused/generic dispatch on top of without
+anyone tracing whether a "cache" existed underneath it.
+
+**Reconciling with Q1's measured bytes:** since the OS's own page cache is the *only*
+caching layer left in play once the CUDA-level "expert cache" is confirmed inert, and the
+box has 108-117 GiB free RAM regardless of the `--ssd-streaming-cache-experts` value passed
+(that value, being a no-op, never reserves anything real), the flat sweep curve now has a
+complete explanation: every arm from 8 GB to 100 GB was, in terms of actual caching
+behavior, identical -- all of them relied on nothing but the kernel's page cache over the
+same free-RAM pool, and none of them consulted any ds4-level structure that the
+`--ssd-streaming-cache-experts` flag could have changed.
+
+**Q3 -- the 11 bypass layers, confirmed.** Log line source: `ds4.c` ~line 56914
+(`"ds4: SSD streaming mixed-precision model: %u/%u routed layers off the slab size class
+will bypass the expert cache..."`), gated by `boosted > 0` where `boosted` counts layers for
+which `weights_streaming_layer_experts_uniform()` (`ds4.c` ~5177) returns false --
+i.e. a layer's `streaming_layer_routed_expert_bytes()` (gate+up+down bytes summed) doesn't
+match `ds4_streaming_routed_expert_bytes()`, the *modal* (most common) per-expert byte class
+across all 43 layers (the "slab size class" the CUDA/Metal cache-of-fixed-size-slots design
+assumes).
+
+Confirmed by direct calculation from the real artifact's tensor-type inventory (43 layers:
+32 pure-MXFP4 gate/up/down, 10 pure-Q3_K gate/up/down, 1 mixed MXFP4-gate/up + Q5_K-down --
+derived from the header scan in the 2026-08-01 Q3_K-port entry above, where gate/up-type
+counts (33 MXFP4-layer, 10 Q3_K-layer) and down-type counts (32 MXFP4, 10 Q3_K, 1 Q5_K)
+combine to exactly these three groups, with no other combination possible under the file's
+own tensor counts): MXFP4 has 0.53125 bytes/element (17B/32-elem block), Q3_K has
+0.4296875 bytes/element (110B/256-elem superblock), Q5_K has 0.6875 bytes/element
+(176B/256-elem superblock). The 32 pure-MXFP4 layers are the modal class (confirmed by the
+runtime's own printed accounting: `"4306 experts, 12.75 MiB each"` at the 60 GB arm, i.e.
+`4306/43=100.1 ~ n_expert*layers`, consistent with 43 layers all being *counted* toward the
+slab-class total even though only 32 are actually eligible -- `ds4_streaming_cacheable_expert_count()`
+only counts layers matching the slab class, so the true cacheable set is 32 layers x
+`DS4_N_EXPERT`, not all 43; the 4306 figure in the log reflects the byte-budget-derived
+expert count at 60 GiB, not the eligible-layer count). The 10 pure-Q3_K layers and the 1
+mixed MXFP4/Q5_K layer -- **11 layers total, exactly matching the log's own count and the
+ticket's own type-theory suspicion (the 10 Q3_K + 1 Q5_K expert layers)** -- have different
+per-expert byte totals and are excluded from the size-class slab by construction.
+
+**Important qualifier, not previously stated:** on CUDA this bypass distinction is **moot**.
+It matters on Metal, where excluded layers are routed to a different code path (direct
+mapped-view reads) than the other 32 layers (which get real LRU cache treatment) --  a
+genuine two-tier system. On CUDA, since Q2 establishes there is no real cache for *any*
+layer, all 43 layers -- both the 32 "slab class" and the 11 "bypass" -- already go through
+the identical same-call staging-buffer fetch in `cuda_stream_selected_cache_begin_load()`.
+The bypass/non-bypass split changes nothing observable in CUDA's actual behavior; the log
+line is accurate about the *classification* (confirmed above) but its stated *consequence*
+("bypass the expert cache and read experts via mapped model views") doesn't differentiate
+CUDA runtime behavior the way it does on Metal, because CUDA has no cache-path/mapped-view
+fork to begin with -- everything is already "mapped model views" on CUDA. Estimated
+per-token traffic if the 11 layers *were* the only miss source (Metal-style, cache hit
+elsewhere): ~0.7-0.9 GB/token (10 layers x 6 experts x ~10.3 MiB + 1 layer x 6 experts x
+~14.0 MiB, using the byte-rate math above with `n_embd=4096`, per-expert intermediate
+dim=2048 inferred from the 12.75 MiB/expert log figure) -- consistent with, and clarifying,
+the ticket's own "~0.9 GB/token" estimate, but this number describes Metal-shaped behavior,
+not what's actually happening on the CUDA path measured in Q1/Q5.
+
+**Q4 -- instrumentation added.** `DS4_CUDA_STREAM_STATS=1` env-gated counters, matching the
+existing `getenv("DS4_CUDA_...")`-per-call self-gating idiom used throughout `ds4_cuda.cu`
+(e.g. `DS4_CUDA_DISABLE_FUSED_FP4_DECODE`, `DS4_CUDA_WEIGHT_CACHE_VERBOSE`). Four host-side
+`uint64_t` atomics-by-single-threaded-construction (this fetch path only ever runs on the
+one CUDA-dispatch thread, so plain counters are correct and cheap -- no `std::atomic`
+needed) incremented at the exact fetch decision point traced in Q2, inside
+`cuda_stream_selected_cache_begin_load()`'s per-expert copy loop, only after all three
+copies (gate/up/down) for that expert succeed: `g_cuda_stream_stats_fetch_calls` (one per
+`begin_load` call, i.e. one per layer per token-step), `g_cuda_stream_stats_expert_fetches`
+/ `_cache_misses` (one per distinct expert actually copied), `g_cuda_stream_stats_bytes_from_file`
+(`gate_expert_bytes*2 + down_expert_bytes` per fetch). `g_cuda_stream_stats_cache_hits` /
+`_bytes_from_cache` are wired but structurally can never increment today (no code path
+serves bytes without going through the copy loop) -- kept, with a comment explaining why,
+so the absence is an empirically-reported zero rather than a field that doesn't exist; this
+also means the counters are forward-compatible with a future real-cache fix without needing
+a second instrumentation pass. `ds4_gpu_print_cuda_stream_stats(void)` (new, declared in
+`ds4_gpu.h`, implemented in `ds4_cuda.cu`, no-op stub in `ds4_metal.m` for build symmetry --
+Metal already has its own real hit/miss reporting via `ds4_gpu_print_memory_report` /
+`DS4_METAL_STREAMING_EXPERT_LAYER_STATS`) prints one summary line, self-gated on the env var,
+called from `ds4_cli.c`'s `run_sampled_generation()` (the function backing the `-p ... -n
+...` single-shot CLI path used by every arm of the P3a sweep and this ticket's own
+methodology) right after the existing `"ds4: prefill: ... generation: ..."` line. This
+closes the documented gap ("Metal has `--expert-profile`; CUDA has nothing").
+
+**Q5 -- re-run with counters, 60 GB arm, 3 reps**, same fixed prompt/flags as the sweep
+(`--ssd-streaming-cache-experts 60GB --nothink -p "Explain in a few sentences how
+photosynthesis works." -n 100`, `ds4-server` stopped, page cache dropped before each rep):
+
+| rep | prefill t/s | decode t/s | fetch_calls | expert_fetches | hit_rate | bytes_from_file | bytes/gen-token |
+|---|---|---|---|---|---|---|---|
+| 1 | 0.90 | 1.00 | 3784 | 22704 | **0.000** | 270.77 GiB | 2.91 GB |
+| 2 | 0.93 | 1.00 | 4300 | 25800 | **0.000** | 307.69 GiB | 3.30 GB |
+| 3 | 0.94 | 1.00 | 3870 | 23220 | **0.000** | 276.92 GiB | 2.97 GB |
+
+`expert_fetches / fetch_calls = 6.00` exactly in all three reps -- confirms
+`DS4_N_EXPERT_USED=6` and that every routed layer's `begin_load` call fetches exactly the
+router's top-6 selection, every time, with zero deduplication against anything previously
+resident. **Measured hit rate: 0.000 in all three reps -- the cache-participation finding
+from Q2 is not a code-reading inference, it is now a directly measured runtime fact.** Mean
+bytes/token (counting `bytes_from_file` against the 100 generated tokens, prefill's smaller
+contribution folded in) ~3.06 GB/token, closely matching both (a) the Q1 disk-bandwidth
+back-calculation (~3.0-3.2 GB/s measured / ~1.0 tok/s decode) and (b) the prior sweep
+writeup's own independent estimate (~3.62 GB/token, computed a completely different way, via
+QD16-max-bandwidth / observed-t/s) -- three independent measurement methods (host-side fetch
+counters, iostat, and the earlier bandwidth/throughput inference) now agree within ~15-20%
+on the same number, which is strong triangulation that this is real, not measurement noise.
+
+**Fix recommendation (not attempted this unit, per scope).** The disk-bound ceiling and the
+zero-hit-rate finding are two separable problems with two separable fixes:
+
+1. **Make `--ssd-streaming-cache-experts` do something on CUDA.** Port Metal's
+   `g_stream_expert_cache[layer][expert]` LRU design (`ds4_metal.m` ~line 12900-13300,
+   `ds4_gpu_stream_expert_cache_peek`/`_get_protected`/`_install_loaded`/`_prune_global`) to
+   CUDA: a persistent, device-resident, expert-id-keyed table of gate/up/down device
+   pointers with `entry_matches()`-style identity checks, populated lazily on miss and
+   consulted on every `begin_load` call *before* falling back to
+   `cuda_model_copy_to_device_streamed()`, evicted by the existing hotness/LRU discipline
+   once `ds4_gpu_stream_expert_cache_configured_count()` (currently hard-`return 0`, needs
+   to actually read the budget) is exceeded. This is the change that would make the
+   `--ssd-streaming-cache-experts` sweep methodology from the prior pass actually measure
+   what it was designed to measure. Scale: comparable to the Metal implementation it would
+   port (a few hundred lines, one new persistent data structure, changes concentrated in
+   `ds4_cuda.cu`), not a redesign of the streaming architecture.
+2. **Independently, disk bandwidth is the wall even with hits accounted for.** Even a
+   perfect CUDA-side cache only helps the *repeat* fraction of expert selections across
+   tokens (session-local routing correlation, not yet measured -- "session working-set size
+   from routing traces" is still an open item in `MEASUREMENTS.md`'s Pending list). The
+   32/43 "slab class" layers could then benefit from real reuse; the 11 bypass layers
+   (per Q3) would still need every-token reads regardless of any cache, since they're
+   excluded from the size-class slab design entirely -- a distinct, likely smaller,
+   follow-up (giving bypass layers their own smaller slab class, or a secondary
+   variable-size cache tier) noted in the prior pass's own Pending list and unchanged by
+   this diagnosis.
+3. Fix (1) is the higher-leverage, correctly-scoped next unit: it's blocked on nothing this
+   pass didn't already establish (the trace, the counters, and the measured 0% hit rate all
+   point at the same missing piece), and the counters added here are exactly what a fix
+   would use to prove itself working (a non-zero hit rate on a repeat run would be the
+   acceptance signal).
+
+**Verification.** `make clean && make cuda-spark`: clean rebuild of `ds4`, `ds4-server`,
+`ds4-bench`, `ds4-eval`, `ds4-agent`, no warnings. Real-artifact runs above (Q1 capture +
+Q5 3-rep counter runs) all completed end-to-end with coherent, on-topic photosynthesis
+generations, consistent with every prior pass's correctness baseline -- no regression from
+adding the counters (they are pure additive instrumentation: four new counters, one new
+print function gated on an unused-by-default env var, one new call site, no changes to any
+existing control flow or the byte-copy path itself beyond the counter increments
+immediately following it). `ds4-server` stopped for every measurement run in this pass and
+restarted afterward; see confirmation below.
