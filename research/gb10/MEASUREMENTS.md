@@ -18,6 +18,7 @@ Columns: `date · engine · config · tok/s · hit% · GB/token · eff GB/s · n
 
 | date | engine | config | tok/s | hit% | GB/tok | eff GB/s | notes |
 |---|---|---|---|---|---|---|---|
+| 2026-07-31 | **ds4** (cuda-spark) | **DeepSeek-V4-Flash IQ2XXS 81GB, RESIDENT, ctx 8192, --nothink** | **16.29** | n/a (resident) | 0 | n/a | **prefill 37.19 t/s; loaded 80.76 GiB in 25.3 s (~3.2 GB/s); footprint 81.29 GiB of 121 GB. Exceeds published DGX Spark 13.75 t/s by 18%. 68x the streaming baseline.** |
 | 2026-07-31 | colibri 1.3.0 | CPU tier, 49.4 GB budget | 0.22 | 35.5 | 16.74 | 1.73 | reasoning off (engine default) |
 | 2026-07-31 | colibri 1.3.0 | CPU tier, 111 GB budget | 0.22 | **59.6** | 13.76 | 1.48 | cache doubled, tok/s unchanged |
 | 2026-07-31 | colibri 1.3.0 | GPU tier, `EXPERT_GB=55 RAM_GB=40` | 0.21 | 35.9 | 9.12 | 1.32 | tier starved: 224 experts placed |
