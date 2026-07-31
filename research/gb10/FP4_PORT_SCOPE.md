@@ -341,6 +341,100 @@ scope boundary between "fix names" and "hit a structural blocker, stop and docum
 No full-model load was reached this pass (blocked as above); the micro smoke-generation step
 was accordingly not run.
 
+### P1 status update (2026-07-31, cont'd): BF16/Q6_K dense-tensor load-time conversion
+
+Follow-on pass closing the BF16/Q6_K dense-tensor blocker the previous pass stopped at
+(`tensor token_embd.weight has type bf16, expected f16`). Rather than teaching every
+dense-tensor validation/matmul call site a third accepted dtype (a much larger, more
+invasive change touching ~15 CUDA dispatch sites for a format that should never need a
+dedicated GEMM path), this converts BF16 and Q6_K dense tensors to F16 **once, at load
+time**, in `model_open()` -- so every downstream consumer (CPU and CUDA, validation and
+matmul) sees an ordinary F16 tensor and needs no changes at all.
+
+**Conversion helpers** (`ds4.c`): `DS4_TENSOR_BF16` (30) added to the tensor-type enum
+(the `gguf_types[30]` registry row already existed, unused). `bf16_to_f32()` (BF16 is
+exactly the high 16 bits of a binary32, so this is a zero-extend + bitcast, no rounding).
+`f32_to_f16_clamped()` -- unlike the existing `f32_to_f16()` (which lets IEEE-754 overflow
+silently become infinity), this clamps to +-65504 and counts clamps; weights should never
+be large enough to hit it, so a nonzero count is a correctness red flag the load now
+surfaces rather than hides. `dequantize_row_q6_K()` (CPU, ported line-for-line from
+llama.cpp `ggml-quants.c` @5f55650, MIT, same idiom as the pre-existing Q3_K/Q5_K ports --
+Q6_K had a fused `vec_dot` but no dequant-to-float helper of its own before this).
+`convert_row_q6_K_to_f16()` wraps it with a transient per-tensor float scratch buffer (the
+Q6_K dense families this feeds -- attn_q_a/q_b, attn_output_a/b, indexer.attn_q_b -- are
+LoRA-rank sized, small relative to the model, so one tensor's worth of scratch is not a
+full-model memory concern).
+
+**Scope-safe selection, no name matching needed**: `model_convert_dense_bf16_q6k()`
+converts every tensor with GGUF type BF16 or Q6_K **and `ndim <= 2`**. Every dense role ds4
+binds (token embeddings, the output head, attention/FFN projections, LoRA factors) is
+<=2D; routed MoE expert tensors are always 3D (`in, mid, n_expert`). This makes the
+`ndim<=2` filter a purely structural way to skip routed experts -- critically, it also
+means GLM's *genuine* Q6_K/Q5_K **routed** experts (which must stay quantized/streamed, not
+blown up to F16 -- they're the reason Q6_K already had routed-expert dequant support) are
+left untouched by construction, with no risk of a blanket-by-type pass accidentally
+converting them.
+
+**Mechanism (grow the same mapping, not a second one)**: every ds4_tensor's data is
+addressed as `model->map + tensor->abs_offset` throughout the codebase (CPU reads and every
+CUDA dispatch site alike), and there's no per-tensor override-pointer concept to hook a
+second, independent buffer into that addressing scheme without touching every call site.
+So instead of allocating converted tensors elsewhere, this **grows `model->map` itself**:
+reserve an anonymous address range sized to the original file plus the total conversion
+output (computed by one pre-scan of the tensor table for eligible BF16/Q6_K tensors),
+remap the file at the front of that reservation (`MAP_FIXED` into space just reserved, so
+it cannot collide with anything else in the process), then map a writable anonymous
+extension immediately after it. Each eligible tensor is then converted into that extension
+and its `ds4_tensor` mutated in place: `type = F16`, `abs_offset` = its new position in the
+extension, `bytes` recomputed. Runs right after `parse_tensors()` inside `model_open()`,
+before `weights_bind()`/`weights_validate_layout()` (or anything else) ever sees the
+tensor table, so **no validation or matmul code needed any BF16/Q6_K-awareness at all** --
+they only ever observe already-converted F16 tensors.
+
+One subtlety caught by a first crash (SIGSEGV in `tensor_family_key`, via gdb backtrace):
+the original mapping is deliberately **not** unmapped after the switch, because every
+`ds4_tensor.name` (a `ds4_str`) is a raw pointer into it, captured by `parse_tensors()`
+before the remap -- unmapping would leave every tensor name (and this pass's own
+family-notice printing) dangling. Leaking the original mapping is a pure
+virtual-address-space cost (no extra physical memory beyond the handful of header/name
+pages already touched), accepted rather than adding a name-copying step.
+
+**Compat notice, grouped by family not by layer**: `tensor_family_key()` folds a
+`blk.<N>.` layer index out of a tensor name (e.g. `blk.7.attn_kv_latent.weight` ->
+`blk.N.attn_kv_latent.weight`) so one notice line covers all layers of the same tensor
+role, avoiding 43x spam. Verified against the real artifact: 14 distinct families printed
+(`output.weight`, `token_embd.weight`, `blk.N.attn_kv_latent.weight` (bf16, 43 tensors),
+`blk.N.attn_output_a/b.weight` and `blk.N.attn_q_a/b.weight` (q6_k, 43 tensors each),
+`blk.N.ffn_{gate,up,down}_shexp.weight` (bf16, 43 each), `blk.N.attn_compress_{kv,gate}.weight`
+(bf16, 41 -- the two non-compressed early layers excluded), `blk.N.indexer.attn_q_b.weight`
+(q6_k, 21 -- only compress-ratio-4 layers have an indexer), `blk.N.indexer.compress_{kv,gate}.weight`
+and `blk.N.indexer.proj.weight` (bf16, 21 each) -- exactly the tensor families the prior
+pass identified as BF16/Q6_K, and zero clamps fired on any of them.
+
+**Result**: `--inspect` (`--cuda --ssd-streaming --ssd-streaming-cold
+--ssd-streaming-cache-experts 8GB`) now gets past the BF16/Q6_K dense-tensor class of
+blocker entirely -- no further `has type bf16/q6_k, expected f16` anywhere in the run --
+and reaches a new, **structurally different** blocker: `tensor hc_head_fn has type f32,
+expected f16`. `hc_head_fn` (the top-level hyper-connection function tensor, bound via the
+`output_hc_fn.weight` -> `hc_head_fn` alias from the earlier tensor-name-compat pass) is
+stored as **F32** in this file, not BF16 or Q6_K -- a third, distinct dtype-mismatch case
+on a tensor outside this pass's scope (top-level `hc_head_fn`/`hc_head_base`/`hc_head_scale`
+were not part of the BF16/Q6_K family list the previous pass identified; `hc_head_base` and
+`hc_head_scale` are F32-typed *and* F32-expected already, so only `hc_head_fn` mismatches).
+Per this ticket's own scope boundary, this is reported rather than folded in as a "same
+class" fix: F32->F16 narrowing for a hyper-connection routing tensor is a different
+precision-loss profile than BF16/Q6_K->F16 (BF16 and Q6_K already carry less mantissa
+precision than F16 in the directions that matter, so widening to F16 is loss-free/near-
+loss-free by construction; truncating an actual F32 tensor is a real new precision
+question the ticket didn't scope) and deserves its own explicit sign-off rather than being
+silently swept into this pass. No full-model load was reached; the micro smoke-generation
+step was accordingly not run this pass either.
+
+**Verification**: `make cuda-spark` -- clean build, no warnings. `./ds4_test` -- 6
+failures, all within the pre-existing flaky set from the prior pass's own two-run
+comparison (`tool-call-quality`, `think-tool-recovery`, `logprob-vectors`, `metal-kernels`;
+`metal-tensor-equivalence` passed this run). No new failing test names.
+
 ## Target artifact
 
 Chosen (checkpoint hunt 2026-07-31): **lovedheart/DeepSeek-V4-Flash-GGUF**
