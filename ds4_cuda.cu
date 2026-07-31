@@ -12158,6 +12158,30 @@ __global__ static void mxfp4_dequant_f16_kernel(
     }
 }
 
+/* Single-block (32-elem) MXFP4 dot product against an f32 activation
+ * slice, in registers -- no dequant materialization. Same block layout
+ * and E2M1/E8M0 decode as mxfp4_dequant_f16_kernel above, reused here for
+ * the P3a fused decode (n_tokens==1) routed-MoE matvec kernels below
+ * (moe_gate_up_mid_fused_fp4q3k_decode_kernel /
+ * moe_down_fused_fp4q3k_decode_kernel), which read this straight from the
+ * streaming selected-expert cache with no host readback and no f16
+ * intermediate, mirroring dev_iq2_xxs_dot_f32 / dev_q2_K_dot_f32's
+ * "decode straight from quantized blocks" idiom. */
+__device__ static float dev_mxfp4_dot_f32(const unsigned char *blk, const float *x) {
+    const float d = mxfp4_e8m0_to_fp32_half_dev(blk[0]);
+    const unsigned char *qs = blk + 1;
+    float acc = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < 16; j++) {
+        const uint8_t byte = qs[j];
+        const int8_t x0 = kvalues_mxfp4_dev[byte & 0x0F];
+        const int8_t x1 = kvalues_mxfp4_dev[byte >> 4];
+        acc += d * (float)x0 * x[j];
+        acc += d * (float)x1 * x[j + 16];
+    }
+    return acc;
+}
+
 static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
     if (!out || !x || !model_map) return 0;
     uint64_t blocks = (in_dim + 31) / 32;
@@ -20977,6 +21001,54 @@ __global__ static void q3_k_dequant_f16_kernel(
     }
 }
 
+/* Single-block (256-elem QK_K super-block) Q3_K dot product against an
+ * f32 activation slice, in registers -- line-for-line the same
+ * scale/hmask/qs decode as q3_k_dequant_f16_kernel above, just
+ * accumulating a dot product instead of writing a dequantized row. Used
+ * by the P3a fused decode (n_tokens==1) routed-MoE matvec kernels below. */
+__device__ static float dev_q3_k_dot_f32(const unsigned char *blk, const float *x) {
+    const unsigned char *hm = blk;
+    const unsigned char *qp0 = blk + 32u;
+    const unsigned char *sc8 = blk + 96u;
+    const float d_all = __half2float(*reinterpret_cast<const __half *>(blk + 108));
+
+    uint32_t aux[4];
+    memcpy(aux, sc8, 12);
+    const uint32_t kmask1 = 0x03030303u;
+    const uint32_t kmask2 = 0x0f0f0f0fu;
+    const uint32_t tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+    aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    const int8_t *scales = reinterpret_cast<const int8_t *>(aux);
+
+    float acc = 0.0f;
+    int is = 0;
+    uint8_t m = 1;
+    const unsigned char *qp = qp0;
+    int oi = 0;
+    for (int n = 0; n < 256; n += 128) {
+        int shift = 0;
+        for (int j = 0; j < 4; j++) {
+            float dl = d_all * (float)(scales[is++] - 32);
+            for (int l = 0; l < 16; l++) {
+                int8_t v = (int8_t)((qp[l + 0] >> shift) & 3) - ((hm[l + 0] & m) ? 0 : 4);
+                acc += dl * (float)v * x[oi++];
+            }
+            dl = d_all * (float)(scales[is++] - 32);
+            for (int l = 0; l < 16; l++) {
+                int8_t v = (int8_t)((qp[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4);
+                acc += dl * (float)v * x[oi++];
+            }
+            shift += 2;
+            m = (uint8_t)(m << 1);
+        }
+        qp += 32;
+    }
+    return acc;
+}
+
 /* Q5_K (GGUF tensor type 13) streaming dequant, same fallback role as
  * q3_k_dequant_f16_kernel above. Mirrors ds4.c's dequantize_row_q5_K
  * (ported from llama.cpp ggml-quants.c @5f55650, MIT), reusing the
@@ -21315,6 +21387,245 @@ static int routed_moe_dequant_gemm_dispatch(
     return cuda_ok(cudaGetLastError(), "routed_moe dequant gemm sum launch");
 }
 
+/* P3a: fused decode (n_tokens==1) matvec kernels for MXFP4/Q3_K routed
+ * experts, cloning the block/warp organization of the IQ2_XXS+Q2_K fused
+ * decode kernels above (moe_gate_up_mid_mid_kernel /
+ * moe_down_f32_kernel): one CUDA block per (out-row, token*n_expert-slot)
+ * pair, device-side `selected[]` indexing (no host readback -- unlike
+ * routed_moe_dequant_gemm_dispatch's per-call device->host sync of the
+ * selected-expert table), each thread decoding a strided subset of
+ * quantized blocks straight into a dot-product accumulator (register
+ * decode, no f16 intermediate materialization, no cuBLAS call), then a
+ * shared-memory tree reduction to one value per block -- identical
+ * reduction shape to the IQ2_XXS/Q2_K kernels' own `partial[256]`
+ * tree. gate/up consume f32 activations directly (`x`), matching what
+ * the IQ2_XXS+Q2_K decode kernels consume (not q8_K-staged -- q8_K
+ * staging in this codebase is specific to the Q4_K fused path's own
+ * decode kernels, which this file's dozens of Q4_K-specific boolean
+ * specializations make impractical to cross a single ticket pass;
+ * documented deviation, see FP4_PORT_SCOPE.md P3a section).
+ *
+ * Type selection is a compile-time template bool (two instantiations per
+ * kernel: MXFP4 and Q3_K) rather than a runtime branch, so each
+ * instantiated kernel has a single decode path with no divergent branch
+ * inside the per-block loop. gate_type/up_type are always equal (ds4's
+ * pre-existing load-time invariant); down_type is looked up
+ * independently, exactly mirroring routed_moe_dequant_gemm_dispatch's
+ * own gate/down-independent type lookup. */
+template <bool GATE_MXFP4>
+__global__ static void moe_gate_up_mid_fused_fp4q3k_decode_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const float *x,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        float clamp) {
+    uint32_t row = blockIdx.x;
+    uint32_t pair = blockIdx.y;
+    if (row >= expert_mid_dim) return;
+    uint32_t tok = pair / n_expert;
+    uint32_t slot = pair - tok * n_expert;
+    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) expert_i = 0;
+    uint32_t expert = (uint32_t)expert_i;
+    const float *xr = x + (uint64_t)tok * expert_in_dim;
+    const unsigned char *gr = (const unsigned char *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+    const unsigned char *ur = (const unsigned char *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+    float gate = 0.0f;
+    float up = 0.0f;
+    if (GATE_MXFP4) {
+        const uint32_t nb = expert_in_dim / 32u;
+        for (uint32_t b = threadIdx.x; b < nb; b += blockDim.x) {
+            gate += dev_mxfp4_dot_f32(gr + (uint64_t)b * 17u, xr + (uint64_t)b * 32u);
+            up += dev_mxfp4_dot_f32(ur + (uint64_t)b * 17u, xr + (uint64_t)b * 32u);
+        }
+    } else {
+        const uint32_t nb = expert_in_dim / 256u;
+        for (uint32_t b = threadIdx.x; b < nb; b += blockDim.x) {
+            gate += dev_q3_k_dot_f32(gr + (uint64_t)b * 110u, xr + (uint64_t)b * 256u);
+            up += dev_q3_k_dot_f32(ur + (uint64_t)b * 110u, xr + (uint64_t)b * 256u);
+        }
+    }
+    __shared__ float partial_gate[256];
+    __shared__ float partial_up[256];
+    partial_gate[threadIdx.x] = gate;
+    partial_up[threadIdx.x] = up;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial_gate[threadIdx.x] += partial_gate[threadIdx.x + stride];
+            partial_up[threadIdx.x] += partial_up[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        gate = partial_gate[0];
+        up = partial_up[0];
+        if (clamp > 1.0e-6f) {
+            if (gate > clamp) gate = clamp;
+            if (up > clamp) up = clamp;
+            if (up < -clamp) up = -clamp;
+        }
+        const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+        gate_out[off] = gate;
+        up_out[off] = up;
+        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+    }
+}
+
+template <bool DOWN_MXFP4>
+__global__ static void moe_down_fused_fp4q3k_decode_kernel(
+        float *down_out,
+        const char *down_base,
+        const float *mid,
+        const int32_t *selected,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        uint32_t n_expert) {
+    uint32_t row = blockIdx.x;
+    uint32_t pair = blockIdx.y;
+    if (row >= out_dim) return;
+    uint32_t tok = pair / n_expert;
+    uint32_t slot = pair - tok * n_expert;
+    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) expert_i = 0;
+    const unsigned char *wr = (const unsigned char *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
+    const float *xr = mid + (uint64_t)pair * expert_mid_dim;
+    float acc = 0.0f;
+    if (DOWN_MXFP4) {
+        const uint32_t nb = expert_mid_dim / 32u;
+        for (uint32_t b = threadIdx.x; b < nb; b += blockDim.x) {
+            acc += dev_mxfp4_dot_f32(wr + (uint64_t)b * 17u, xr + (uint64_t)b * 32u);
+        }
+    } else {
+        const uint32_t nb = expert_mid_dim / 256u;
+        for (uint32_t b = threadIdx.x; b < nb; b += blockDim.x) {
+            acc += dev_q3_k_dot_f32(wr + (uint64_t)b * 110u, xr + (uint64_t)b * 256u);
+        }
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = acc;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) down_out[(uint64_t)pair * out_dim + row] = partial[0];
+}
+
+/* Returns true iff `type` is one of the two types the fused decode
+ * kernels above natively decode (MXFP4=39, Q3_K=11). Q5_K stays on the
+ * generic dequant+GEMM fallback even for decode (out of this pass's
+ * scope per the ticket). */
+static bool fused_fp4q3k_decode_type_supported(uint32_t type) {
+    return type == 39u || type == 11u;
+}
+
+/* Dispatcher for the fused decode kernels, called from routed_moe_launch
+ * only when n_tokens==1 and both gate/up and down types are in
+ * {MXFP4, Q3_K}. Structurally the decode-shaped sibling of
+ * routed_moe_dequant_gemm_dispatch above, but: (a) no per-call device->
+ * host readback of the selected-expert table (the kernels index
+ * `selected` device-side, same as the Q4_K/IQ2_XXS fused paths), and (b)
+ * no per-pair cuBLAS GEMM / f16 dequant materialization -- one kernel
+ * launch handles every (token,expert) pair in the grid's y-dimension. */
+static int routed_moe_fused_fp4q3k_decode_dispatch(
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *gate,
+        ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *down,
+        const char *gate_w,
+        const char *up_w,
+        const char *down_w,
+        uint32_t gate_type,
+        uint32_t down_type,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_expert,
+        float clamp,
+        const ds4_gpu_tensor *x,
+        uint32_t n_tokens,
+        int owned_filtered) {
+    if (!fused_fp4q3k_decode_type_supported(gate_type) ||
+        !fused_fp4q3k_decode_type_supported(down_type)) {
+        return 0;
+    }
+    const uint32_t gate_block_elems = dequant_gemm_block_elems(gate_type);
+    const uint32_t down_block_elems = dequant_gemm_block_elems(down_type);
+    if (expert_in_dim % gate_block_elems != 0u || expert_mid_dim % gate_block_elems != 0u ||
+        expert_mid_dim % down_block_elems != 0u) {
+        return 0;
+    }
+    const uint32_t in_blocks = expert_in_dim / gate_block_elems;
+    const uint32_t mid_blocks = expert_mid_dim / down_block_elems;
+    if (gate_row_bytes != (uint64_t)in_blocks * dequant_gemm_block_bytes(gate_type) ||
+        down_row_bytes != (uint64_t)mid_blocks * dequant_gemm_block_bytes(down_type)) {
+        return 0;
+    }
+
+    const uint32_t pair_count = n_tokens * n_expert;
+    const dim3 grid_gate_up(expert_mid_dim, pair_count, 1);
+    const dim3 grid_down(out_dim, pair_count, 1);
+    const unsigned threads = 256;
+
+    if (gate_type == 39u) {
+        moe_gate_up_mid_fused_fp4q3k_decode_kernel<true><<<grid_gate_up, threads>>>(
+                (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                gate_w, up_w, (const float *)x->ptr,
+                (const int32_t *)selected->ptr, (const float *)weights->ptr,
+                gate_expert_bytes, gate_row_bytes, expert_in_dim, expert_mid_dim, n_expert, clamp);
+    } else {
+        moe_gate_up_mid_fused_fp4q3k_decode_kernel<false><<<grid_gate_up, threads>>>(
+                (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                gate_w, up_w, (const float *)x->ptr,
+                (const int32_t *)selected->ptr, (const float *)weights->ptr,
+                gate_expert_bytes, gate_row_bytes, expert_in_dim, expert_mid_dim, n_expert, clamp);
+    }
+    if (!cuda_ok(cudaGetLastError(), "routed_moe fused fp4/q3k decode gate/up launch")) return 0;
+
+    if (down_type == 39u) {
+        moe_down_fused_fp4q3k_decode_kernel<true><<<grid_down, threads>>>(
+                (float *)down->ptr, down_w, (const float *)mid->ptr,
+                (const int32_t *)selected->ptr,
+                down_expert_bytes, down_row_bytes, expert_mid_dim, out_dim, n_expert);
+    } else {
+        moe_down_fused_fp4q3k_decode_kernel<false><<<grid_down, threads>>>(
+                (float *)down->ptr, down_w, (const float *)mid->ptr,
+                (const int32_t *)selected->ptr,
+                down_expert_bytes, down_row_bytes, expert_mid_dim, out_dim, n_expert);
+    }
+    if (!cuda_ok(cudaGetLastError(), "routed_moe fused fp4/q3k decode down launch")) return 0;
+
+    const uint64_t n = (uint64_t)n_tokens * out_dim;
+    if (owned_filtered) {
+        moe_sum_owned_kernel<<<(unsigned)((n + 255) / 256), 256>>>(
+                (float *)out->ptr, (const float *)down->ptr,
+                (const int32_t *)selected->ptr, out_dim, n_expert, n_tokens);
+    } else {
+        moe_sum_kernel<<<(unsigned)((n + 255) / 256), 256>>>(
+                (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
+    }
+    return cuda_ok(cudaGetLastError(), "routed_moe fused fp4/q3k decode sum launch");
+}
+
 static int routed_moe_launch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -21373,6 +21684,19 @@ static int routed_moe_launch(
         dequant_gemm_type_supported(gate_type) &&
         dequant_gemm_type_supported(down_type);
     if (!dequant_gemm_path && !q4k_path && !iq2_q2k_path) return 0;
+    /* P3a: fused decode (n_tokens==1) matvec kernels for MXFP4/Q3_K
+     * routed experts, mirroring the Q4_K/IQ2_XXS fused paths' device-side
+     * selected-cache indexing instead of dequant_gemm_path's per-call
+     * host readback + per-pair cuBLAS. Prefill (n_tokens>1) always falls
+     * through to dequant_gemm_path unchanged, per the ticket's own scope
+     * boundary. DS4_CUDA_DISABLE_FUSED_FP4_DECODE=1 is the escape hatch
+     * back to dequant_gemm_path, mirroring the existing
+     * DS4_CUDA_DISABLE_DEQUANT_GEMM_SELECTED_EXPERT_VIEWS idiom. */
+    const int fused_fp4q3k_decode_path =
+        n_tokens == 1u && !q4k_path && !iq2_q2k_path &&
+        fused_fp4q3k_decode_type_supported(gate_type) &&
+        fused_fp4q3k_decode_type_supported(down_type) &&
+        getenv("DS4_CUDA_DISABLE_FUSED_FP4_DECODE") == NULL;
     /* Q4_K routed-MoE dispatch:
      *   n_tokens == 1 and n_expert == 6:
      *                  use_direct_down_sum + moe_gate_up_mid_decode_q4K_qwarp32
@@ -21440,6 +21764,18 @@ static int routed_moe_launch(
         cuda_resolve_weight_ptr(model_map, down_offset, down_bytes,
                                 logical_tier, "moe_down");
     if (!gate_w || !up_w || !down_w) return 0;
+
+    if (fused_fp4q3k_decode_path) {
+        return routed_moe_fused_fp4q3k_decode_dispatch(
+                out, gate, up, mid, down,
+                gate_w, up_w, down_w,
+                gate_type, down_type,
+                gate_expert_bytes, gate_row_bytes,
+                down_expert_bytes, down_row_bytes,
+                expert_in_dim, expert_mid_dim, out_dim,
+                selected, weights, n_expert, clamp, x, n_tokens,
+                owned_filtered);
+    }
 
     if (dequant_gemm_path) {
         return routed_moe_dequant_gemm_dispatch(

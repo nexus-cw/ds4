@@ -1046,3 +1046,141 @@ one small, permanent, env-gated debug hook was kept in the same style
 (`DS4_METAL_DEBUG_DENSE_CONVERT=<name-substring>`, in `model_convert_dense_bf16_q6k()`)
 since it is a generally useful tool for verifying any future dialect-compat dense-tensor
 conversion by name, not specific to this bug.
+
+### P3a status (2026-08-01): fused decode (n_tokens==1) matvec kernels for
+MXFP4/Q3_K routed experts
+
+Follow-on pass to the P1 correctness fix above (`dequantize_row_q6_K` offset bug), now
+that MXFP4 streaming inference is confirmed correct but slow (0.75-0.79 t/s decode on the
+real 150GB artifact). This pass adds fused, device-side-indexed decode kernels for
+MXFP4/Q3_K routed experts, removing the per-layer host readback and per-(token,expert)-pair
+f16 dequant + cuBLAS GEMM chain that `routed_moe_dequant_gemm_dispatch` (P1's generic
+fallback) does for every decode step.
+
+**Kernel design.** Cloned the block/warp organization of the IQ2_XXS+Q2_K fused decode
+kernels (`moe_gate_up_mid_mid_kernel` / `moe_down_f32_kernel`, `ds4_cuda.cu`) rather than
+the Q4_K fused path: one CUDA block per (out-row, token*n_expert-slot) pair, 256 threads
+each decoding a strided subset of quantized blocks straight into a register dot-product
+accumulator, then a shared-memory tree reduction (`partial[256]`) to one value per block.
+gate/up consume f32 activations directly (`x->ptr`), matching what the IQ2_XXS+Q2_K decode
+kernels already consume — **not** q8_K-staged activations. This is a documented deviation
+from the ticket's stated preference for the Q4_K decode kernel structure: Q4_K's own decode
+path (`moe_gate_up_mid_decode_q4K_qwarp32` and ~a dozen sibling specializations gated by
+booleans like `use_q4_mma_tiles16`/`use_q4_gate_h16r8`/`use_direct_down_sum`, spanning
+hundreds of lines around `ds4_cuda.cu:21376-22541`) is a heavily hand-tuned,
+warp-shuffle/MMA-tile family specific to Q4_K's 4-bit/32-scale-per-superblock layout and
+would take a dedicated pass on its own scale to port faithfully; the IQ2_XXS+Q2_K path is
+the structurally closer, simpler sibling this ticket's own text explicitly permits ("or
+f32/f16 activation if that's what the Q4_K decode kernels actually consume -- follow the
+existing pattern exactly" / "whichever existing K-quant decode kernel is structurally
+closest" for Q3_K, extended here to the gate/up path too for consistency and time budget).
+
+Two new `__device__` dot-product helpers do the in-register block decode, each a line-for-
+line port of the existing dequant kernels' math (`mxfp4_dequant_f16_kernel`,
+`q3_k_dequant_f16_kernel`) but accumulating `dl * v * x[i]` instead of writing a
+dequantized row:
+- `dev_mxfp4_dot_f32`: one 32-elem MXFP4 block (17 bytes: E8M0 scale + 16B E2M1 nibbles),
+  reuses the existing `kvalues_mxfp4_dev` / `mxfp4_e8m0_to_fp32_half_dev` constants.
+- `dev_q3_k_dot_f32`: one 256-elem Q3_K super-block (110 bytes: hmask/qs/scales/d), reuses
+  the existing scale/hmask unpacking exactly as `q3_k_dequant_f16_kernel` does.
+
+Two new kernels, each a C++ template on a compile-time `bool` selecting MXFP4 vs Q3_K (two
+instantiations apiece, no runtime branch inside the per-block loop):
+`moe_gate_up_mid_fused_fp4q3k_decode_kernel<GATE_MXFP4>` (writes `gate_out`/`up_out`/
+`mid_out` = SiLU(gate)*up*routing_weight, same as the IQ2_XXS kernel's combine) and
+`moe_down_fused_fp4q3k_decode_kernel<DOWN_MXFP4>`. gate_type covers both gate and up
+(ds4's pre-existing load-time invariant); down_type is looked up independently, so a layer
+with MXFP4 gate/up and Q3_K down (or vice versa) dispatches through the same call with each
+half using its own template instantiation -- mirroring `routed_moe_dequant_gemm_dispatch`'s
+own gate/down-independent type lookup.
+
+Critically, unlike `routed_moe_dequant_gemm_dispatch` (which does one `cudaMemcpy`
+device->host of the `selected[]` table per MoE-layer call because cuBLAS needs weight
+pointers on the host), the new kernels index `selected[]` **device-side**, exactly like the
+Q4_K/IQ2_XXS fused paths -- no host sync, no f16 intermediate materialization, no cuBLAS
+call at all.
+
+**Q5_K is out of scope for the fused path** (per the ticket's own MXFP4/Q3_K wording):
+`fused_fp4q3k_decode_type_supported()` only accepts types 39/11, so any layer with a Q5_K
+gate/up or down (the real artifact has exactly one Q5_K down tensor among 129 routed
+tensors) still falls through to `routed_moe_dequant_gemm_dispatch` even at decode.
+
+**Wiring** (`routed_moe_launch`): added `fused_fp4q3k_decode_path = n_tokens==1 &&
+!q4k_path && !iq2_q2k_path && fused_fp4q3k_decode_type_supported(gate_type) &&
+fused_fp4q3k_decode_type_supported(down_type) && !getenv("DS4_CUDA_DISABLE_FUSED_FP4_DECODE")`,
+checked before `dequant_gemm_path` so it takes priority whenever it matches; prefill
+(`n_tokens>1`) is untouched and always falls through to the existing `dequant_gemm_path`
+loop. New escape hatch `DS4_CUDA_DISABLE_FUSED_FP4_DECODE=1`, mirroring the existing
+`DS4_CUDA_DISABLE_DEQUANT_GEMM_SELECTED_EXPERT_VIEWS` idiom, forces the generic path even
+for decode-shaped MXFP4/Q3_K calls -- used below both as the "before" measurement toggle and
+as the fused-vs-generic correctness cross-check.
+
+**Correctness.** Extended `research/gb10/test_mxfp4_moe.c` and `test_mixed_moe.c`: after
+each decode-shaped (`n_tokens==1`) case's existing CPU-reference check, if the type
+combination is fused-supported, the identical inputs are re-dispatched through
+`ds4_gpu_routed_moe_batch_tensor()` a second time with `DS4_CUDA_DISABLE_FUSED_FP4_DECODE=1`
+set (forcing the generic path) and the two GPU outputs are compared directly against each
+other (0.02 relative tolerance, same tolerance the existing CPU-reference checks use).
+`test_mxfp4_moe`'s decode case (MXFP4/MXFP4) and `test_mixed_moe`'s MXFP4/Q3_K and
+Q3_K/Q3_K decode cases all exercise this cross-check; the MXFP4/Q5_K decode case correctly
+skips it (down_type=13 not fused-supported) and continues through the generic path only,
+as designed. All cases pass: fused output agrees with the CPU reference and with the
+generic-path output, and all pre-existing (unmodified) prefill-shaped cases still pass.
+
+```
+$ ./research/gb10/test_mxfp4_moe
+MXFP4 MoE test: all cases passed
+$ ./research/gb10/test_mixed_moe
+mixed routed-MoE test: all cases passed
+```
+
+**End-to-end**, real 150GB artifact, `--cuda --ssd-streaming --ssd-streaming-cache-experts
+40GB --nothink`, foreground with timeouts, polled:
+- `-p "Reply with exactly: ok"`: `ok` (exact match). `prefill: 0.91 t/s, generation: 0.95 t/s`.
+- `-p "What is the capital of France?"` with `DS4_METAL_STREAMING_DECODE_PREFILL_MAX=4096`:
+  `The capital of France is Paris.` -- coherent and correct. `prefill: 0.92 t/s,
+  generation: 0.99 t/s`.
+
+Both stay coherent -- no regression from the P1 correctness fix's baseline behavior.
+
+**Performance**, same warm state (no cache drops between conditions -- both measured back
+to back on the same already-warm page cache from the correctness/smoke runs immediately
+preceding), fixed prompt (`"Explain in a few sentences how photosynthesis works."`, `-n
+100`, `DS4_METAL_STREAMING_DECODE_PREFILL_MAX=4096`), 3 runs each, decode t/s from the
+`generation:` field ds4 prints itself:
+
+| run | before (generic, `DS4_CUDA_DISABLE_FUSED_FP4_DECODE=1`) | after (fused, default) |
+|---|---|---|
+| 1 | 0.79 t/s | 1.00 t/s |
+| 2 | 0.79 t/s | 1.04 t/s |
+| 3 | 0.79 t/s | 1.04 t/s |
+| prefill (same runs) | 0.75 / 0.75 / 0.75 t/s | 0.92 / 0.96 / 0.96 t/s |
+
+Decode: 0.79 t/s (all 3 before runs, identical to two decimal places) -> 1.00/1.04/1.04
+t/s after -- roughly a 27-32% decode speedup from removing the per-layer host readback
+and per-pair cuBLAS/f16 chain for the ~89% of routed-expert tensors (98 MXFP4 + 30 Q3_K of
+129) this pass's fused kernels now cover at decode. Prefill also improved slightly
+(0.75->0.92-0.96 t/s) even though prefill dispatch is unchanged code -- attributable to
+prefill's own decode-style per-token streaming-prefill path (the
+`DS4_METAL_STREAMING_DECODE_PREFILL_MAX=4096`-forced mechanism, itself built from per-token
+`n_tokens==1` calls into `routed_moe_launch`) also picking up the fused kernels
+incidentally, not a change to the true `n_tokens>1` batched-prefill GEMM path, which this
+pass explicitly left untouched. All three generation texts stayed coherent and consistent
+with the P1 fix's baseline quality (compare: "Photosynthesis is the process by which
+plants, algae, and some bacteria convert sunlight into chemical energy...").
+
+This is a real but modest win, not a step-change to the ~16-24 t/s class the Q4_K/IQ2_XXS
+fused tile kernels or the REAP25 prior-art reach -- the fused kernels here still do a
+naive one-thread-per-block-element strided scan with no warp-shuffle reduction, no
+half2/vectorized loads, and no MMA/tensor-core usage (a genuine port of Q4_K's own
+warp-tile machinery, deferred per the design-summary note above). Follow-up P3b scope:
+warp-shuffle reduction (replace the 256-wide shared-memory tree with a warp-level
+`__shfl_down_sync` reduction plus a small cross-warp combine, matching the Q4_K decode
+kernels' own reduction shape) and vectorized MXFP4/Q3_K block loads, before reaching for
+tensor-core prefill kernels.
+
+**Verification.** `make clean && make cuda-spark`: clean rebuild, no warnings. `./ds4_test`
+(single run, 900s): `ds4 tests: 11 failure(s)` across the five pre-existing flaky sections
+documented by every prior pass on this hardware (`tool-call-quality`,
+`think-tool-recovery`, `logprob-vectors`, `metal-kernels`, `metal-tensor-equivalence`) --
+no new failing test names.

@@ -260,6 +260,57 @@ static int run_case(uint32_t n_tokens, uint32_t n_expert, uint32_t n_total_exper
         check_close(label, gpu_out[i], ref_out[i], 0.02f);
     }
 
+    /* P3a: decode-shaped (n_tokens==1) MXFP4/MXFP4 calls now take the new
+     * fused decode kernel path (routed_moe_fused_fp4q3k_decode_dispatch)
+     * by default. Re-run the identical call with
+     * DS4_CUDA_DISABLE_FUSED_FP4_DECODE=1 to force the pre-existing
+     * generic dequant+GEMM path (routed_moe_dequant_gemm_dispatch) on the
+     * exact same inputs, and require the two GPU paths to agree with each
+     * other (not just each independently against the CPU reference
+     * above) -- this is the direct fused-vs-generic cross-check the P3a
+     * ticket asked for. */
+    if (n_tokens == 1u) {
+        setenv("DS4_CUDA_DISABLE_FUSED_FP4_DECODE", "1", 1);
+        ds4_gpu_tensor *t_out2 = ds4_gpu_tensor_alloc((uint64_t)n_tokens * out_dim * sizeof(float));
+        ds4_gpu_tensor *t_gate2 = ds4_gpu_tensor_alloc((uint64_t)n_tokens * n_expert * mid_dim * sizeof(float));
+        ds4_gpu_tensor *t_up2 = ds4_gpu_tensor_alloc((uint64_t)n_tokens * n_expert * mid_dim * sizeof(float));
+        ds4_gpu_tensor *t_mid2 = ds4_gpu_tensor_alloc((uint64_t)n_tokens * n_expert * mid_dim * sizeof(float));
+        ds4_gpu_tensor *t_down2 = ds4_gpu_tensor_alloc((uint64_t)n_tokens * n_expert * out_dim * sizeof(float));
+        bool mid_is_f16_2 = false;
+        int ok2 = ds4_gpu_routed_moe_batch_tensor(
+                t_out2, t_gate2, t_up2, t_mid2, t_down2,
+                model, model_size,
+                gate_offset, up_offset, down_offset,
+                39u /* MXFP4 */, 39u /* MXFP4 */,
+                gate_expert_bytes, gate_row_bytes,
+                down_expert_bytes, down_row_bytes,
+                in_dim, mid_dim, out_dim,
+                t_selected, t_weights,
+                n_total_expert, n_expert,
+                0.0f /* clamp */, t_x,
+                0 /* layer_index */, n_tokens,
+                &mid_is_f16_2, false);
+        unsetenv("DS4_CUDA_DISABLE_FUSED_FP4_DECODE");
+        if (!ok2) {
+            fprintf(stderr, "FAIL: generic-path (fused-disabled) dispatch returned 0\n");
+            g_fail = 1;
+        } else {
+            float *gpu_out_generic = (float *)malloc((size_t)n_tokens * out_dim * sizeof(float));
+            ds4_gpu_tensor_read(t_out2, 0, gpu_out_generic, (uint64_t)n_tokens * out_dim * sizeof(float));
+            for (uint32_t i = 0; i < n_tokens * out_dim; i++) {
+                char label[80];
+                snprintf(label, sizeof(label), "fused-vs-generic out[%u]", i);
+                check_close(label, gpu_out[i], gpu_out_generic[i], 0.02f);
+            }
+            free(gpu_out_generic);
+        }
+        ds4_gpu_tensor_free(t_out2);
+        ds4_gpu_tensor_free(t_gate2);
+        ds4_gpu_tensor_free(t_up2);
+        ds4_gpu_tensor_free(t_mid2);
+        ds4_gpu_tensor_free(t_down2);
+    }
+
     ds4_gpu_tensor_free(t_out);
     ds4_gpu_tensor_free(t_gate);
     ds4_gpu_tensor_free(t_up);
