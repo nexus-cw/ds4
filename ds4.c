@@ -21057,6 +21057,18 @@ static bool metal_graph_streaming_expert_cache_seed_layer_expected(
     return type == DS4_TENSOR_Q2_K || type == DS4_TENSOR_Q4_K;
 }
 
+/* Types the CUDA generic dequant+GEMM routed-expert fallback (ds4_cuda.cu's
+ * dequant_gemm_type_supported / routed_moe_dequant_gemm_dispatch family --
+ * MXFP4, Q3_K, Q5_K as of this port) can dequant a routed-expert row from.
+ * Kept in lock-step with that table by hand: it exists only to decide
+ * whether the *selected-expert streaming cache* below is worth populating
+ * for a given tensor, not to gate the dequant kernels themselves. */
+static bool metal_graph_dequant_gemm_selected_slots_type(uint32_t type) {
+    return type == DS4_TENSOR_MXFP4 ||
+           type == DS4_TENSOR_Q3_K ||
+           type == DS4_TENSOR_Q5_K;
+}
+
 static bool metal_graph_decode_cuda_selected_slots_expected(
         const ds4_gpu_graph     *g,
         const ds4_layer_weights *layer) {
@@ -21084,7 +21096,16 @@ static bool metal_graph_decode_cuda_selected_slots_expected(
         layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
         layer->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
         getenv("DS4_METAL_DISABLE_IQ2_SELECTED_EXPERT_VIEWS") == NULL;
-    return q4 || iq2;
+    /* Generic dequant+GEMM fallback family (MXFP4/Q3_K/Q5_K): gate and up
+     * are always the same type (ds4's cross-family load-time invariant),
+     * down is looked up independently, mirroring
+     * routed_moe_launch's dequant_gemm_path selection in ds4_cuda.cu. */
+    const bool dequant_gemm =
+        metal_graph_dequant_gemm_selected_slots_type(layer->ffn_gate_exps->type) &&
+        metal_graph_dequant_gemm_selected_slots_type(layer->ffn_up_exps->type) &&
+        metal_graph_dequant_gemm_selected_slots_type(layer->ffn_down_exps->type) &&
+        getenv("DS4_CUDA_DISABLE_DEQUANT_GEMM_SELECTED_EXPERT_VIEWS") == NULL;
+    return q4 || iq2 || dequant_gemm;
 #else
     (void)g;
     (void)layer;
@@ -21337,7 +21358,18 @@ static bool metal_graph_decode_set_hash_selected_override(
                                                       down_tensor_bytes);
     const bool iq2_selected =
         metal_graph_decode_iq2_selected_slots_expected(g, layer);
-    if (!q4_selected && !iq2_selected) {
+    /* Generic dequant+GEMM fallback family (MXFP4/Q3_K/Q5_K): hash layers
+     * (ffn_gate_tid2eid present) never run the GPU router-select + readback
+     * path this function stands in for, so without this branch a hash
+     * layer using these types would never populate the CUDA selected-expert
+     * streaming cache at all -- same gap metal_graph_decode_cuda_selected_slots_expected
+     * closes for non-hash layers, mirrored here for the hash-layer case. */
+    const bool dequant_gemm_selected =
+        metal_graph_dequant_gemm_selected_slots_type(layer->ffn_gate_exps->type) &&
+        metal_graph_dequant_gemm_selected_slots_type(layer->ffn_up_exps->type) &&
+        metal_graph_dequant_gemm_selected_slots_type(layer->ffn_down_exps->type) &&
+        getenv("DS4_CUDA_DISABLE_DEQUANT_GEMM_SELECTED_EXPERT_VIEWS") == NULL;
+    if (!q4_selected && !iq2_selected && !dequant_gemm_selected) {
         return true;
     }
 

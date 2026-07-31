@@ -551,6 +551,128 @@ and `ds4_cuda.cu` changes in this update. `./ds4_test` -- 6 failures, same names
 prior run (`tool-call-quality`, `think-tool-recovery`, `logprob-vectors`, `metal-kernels`);
 no new failing test names.
 
+### P1 status update (2026-08-01): wire the generic dequant+GEMM routed-MoE path into
+CUDA SSD streaming's selected-expert cache
+
+Follow-on pass closing the streaming-expert-cache gap the previous pass stopped at
+(`ds4: CUDA streaming selected experts are unavailable for layer 0` /
+`prompt processing failed: cuda prefill failed`, first hit running the real 150GB
+artifact end-to-end under `--ssd-streaming`).
+
+**Root cause, traced (not guessed) by reading the fused paths' own protocol**:
+`routed_moe_launch` (`ds4_cuda.cu`) gates *every* routed-MoE branch (fused Q4_K,
+fused IQ2_XXS+Q2_K, and the generic dequant+GEMM family alike) on a single shared
+check: under `--ssd-streaming`, it refuses to run unless the per-layer
+`g_stream_selected_cache` ("which experts are selected this step, plus their
+host-resolved gate/up/down device pointers") is already populated and matches the
+current layer/model/offsets -- if not, it prints the "streaming selected experts are
+unavailable" line and returns 0. This check itself was never type-specific; the
+generic MXFP4/Q3_K/Q5_K path was already going through the *same* gate the fused
+paths use, contrary to what the previous pass's blocker message suggested at first
+read. The actual gap was one level up, in `ds4.c`, at the two places that *populate*
+the cache before `routed_moe_launch` ever runs:
+
+1. `metal_graph_decode_cuda_selected_slots_expected()` (`ds4.c`) is the single
+   predicate both `metal_graph_decode_cuda_selected_load()` (per-token decode) and
+   `metal_graph_cuda_stream_prefill_batch_selected_load()` (batched prefill) consult
+   to decide whether populating the cache is even worth attempting for a layer. It
+   only ever recognized two type combos -- Q4_K/Q4_K/Q4_K and IQ2_XXS/IQ2_XXS/Q2_K --
+   returning `q4 || iq2`, so a layer using the generic dequant+GEMM family
+   (MXFP4/Q3_K/Q5_K, from f8d6222) never reached either populate call, regardless of
+   dequant-kernel support already existing for those types.
+2. `metal_graph_decode_set_hash_selected_override()` (`ds4.c`) is the analogous
+   populate step for *hash layers* (`ffn_gate_tid2eid` present, layers 0-2 in the real
+   artifact per the earlier dialect-compat pass): hash-layer expert selection is a
+   deterministic per-token formula computed on the CPU
+   (`layer_hash_selected_experts()`), not a learned router read back from the GPU, so
+   it has its own cache-populate call gated on the same `q4_selected || iq2_selected`
+   pair of Metal-specific predicates -- same gap, same two types, independently
+   missing the generic family.
+
+**Fix, not a new mechanism**: added one small predicate,
+`metal_graph_dequant_gemm_selected_slots_type()` (mirrors `ds4_cuda.cu`'s own
+`dequant_gemm_type_supported()` -- MXFP4/Q3_K/Q5_K -- kept in lock-step by hand since
+the two live in different translation units with no shared header for this constant
+list), and used it in both places above: `metal_graph_decode_cuda_selected_slots_expected()`
+now also returns true when gate/up/down are each independently in that set (gate ==
+up is ds4's pre-existing load-time invariant; down may legitimately differ, exactly
+mirroring how `routed_moe_launch` already looks gate_type/down_type up independently
+in its own dispatch table), and `metal_graph_decode_set_hash_selected_override()`'s
+early-exit condition gained the same third alternative. Both changes call the exact
+same populate functions (`ds4_gpu_stream_expert_cache_begin_selected_load()` /
+`ds4_gpu_stream_expert_cache_prepare_selected_batch()`, both in `ds4_cuda.cu`) the
+Q4_K/IQ2_XXS paths already used -- those functions were always type-agnostic (byte-
+table-driven via `graph_stream_expert_table_make()` / `routed_expert_row_bytes()`,
+already generalized for these types), so no cache/prefetch/eviction code needed
+touching at all, only the two decision points that were skipping the call for our
+tensor types. New env escape hatch (matching the existing per-family opt-out idiom):
+`DS4_CUDA_DISABLE_DEQUANT_GEMM_SELECTED_EXPERT_VIEWS`.
+
+**Verification**: `make cuda-spark` -- clean build from `make clean`, no warnings,
+both edits. Test ladder against the real 150GB artifact (`--cuda --ssd-streaming
+--ssd-streaming-cache-experts 40GB --nothink`), foreground, 600s timeout, polled
+rather than blind-waited:
+
+- `-p "Reply with exactly: ok"`, **without** `--ssd-streaming-cold` (default
+  popularity-preload warm path): no longer hits the streaming-cache error anywhere.
+  Completes end to end: `ds4: prefill: 0.73 t/s, generation: 0.75 t/s`. Output is
+  fluent-looking but **not** the requested text and not coherent (see correctness
+  note below): `  _0.**\n\n#  *  * It app\n#  *  *  *  * & is rarely of//s ... 및\n\n#
+  What;architecture。\n\n babysitter\n\n##  _ _ POSTR8a5 "DYZyowndego-  _aRz6\n\n#  _
+  · ,pDlz2释然红娘ande\n\n### wheels weelaborition,`.
+- Same **with** `--ssd-streaming-cold`: also completes, no streaming-cache error,
+  similar speed (`0.72 t/s` prefill / `0.77 t/s` generation), different garbage
+  (`  *  *! \n\n#  *:^pDlz4lz+3 about:诶!1lek stress删除了 macros asus.Ir Év2 Release`).
+  Confirms the fix is unconditional on the cold/warm preload choice, as expected
+  (cache population, not preload policy, was the gap).
+- Longer prompt (`-p "What is the capital of France? Answer in one sentence."`):
+  **hit a different, new failure** -- `ds4: prompt processing failed: cuda prefill
+  failed` with no diagnostic line at all (not the streaming-cache message this pass
+  fixed). Traced far enough to identify it as a distinct gap, not a regression of
+  this fix: `metal_graph_streaming_decode_prefill_max_tokens()` (`ds4.c`) caps the
+  decode-style (per-token) streaming prefill path this fix targets at 18 tokens
+  unless layer 0 is Q4_K (64 tokens then) -- the real artifact's layer 0 is MXFP4, so
+  18 is the effective cap, and the longer prompt's token count exceeds it, diverting
+  prefill into `metal_graph_prefill_layer_major()`'s streaming
+  page-in/readahead/pread/madvise branch (`ds4.c`, the `layer_prepare` block after the
+  `split_commands` check), which fails silently (no `fprintf` on the failing path) --
+  a separate unit of streaming-prefetch infrastructure this pass did not touch.
+  Confirmed this is a genuinely different code path, not our fix's blind spot, by
+  forcing the short-prompt decode-style path with
+  `DS4_METAL_STREAMING_DECODE_PREFILL_MAX=4096`: the same longer prompt then
+  completes (no crash) through the exact mechanism this pass fixed, producing more
+  (still incoherent) garbage output. Per this ticket's own stop-and-document
+  precedent, the layer-major page-in path's silent-failure gap is reported here but
+  not chased further -- distinct unit of work, streaming-prefetch scheduling rather
+  than the selected-expert-cache population this pass scoped.
+
+**Correctness note (not chased further, per the ticket's own instruction)**: this is
+the first real look at whether MXFP4 dequant+GEMM inference is numerically correct,
+and the answer is *partially* -- `--dump-logits` on a 1-token prompt (`"Hi"`) shows
+finite logits throughout (no NaN/Inf, 129280/129280 finite), a plausible magnitude
+range (min -37.9/max 21.2, mean -0.63, stdev 4.53), comparable to the IQ2_XXS
+baseline's own 1-token dump on the same prompt (finite throughout, min -42.6/max 28.0,
+mean 1.96, stdev 4.34) -- so this is not a catastrophic blow-up (no obviously broken
+scale/exponent handling). But the argmax token is wrong: MXFP4 picks token 223 (a
+plain space, logit 21.16) as the top continuation of "Hi", where IQ2_XXS picks token
+19923 ("Hello", logit 27.97) -- a semantically sensible continuation. Generated text
+in all three ladder runs above is fluent-looking token salad, not coherent language,
+consistent with a real dequant/layout bug somewhere in the MXFP4 (or the Q3_K/Q5_K
+down-projection, or the surrounding BF16/Q6_K/F32 dense-tensor conversion, or the
+hash-layer/hyper-connection/indexer plumbing) rather than a total numerical collapse.
+Root-causing which of these is out of scope for this pass (ticket explicitly says
+"do not chase deep" here); flagging as the next P1 priority once streaming itself is
+confirmed stable.
+
+**Tests**: `./ds4_test` -- ran to completion once (900s timeout; a first attempt at
+the default 300s timeout truncated mid-suite mid-way through `metal-tensor-equivalence`
+and is not counted). Result: `ds4 tests: 6 failure(s)` across four failing test
+sections -- `tool-call-quality` (2 assertions), `think-tool-recovery` (1),
+`logprob-vectors` (1), `metal-kernels` (2) -- all four within the pre-existing flaky
+set documented by every prior pass on this hardware (`tool-call-quality`,
+`think-tool-recovery`, `logprob-vectors`, `metal-kernels`, `metal-tensor-equivalence`);
+`metal-tensor-equivalence` passed this run. No new failing test names.
+
 ## Target artifact
 
 Chosen (checkpoint hunt 2026-07-31): **lovedheart/DeepSeek-V4-Flash-GGUF**
