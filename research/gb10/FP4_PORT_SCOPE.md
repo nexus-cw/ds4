@@ -262,6 +262,85 @@ identical to the prior `required_u32`/`required_f32` behavior), which the existi
 test fixture GGUF exercises throughout (no compat branch fires when running `make test`'s
 own model). No regression attributable to this change.
 
+### P1 status update (2026-07-31, cont'd): tensor-name dialect compat + BF16/Q6_K dense-tensor blocker
+
+Follow-on pass to the deepseek4-metadata-compat work above, closing the "genuine tensor
+NAME mismatch" it stopped at (`output_hc_base.weight` missing). Added a general
+tensor-name-alias mechanism to the loader (`ds4.c`): `find_tensor_alias()` /
+`required_tensor_alias()` (plain names, used for the three top-level hc-head tensors) and
+their formatted, per-layer analogs `tensor_by_namef_alias()` / `required_tensorf_alias()`
+-- each tries the canonical (ds4/llama.cpp-dialect) name first and only falls back to a
+documented alias if that's absent, printing a one-line `dialect compat` notice per hit, same
+idiom as the metadata-key compat layer.
+
+Iterating `--inspect` through successive `required tensor is missing` dies (each fixed only
+after checking the donor's own tensor-creation code -- `src/models/deepseek4.cpp` /
+`src/llama-arch.cpp` @5f55650 -- to confirm the alias really is the same tensor, plus a
+header-only scan of the real artifact to confirm dims/type match what ds4 binds at that
+site) surfaced one consistent dialect across the whole file: this community conversion
+drops the GGUF `.weight`/`.bias` suffix entirely on several tensor families, and separately
+renames a few tensors outright. Aliases added (canonical ds4/llama.cpp name -> file's alias),
+all shape/type-verified against the header before wiring:
+
+- Top-level: `output_hc_base.weight` -> `hc_head_base` {4} F32; `output_hc_fn.weight` ->
+  `hc_head_fn` {16384,4} F32 (== `hc_dim` x `DS4_N_HC`); `output_hc_scale.weight` ->
+  `hc_head_scale` {1} F32.
+- Per-layer, suffix-dropped (verified on layer 0 unless noted, applies uniformly): 
+  `hc_attn_fn/scale/base.weight` -> `hc_attn_fn/scale/base` ({16384,24}/{3}/{24} F32);
+  `hc_ffn_fn/scale/base.weight` -> `hc_ffn_fn/scale/base` (same shapes); `attn_sinks.weight`
+  -> `attn_sinks` ({64} F32 == `DS4_N_HEAD`); `exp_probs_b.bias` -> `exp_probs_b` ({256} F32
+  == `DS4_N_EXPERT`); `ffn_gate_tid2eid.weight` -> `ffn_gate_tid2eid` ({6,129280} I32 ==
+  `DS4_N_EXPERT_USED` x `DS4_N_VOCAB`).
+- Per-layer, renamed: `attn_kv.weight` -> `attn_kv_latent.weight` ({4096,512} BF16 == 
+  `DS4_N_EMBD` x `DS4_N_HEAD_DIM`/key_length=512; donor: `LLM_TENSOR_ATTN_KV`,
+  `models/deepseek4.cpp:95`).
+- Per-layer, compress-ratio-gated ("compressor" -> "compress", plus the same
+  suffix-drop-on-the-get_rows-tensor pattern as `ffn_gate_tid2eid`): 
+  `attn_compressor_{ape,kv,gate,norm}.weight` -> `attn_compress_ape` (bare) /
+  `attn_compress_{kv,gate,norm}.weight`; `indexer_compressor_{ape,kv,gate,norm}.weight` ->
+  `indexer.compress_ape` (bare) / `indexer.compress_{kv,gate,norm}.weight` (donor:
+  `LLM_TENSOR_ATTN_COMPRESSOR_*` / `LLM_TENSOR_INDEXER_COMPRESSOR_*`,
+  `llama-arch.cpp:477-480,610-613`).
+
+**Result**: with these aliases, `--inspect` (`--cuda --ssd-streaming --ssd-streaming-cold
+--ssd-streaming-cache-experts 8GB`) now binds every required tensor across all 43 layers and
+the top level -- zero `required tensor is missing` for the rest of the run -- and reaches a
+new, structurally different blocker: `tensor token_embd.weight has type bf16, expected f16`.
+This is **not** a naming problem (the name matches exactly) but a dtype-support gap: this
+artifact stores several dense (non-routed-expert) tensor families as GGUF BF16 (type 30) or
+Q6_K (type 12) -- `token_embd.weight`, `output.weight`, `attn_kv_latent.weight`,
+`ffn_{gate,up,down}_shexp.weight`, `indexer.proj.weight`, `attn_compress_{kv,gate}.weight`,
+`indexer.compress_{kv,gate}.weight` (all BF16), and `attn_q_a/q_b/output_a/output_b.weight`,
+`indexer.attn_q_b.weight` (all Q6_K) -- and ds4 has **no BF16 or Q6_K support anywhere in its
+dense-tensor path**: `tensor_type_is_dense_quant()` (`ds4.c`) accepts only Q8_0/Q4_K/Q4_0,
+the plain-tensor type checks (`tensor_expect_layout` call sites for `token_embd`,
+`attn_kv`/`indexer_proj`, `attn_compressor_kv`/`gate`) hard-require `DS4_TENSOR_F16`/
+`DS4_TENSOR_F32` specifically, and there is no `DS4_TENSOR_BF16` enum constant, no
+BF16-to-float/f16 dequant helper (CPU or CUDA), and no Q6_K dequant-to-float path either
+(`gguf_type_info[30]` registers BF16's block size for the type-name table only, unused
+anywhere else; Q6_K has fused `vec_dot_q6_K` dot-product support per the type-info registry
+comments elsewhere in the file but, like the pre-Q3_K/Q5_K state described in the
+2026-08-01 entry above, no dequant-to-float/f16 kernel of its own). This contradicts this
+scope doc's original assumption ("every other tensor becomes Q8_0",
+`llama-quant.cpp:474-480`) for *this specific* community conversion: whatever quantize
+recipe produced it kept token embeddings, the output head, several MoE-adjacent dense
+projections, and MLA/indexer attention weights at BF16 or Q6_K rather than Q8_0. Confirmed
+this is the true next blocker and not another naming difference: the `--inspect` log shows
+zero further `required tensor is missing` lines before it.
+
+**Not attempted here**: BF16 dequant (trivial bit-shift widening to F16/F32, unlike MXFP4/
+Q3_K/Q5_K's block math) and Q6_K dequant-to-float (structurally identical porting job to the
+Q3_K/Q5_K work already done for routed experts, just for a dense/non-routed tensor path) are
+both real, scoped, and very likely small ports from `ggml-quants.c`/`convert.cu`
+(`dequantize_row_bf16`-equivalent is nearly free; `dequantize_row_q6_K` already has a direct
+llama.cpp analog) -- but wiring either into ds4's dense-tensor type-check/read path (as
+opposed to the routed-expert dequant+GEMM family this port has focused on) is a distinct unit
+of work from tensor-name aliasing and is deliberately left unstarted, per this ticket's own
+scope boundary between "fix names" and "hit a structural blocker, stop and document."
+
+No full-model load was reached this pass (blocked as above); the micro smoke-generation step
+was accordingly not run.
+
 ## Target artifact
 
 Chosen (checkpoint hunt 2026-07-31): **lovedheart/DeepSeek-V4-Flash-GGUF**
