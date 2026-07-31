@@ -922,3 +922,127 @@ timeouts, polled: `-p "Reply with exactly: ok"` and the France prompt (with
 symptom (finite, fluent-shaped, incoherent text; `~0.70-0.76 t/s` prefill/generation) --
 confirms the debug instrumentation is a true no-op on the actual generation path.
 `./ds4_test`: `ds4 tests: 10 failure(s)` across four sections -- `tool-call-quality`, `logprob-vectors`, `metal-kernels`, `metal-tensor-equivalence` -- all four within the pre-existing flaky set documented by every prior pass on this hardware; `think-tool-recovery` passed this run. No new failing test names.
+
+
+### P1 status update (2026-08-01, cont'd): FIRST DIVERGENCE FOUND AND FIXED --
+`dequantize_row_q6_K` missing per-block output offset zeroed nearly all Q6_K-dialect-
+compat-converted dense attention weights; MXFP4 artifact now produces coherent output
+
+Follow-on pass to the priority-hypothesis-disproven entry above. Per this pass's own
+brief, ran debug plan step 3b: captured per-layer hidden-state stats for the real MXFP4
+artifact under `--cuda --ssd-streaming --ssd-streaming-cache-experts 40GB --nothink`
+and diffed against `/tmp/llamacpp_eval.log`'s ground truth.
+
+**Step 1 (prompt/token confirmation)**: `/tmp/llamacpp_eval.log`'s header shows `number
+of input tokens = 1`, token `23166`; independently confirmed via a throwaway GGUF-vocab
+reader that token 23166 decodes to `"Hi"` -- llama.cpp's eval-callback ground truth is a
+**raw, untemplated single-token completion**, not a chat-formatted prompt. ds4's default
+`-p "Hi"` path applies its chat template (10 tokens with `--dump-logits` confirming
+`prompt_tokens: 10`), so matching the SAME token sequence required ds4's undocumented
+`--raw`/`--raw-prompt` flag (`ds4_cli.c`, `gen->raw_prompt`); `-p "Hi" --raw --nothink
+--dump-tokens` confirms `[23166]`, byte-identical to llama.cpp's input.
+
+**Step 2 (instrumentation)**: no new instrumentation was needed -- `ds4.c` already has a
+generic, env-gated per-tensor graph dump (`metal_graph_debug_dump_tensor`, controlled by
+`DS4_METAL_GRAPH_DUMP_PREFIX`/`_NAME`/`_LAYER`/`_POS`, already wired at every named point
+`llama.cpp`'s eval-callback also logs: `attn_out-N`, `hc_attn_post-N`, `ffn_out-N`,
+`hc_ffn_post-N` per layer) that this port's earlier passes had not yet exercised for this
+purpose. Used it directly, `DS4_METAL_GRAPH_DUMP_LAYER=all`, against both the MXFP4
+artifact and (as the sanity yardstick the ticket asked for) the known-good IQ2_XXS
+baseline under the identical `--raw --nothink --ssd-streaming` flags.
+
+**Step 2 result (yardstick + first divergence)**: IQ2_XXS's per-layer `attn_out`/`ffn_out`
+sums track llama.cpp's ground truth closely at every layer checked (e.g. layer 1 `attn_out`
+sum 22.07 ds4-IQ2XXS vs 23.05 llama.cpp; layer 3 `ffn_out` 8.09 vs 7.36) -- confirming
+"benign difference" looks like agreement within roughly 10%, consistent with IQ2_XXS's own
+lossy quantization versus llama.cpp's higher-precision reference. MXFP4, by contrast,
+diverges catastrophically starting at **layer 0's `attn_out`**: every element is ~0
+(`sum=-0.0000`, `absmax=0.0001`) instead of the expected magnitude-tens values, and this
+`attn_out ~ 0` pattern repeats identically for **every one of the 43 layers** -- a uniform,
+layer-0-onward failure, not a single-layer defect. `hc_attn_post`/`hc_ffn_post` stay
+superficially plausible only because the hyper-connection residual mostly passes the prior
+layer's state through unchanged when the attention contribution is ~0.
+
+**Step 3 (drill-down, attention pipeline)**: dumped every intermediate attention tensor
+for layer 0 and found the exact break point: `q_lora`/`Qraw`/`Qnorm`/`Qcur` (the Q-LoRA
+projection and its descendants) have **only their first element populated; every other
+element is exactly 0.0** (not garbage -- a clean, untouched-buffer zero), while the
+sibling `KVraw`/`KVnorm`/`KVcur` computed from the same `attn_norm` input are fully
+populated and numerically sane. This "row 0 real, every other row exactly 0" signature,
+reproducible identically whether `attn_q_a`'s matmul goes through the codebase's
+Q8_0-hardcoded fused pair kernel (`ds4_gpu_matmul_q8_0_pair_tensor`) or the type-correct
+F16 cuBLAS path (`ds4_gpu_matmul_f16_tensor`), pointed away from the GEMM/kernel layer
+entirely and at the **weight data itself**.
+
+**Root cause, confirmed at the byte level**: `dequantize_row_q6_K()` (`ds4.c`), the CPU
+routine `model_convert_dense_bf16_q6k()`'s load-time Q6_K-\>F16 dense-tensor dialect-compat
+conversion calls to turn this artifact's Q6_K `attn_q_a`/`attn_q_b`/`attn_output_a`/
+`attn_output_b`/indexer weights into plain F16, has a real, ported-in defect: its inner
+per-block write (`y[n + l + 0] = ...`, etc.) never adds the block index's own offset
+(`i * QK_K`) to `n`/`l` before indexing `y[]`. For the function's *pre-existing* caller (a
+genuine single-block, `k == QK_K` per-row dequant used elsewhere) this bug is a no-op
+(`nb == 1`, so the missing offset is always 0 anyway) -- which is exactly why three prior
+passes' static inspection and the earlier "runtime-verified" Q3_K dequant check (a
+*different* type, on the streaming *expert* dequant path, never routed through this
+function) never caught it. This port's *new* load-time dense-tensor conversion is the
+first caller to invoke it with `k` spanning the WHOLE flattened 2D tensor (thousands of
+blocks per call, e.g. 16384 blocks for `attn_q_a`'s 4096x1024 shape) -- and with the
+missing offset, every block overwrites the same first-256-float window of the destination,
+so only the LAST block processed survives there and every other destination float -- i.e.
+essentially the entire tensor -- is left at its `malloc`'d-but-never-written default of
+zero. Verified directly: a throwaway debug hook printing `attn_q_a`'s converted bytes at
+element 4096 (`QK_K * 16`, exactly one `attn_q_a` row) showed `0,0,0,0` for every one of
+the 43 layers, both mid-tensor and at the tensor's own final element, while element 0
+was correctly non-zero and matched the file's real Q6_K-decoded value.
+
+**Second, independent (but currently-masked) bug found and fixed alongside it**: while
+localizing the above, found that the single-token decode graph's Q-LoRA/KV-raw projection
+(`metal_graph_encode_decode_layer_phase`, `ds4.c`) unconditionally calls the Q8_0-specific
+fused kernel (`ds4_gpu_matmul_q8_0_pair_tensor`) and its own non-pair fallback
+(`ds4_gpu_matmul_q8_0_tensor`) for `attn_q_a`/`attn_kv` with **no check of the tensor's
+actual type** -- correct only when those tensors are natively Q8_0 (true for the IQ2_XXS
+`AProjQ8` baseline, hence never caught before), but silently wrong for any dialect-compat
+file where `model_convert_dense_bf16_q6k()` has converted them to F16 (interprets F16 byte
+layout with a hardcoded Q8_0 34-bytes/32-elements block stride). The batch/prefill graph
+already guards this correctly (`metal_graph_matmul_q8_0_named_tensor()` ->
+`metal_graph_matmul_dense_quant_tensor()`, which dispatches on `w->type`); this pass
+mirrors that guard into the decode graph. This bug was empirically masked by the first one
+during isolation (with the weight data itself zero beyond block 0, misreading it as Q8_0
+happened to also decode to ~0), so it was not independently distinguishable until both
+were fixed together and verified against ground truth.
+
+**Fix**: two changes in `ds4.c`.
+1. `dequantize_row_q6_K()`: added the missing per-block `y0 = i * QK_K` offset to all four
+   `y[]` writes.
+2. `metal_graph_encode_decode_layer_phase()`'s Q-LoRA/KV-raw projection: gate the
+   Q8_0-specific fast paths on `layer->attn_q_a->type == DS4_TENSOR_Q8_0 &&
+   layer->attn_kv->type == DS4_TENSOR_Q8_0`, falling back to the already-existing
+   type-generic `metal_graph_matmul_plain_tensor()` otherwise.
+
+**Post-fix verification**: re-ran the same per-layer dump against the real MXFP4 artifact.
+`attn_out`/`ffn_out` sums now track llama.cpp's ground truth closely at every layer
+checked -- e.g. layer 0 `attn_out` -19.90 (ds4) vs -19.06 (llama.cpp), `ffn_out` 19.35 vs
+19.34; layer 1 `attn_out` 24.12 vs 23.05, `ffn_out` 5.76 vs 5.67; layer 3 `ffn_out` 7.54 vs
+7.36 -- differences consistent with f16-accumulation noise, the same magnitude of
+agreement the IQ2_XXS yardstick showed against the same ground truth. Smoke ladder against
+the real 150GB artifact, foreground with timeouts, polled:
+- `-p "Reply with exactly: ok" --nothink`: `ok` (exact match).
+- `-p "What is the capital of France?" --nothink` with
+  `DS4_METAL_STREAMING_DECODE_PREFILL_MAX=4096`: `The capital of France is Paris.` --
+  coherent and correct, replacing the prior-documented fluent-but-incoherent garbage.
+  `~0.72-0.77 t/s` prefill/generation (unchanged perf envelope; this pass was a
+  correctness fix, not a performance one).
+
+`make clean && make cuda-spark`: clean rebuild, no warnings. `./ds4_test`: `ds4 tests: 10
+failure(s)` across four sections -- `tool-call-quality`, `logprob-vectors`,
+`metal-kernels`, `metal-tensor-equivalence` -- all four within the pre-existing flaky set
+documented by every prior pass on this hardware; no new failing test names.
+
+**Scope note**: this pass's earlier debug hooks (`DS4_DEBUG_STREAM_CACHE_LAYER` etc. from
+the previous entry) are unrelated to this bug and left untouched. This pass's own
+throwaway diagnostic probes (an F16-weight-pointer dumper, a cuBLAS-path tracer, a
+per-block Q6_K dequant tracer) were removed once the root cause was isolated and fixed;
+one small, permanent, env-gated debug hook was kept in the same style
+(`DS4_METAL_DEBUG_DENSE_CONVERT=<name-substring>`, in `model_convert_dense_bf16_q6k()`)
+since it is a generally useful tool for verifying any future dialect-compat dense-tensor
+conversion by name, not specific to this bug.

@@ -3903,6 +3903,18 @@ static float ds4_vec_dot_q5_K_f32(int n, const block_q5_K *x, const float *y) {
 static DS4_MAYBE_UNUSED void dequantize_row_q6_K(const block_q6_K *x, float *y, int64_t k) {
     const int64_t nb = k / QK_K;
     for (int64_t i = 0; i < nb; i++) {
+        /* Bug fixed here: every block's 256 output values were being
+         * written to y[0..255] regardless of block index i, silently
+         * discarding every block but the last one for any multi-block
+         * call (k > QK_K). Harmless for the pre-existing per-row routed-
+         * expert caller (which only ever passes a single-block k == QK_K
+         * row), but this port's new load-time dense-tensor conversion
+         * calls it once per WHOLE flattened 2D tensor (k up to millions
+         * of elements, thousands of blocks) -- exactly the shape that
+         * exposes it: only the last block survives, everything else stays
+         * at the destination buffer's zero-initialized default. Restore
+         * the per-block y-offset so every block lands in its own slot. */
+        const int64_t y0 = i * QK_K;
         const float d = f16_to_f32(x[i].d);
         const uint8_t *ql = x[i].ql;
         const uint8_t *qh = x[i].qh;
@@ -3916,10 +3928,10 @@ static DS4_MAYBE_UNUSED void dequantize_row_q6_K(const block_q6_K *x, float *y, 
                 const int q3 = ((int)(ql[l + 0]  >> 4)    | (((qh[l] >> 4) & 3) << 4)) - 32;
                 const int q4 = ((int)(ql[l + 32] >> 4)    | (((qh[l] >> 6) & 3) << 4)) - 32;
 
-                y[n + l + 0]  = d * (float)sc[is + 0] * (float)q1;
-                y[n + l + 32] = d * (float)sc[is + 2] * (float)q2;
-                y[n + l + 64] = d * (float)sc[is + 4] * (float)q3;
-                y[n + l + 96] = d * (float)sc[is + 6] * (float)q4;
+                y[y0 + n + l + 0]  = d * (float)sc[is + 0] * (float)q1;
+                y[y0 + n + l + 32] = d * (float)sc[is + 2] * (float)q2;
+                y[y0 + n + l + 64] = d * (float)sc[is + 4] * (float)q3;
+                y[y0 + n + l + 96] = d * (float)sc[is + 6] * (float)q4;
             }
 
             ql += 64;
@@ -4151,6 +4163,39 @@ static void model_convert_dense_bf16_q6k(ds4_model *m, int mmap_flags) {
         t->abs_offset = cursor;
         t->bytes = t->elements * 2u;
         cursor += t->bytes;
+
+        {
+            const char *dbg_name = glm_graph_env_value("DS4_ROCM_DEBUG_DENSE_CONVERT",
+                                                        "DS4_METAL_DEBUG_DENSE_CONVERT");
+            char dbg_namebuf[256];
+            if (dbg_name && dbg_name[0] && t->name.len < sizeof(dbg_namebuf)) {
+                memcpy(dbg_namebuf, t->name.ptr, t->name.len);
+                dbg_namebuf[t->name.len] = 0;
+            } else {
+                dbg_namebuf[0] = 0;
+            }
+            if (dbg_name && dbg_name[0] && strstr(dbg_namebuf, dbg_name) != NULL) {
+                double sum = 0.0, absmax = 0.0;
+                uint64_t nshow = t->elements < 4 ? t->elements : 4;
+                for (uint64_t e = 0; e < t->elements; e++) {
+                    float v = f16_to_f32(dst[e]);
+                    sum += v;
+                    float av = v < 0 ? -v : v;
+                    if (av > absmax) absmax = av;
+                }
+                fprintf(stderr,
+                        "ds4: [dbgconvert] tensor=%.*s orig_type=%s elements=%llu "
+                        "abs_offset=%llu sum=%g absmax=%g first%llu=",
+                        (int)t->name.len, t->name.ptr, orig_type_name,
+                        (unsigned long long)t->elements,
+                        (unsigned long long)t->abs_offset, sum, absmax,
+                        (unsigned long long)nshow);
+                for (uint64_t e = 0; e < nshow; e++) {
+                    fprintf(stderr, "%g ", f16_to_f32(dst[e]));
+                }
+                fprintf(stderr, "\n");
+            }
+        }
 
         char key[128];
         tensor_family_key(t->name, key, sizeof(key));
@@ -22438,8 +22483,25 @@ static bool metal_graph_encode_decode_layer_phase(
     }
     if (!resume_after_attn) {
     if (!resume_after_qkv) {
+    /* g->cuda_qkv_pair's fused kernel (ds4_gpu_matmul_q8_0_pair_tensor) and
+     * its own non-pair fallback (ds4_gpu_matmul_q8_0_tensor) both hardcode
+     * Q8_0 block byte layout (blocks*34 bytes/row) for attn_q_a/attn_kv,
+     * with no tensor-type check -- correct for files where those tensors
+     * are natively Q8_0 (e.g. the IQ2_XXS AProjQ8 baseline), but wrong
+     * for dialect-compat files (e.g. this port's MXFP4_MOE artifact) where
+     * model_convert_dense_bf16_q6k() has already converted them to plain
+     * F16 at load time: reading F16 bytes with a Q8_0 row stride silently
+     * misreads every row after the first as unrelated bytes, typically
+     * decoding to near-zero. The batch/prefill graph already guards this
+     * correctly via metal_graph_matmul_q8_0_named_tensor() ->
+     * metal_graph_matmul_dense_quant_tensor(), which dispatches on
+     * w->type; mirror that guard here for the single-token decode graph. */
+    const bool qkv_attn_types_q8_0 =
+        layer->attn_q_a->type == DS4_TENSOR_Q8_0 &&
+        layer->attn_kv->type == DS4_TENSOR_Q8_0;
     bool qkv_pair_projected = resume_after_qa_kv_raw;
     if (!resume_after_qa_kv_raw && ok && qkv_rms_fused &&
+        qkv_attn_types_q8_0 &&
         g->cuda_qkv_pair && !metal_graph_use_reference_qkv_pair_proj()) {
         qkv_pair_projected = ds4_gpu_matmul_q8_0_pair_tensor(
                 metal_graph_qr(g),
@@ -22454,20 +22516,32 @@ static bool metal_graph_encode_decode_layer_phase(
                 metal_graph_attn_norm(g),
                 1) != 0;
     }
-    if (!resume_after_qa_kv_raw && ok && !qkv_pair_projected) ok = ds4_gpu_matmul_q8_0_tensor(metal_graph_qr(g), model->map, model->size,
-                                                                     layer->attn_q_a->abs_offset,
-                                                                     DS4_N_EMBD, q_rank,
-                                                                     metal_graph_attn_norm(g), 1) != 0;
+    if (!resume_after_qa_kv_raw && ok && !qkv_pair_projected) {
+        ok = qkv_attn_types_q8_0 ?
+            (ds4_gpu_matmul_q8_0_tensor(metal_graph_qr(g), model->map, model->size,
+                                        layer->attn_q_a->abs_offset,
+                                        DS4_N_EMBD, q_rank,
+                                        metal_graph_attn_norm(g), 1) != 0) :
+            metal_graph_matmul_plain_tensor(metal_graph_qr(g), model, layer->attn_q_a,
+                                            DS4_N_EMBD, q_rank,
+                                            metal_graph_attn_norm(g), 1);
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("q_lora", metal_graph_qr(g), q_rank, il, pos);
     }
     const bool kvnorm_dump = metal_graph_debug_wants("KVnorm", il, pos);
     bool kv_rope_fused = false;
     if (qkv_rms_fused) {
-        if (!resume_after_qa_kv_raw && ok && !qkv_pair_projected) ok = ds4_gpu_matmul_q8_0_tensor(metal_graph_kv_raw(g), model->map, model->size,
-                                                                         layer->attn_kv->abs_offset,
-                                                                         DS4_N_EMBD, DS4_N_HEAD_DIM,
-                                                                         metal_graph_attn_norm(g), 1) != 0;
+        if (!resume_after_qa_kv_raw && ok && !qkv_pair_projected) {
+            ok = qkv_attn_types_q8_0 ?
+                (ds4_gpu_matmul_q8_0_tensor(metal_graph_kv_raw(g), model->map, model->size,
+                                            layer->attn_kv->abs_offset,
+                                            DS4_N_EMBD, DS4_N_HEAD_DIM,
+                                            metal_graph_attn_norm(g), 1) != 0) :
+                metal_graph_matmul_plain_tensor(metal_graph_kv_raw(g), model, layer->attn_kv,
+                                                DS4_N_EMBD, DS4_N_HEAD_DIM,
+                                                metal_graph_attn_norm(g), 1);
+        }
         if (ok) {
             metal_graph_debug_dump_tensor("KVraw", metal_graph_kv_raw(g), DS4_N_HEAD_DIM, il, pos);
         }
