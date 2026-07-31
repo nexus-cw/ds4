@@ -20890,6 +20890,197 @@ __global__ static void moe_down_f32_kernel(
     if (threadIdx.x == 0) down_out[(uint64_t)pair * out_dim + row] = partial[0];
 }
 
+/* MXFP4 routed-expert MoE support (P1 correctness path).
+ *
+ * routed_moe_launch's other branches (Q4_K, IQ2_XXS/Q2_K) use hand-tuned
+ * sorted-pairs expert-tile kernels that do the dequant and dot-product in
+ * one fused pass. MXFP4 does not get one of those yet -- P1 scope is
+ * dequant-then-generic-f16-GEMM only (see FP4_PORT_SCOPE.md P3 for the
+ * follow-up native dot-product/tensor-core work). Correctness over
+ * throughput: this dispatches a naive per-(token,expert)-pair loop, each
+ * pair doing three dequant+cuBLAS-f16-GEMM calls (gate, up, down) via
+ * mxfp4_matmul_row_f16gemm below (which reuses mxfp4_dequant_f16_kernel,
+ * the same streaming-dequant kernel backing ds4_gpu_matmul_mxfp4_tensor),
+ * with a small elementwise kernel for the SiLU(gate)*up*routing-weight
+ * combine in between. The final expert-sum reuses the existing
+ * moe_sum_kernel / moe_sum_owned_kernel exactly as the other paths do, so
+ * MXFP4 experts land in the same out->ptr accumulation as everything
+ * else. Because expert selection is data-dependent (the `selected`
+ * device array), and cuBLAS needs the weight pointer on the host at
+ * launch time, we take one device->host readback of the pair->expert
+ * table up front rather than threading per-pair addressing through a
+ * device-side kernel body (as the fused paths do) -- a one-time sync
+ * per MoE layer call, acceptable for a P1 correctness path.
+ */
+__global__ static void mxfp4_moe_silu_mul_kernel(
+        float *mid_out,
+        const float *gate_in,
+        const float *up_in,
+        const float *weight_ptr,
+        uint32_t mid_dim,
+        float clamp) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= mid_dim) return;
+    float gate = gate_in[i];
+    float up = up_in[i];
+    if (clamp > 1.0e-6f) {
+        if (gate > clamp) gate = clamp;
+        if (up > clamp) up = clamp;
+        if (up < -clamp) up = -clamp;
+    }
+    mid_out[i] = (gate / (1.0f + expf(-gate))) * up * (*weight_ptr);
+}
+
+/* Dequant an [out_dim x in_dim] MXFP4 weight matrix (row-major, packed
+ * blocks with no inter-row padding: row_bytes must equal
+ * (in_dim/32)*17) into an f16 scratch buffer and GEMM it against a
+ * single f32 activation row via cuBLAS, writing an f32 output row.
+ * Single-row (n_tok=1) sibling of ds4_gpu_matmul_mxfp4_tensor above,
+ * built for the per-pair MoE loop where the weight base pointer differs
+ * per call (selected expert) so a single batched GEMM isn't available. */
+static int mxfp4_matmul_row_f16gemm(
+        float *out_row,
+        const char *w,
+        uint64_t row_bytes,
+        const float *x_row,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        int logical_tier) {
+    if (!out_row || !w || !x_row || !g_cublas_ready || (in_dim & 31u) != 0u) return 0;
+    const uint32_t blocks = in_dim / 32u;
+    if (row_bytes != (uint64_t)blocks * 17u) return 0;
+    const uint64_t wh_bytes = (uint64_t)in_dim * out_dim * sizeof(__half);
+    const uint64_t xh_off = (wh_bytes + 255u) & ~255ull;
+    const uint64_t gemm_tmp = xh_off + (uint64_t)in_dim * sizeof(__half);
+    void *tmp16 = cuda_tmp_alloc_on(logical_tier, gemm_tmp, "mxfp4 moe dequant gemm");
+    if (!tmp16) return 0;
+    __half *wh = (__half *)tmp16;
+    __half *xh = (__half *)((char *)tmp16 + xh_off);
+    const uint64_t total_blocks = (uint64_t)out_dim * blocks;
+    mxfp4_dequant_f16_kernel<<<(unsigned)((total_blocks + 255u) / 256u), 256>>>(
+            wh, reinterpret_cast<const unsigned char *>(w),
+            total_blocks, blocks, in_dim);
+    f32_to_f16_kernel<<<(unsigned)((in_dim + 255u) / 256u), 256>>>(xh, x_row, in_dim);
+    if (!cuda_ok(cudaGetLastError(), "routed_moe mxfp4 dequant gemm staging")) return 0;
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasStatus_t st = cublasGemmEx(cuda_cublas_for_tier(logical_tier),
+                                     CUBLAS_OP_T, CUBLAS_OP_N,
+                                     (int)out_dim, 1, (int)in_dim,
+                                     &alpha,
+                                     wh, CUDA_R_16F, (int)in_dim,
+                                     xh, CUDA_R_16F, (int)in_dim,
+                                     &beta,
+                                     out_row, CUDA_R_32F, (int)out_dim,
+                                     CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "ds4: cuBLAS routed_moe mxfp4 gemm failed: status %d\n", (int)st);
+        return 0;
+    }
+    return 1;
+}
+
+/* Per-(token,expert)-pair MXFP4 gate/up/down dequant+GEMM loop, called
+ * from routed_moe_launch once gate_w/up_w/down_w are resolved (works
+ * whether those pointers come from the model map directly or the SSD
+ * streaming selected-experts cache -- that resolution is unchanged and
+ * type-agnostic). Handles both decode (n_tokens==1) and prefill
+ * (n_tokens>1) with the same loop; no separate kernels for the two, per
+ * the P1 scope (throughput work is P3). */
+static int routed_moe_mxfp4_dispatch(
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *gate,
+        ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *down,
+        const char *gate_w,
+        const char *up_w,
+        const char *down_w,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_expert,
+        float clamp,
+        const ds4_gpu_tensor *x,
+        uint32_t n_tokens,
+        int owned_filtered,
+        int logical_tier) {
+    if ((expert_in_dim & 31u) != 0u || (expert_mid_dim & 31u) != 0u) return 0;
+    const uint32_t in_blocks = expert_in_dim / 32u;
+    const uint32_t mid_blocks = expert_mid_dim / 32u;
+    if (gate_row_bytes != (uint64_t)in_blocks * 17u ||
+        down_row_bytes != (uint64_t)mid_blocks * 17u) {
+        return 0;
+    }
+
+    const uint32_t pair_count = n_tokens * n_expert;
+    int32_t *sel_host = (int32_t *)malloc((size_t)pair_count * sizeof(int32_t));
+    if (!sel_host) return 0;
+    const int synced = cuda_ok(
+            cudaMemcpy(sel_host, selected->ptr, (size_t)pair_count * sizeof(int32_t),
+                       cudaMemcpyDeviceToHost),
+            "routed_moe mxfp4 selected readback");
+    if (!synced) {
+        free(sel_host);
+        return 0;
+    }
+
+    int ok = 1;
+    for (uint32_t pair = 0; pair < pair_count && ok; pair++) {
+        int32_t expert_i = sel_host[pair];
+        if (expert_i < 0) {
+            if (owned_filtered) continue;  /* moe_sum_owned_kernel skips these */
+            expert_i = 0;                  /* legacy fallback convention: clamp, weight is 0 */
+        }
+        const uint32_t tok = pair / n_expert;
+        const float *x_row = (const float *)x->ptr + (uint64_t)tok * expert_in_dim;
+        const char *gate_row_base = gate_w + (uint64_t)(uint32_t)expert_i * gate_expert_bytes;
+        const char *up_row_base = up_w + (uint64_t)(uint32_t)expert_i * gate_expert_bytes;
+        const char *down_row_base = down_w + (uint64_t)(uint32_t)expert_i * down_expert_bytes;
+
+        float *gate_buf = (float *)gate->ptr + (uint64_t)pair * expert_mid_dim;
+        float *up_buf = (float *)up->ptr + (uint64_t)pair * expert_mid_dim;
+        float *mid_buf = (float *)mid->ptr + (uint64_t)pair * expert_mid_dim;
+        float *down_buf = (float *)down->ptr + (uint64_t)pair * out_dim;
+
+        ok = mxfp4_matmul_row_f16gemm(gate_buf, gate_row_base, gate_row_bytes,
+                                      x_row, expert_in_dim, expert_mid_dim, logical_tier);
+        if (ok) {
+            ok = mxfp4_matmul_row_f16gemm(up_buf, up_row_base, gate_row_bytes,
+                                          x_row, expert_in_dim, expert_mid_dim, logical_tier);
+        }
+        if (!ok) break;
+
+        const float *weight_ptr = (const float *)weights->ptr + pair;
+        mxfp4_moe_silu_mul_kernel<<<(expert_mid_dim + 255u) / 256u, 256>>>(
+                mid_buf, gate_buf, up_buf, weight_ptr, expert_mid_dim, clamp);
+        ok = cuda_ok(cudaGetLastError(), "routed_moe mxfp4 silu launch");
+        if (!ok) break;
+
+        ok = mxfp4_matmul_row_f16gemm(down_buf, down_row_base, down_row_bytes,
+                                      mid_buf, expert_mid_dim, out_dim, logical_tier);
+    }
+    free(sel_host);
+    if (!ok) return 0;
+
+    const uint64_t n = (uint64_t)n_tokens * out_dim;
+    if (owned_filtered) {
+        moe_sum_owned_kernel<<<(unsigned)((n + 255) / 256), 256>>>(
+                (float *)out->ptr, (const float *)down->ptr,
+                (const int32_t *)selected->ptr, out_dim, n_expert, n_tokens);
+    } else {
+        moe_sum_kernel<<<(unsigned)((n + 255) / 256), 256>>>(
+                (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
+    }
+    return cuda_ok(cudaGetLastError(), "routed_moe mxfp4 sum launch");
+}
+
 static int routed_moe_launch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -20935,7 +21126,8 @@ static int routed_moe_launch(
         return 0;
     }
     const int q4k_path = (gate_type == 12u && down_type == 12u);
-    if (!q4k_path && (gate_type != 16u || down_type != 10u)) return 0;
+    const int mxfp4_path = (gate_type == 39u && down_type == 39u);
+    if (!mxfp4_path && !q4k_path && (gate_type != 16u || down_type != 10u)) return 0;
     /* Q4_K routed-MoE dispatch:
      *   n_tokens == 1 and n_expert == 6:
      *                  use_direct_down_sum + moe_gate_up_mid_decode_q4K_qwarp32
@@ -21003,6 +21195,17 @@ static int routed_moe_launch(
         cuda_resolve_weight_ptr(model_map, down_offset, down_bytes,
                                 logical_tier, "moe_down");
     if (!gate_w || !up_w || !down_w) return 0;
+
+    if (mxfp4_path) {
+        return routed_moe_mxfp4_dispatch(
+                out, gate, up, mid, down,
+                gate_w, up_w, down_w,
+                gate_expert_bytes, gate_row_bytes,
+                down_expert_bytes, down_row_bytes,
+                expert_in_dim, expert_mid_dim, out_dim,
+                selected, weights, n_expert, clamp, x, n_tokens,
+                owned_filtered, logical_tier);
+    }
 
     int ok = 1;
     const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;

@@ -51,6 +51,45 @@ ds4 head start: E2M1 value table + nearest-value dequant already exist (activati
 - **P1 — MXFP4 correct**: items 1-5 above; validate logits vs llama.cpp dequant on the same
   tensor bytes (bit-exact dequant is testable in isolation); then ds4-eval + KLD vs the
   IQ2_XXS baseline. Fallback GEMM speed is acceptable for validation.
+
+### P1 status (2026-07-31)
+
+GPU routed-expert dispatch landed: `routed_moe_launch` (`ds4_cuda.cu`) now has an
+`mxfp4_path` branch (`gate_type == down_type == 39`) alongside the pre-existing Q4_K /
+IQ2_XXS+Q2_K branches, so it no longer `return 0`s (-> upstream `ds4_die`) for an
+MXFP4_MOE GGUF. It is a naive per-(token,expert)-pair loop
+(`routed_moe_mxfp4_dispatch` / `mxfp4_matmul_row_f16gemm`): one device->host readback of
+the `selected` expert-index table per call (needed because cuBLAS wants the weight
+pointer on the host, unlike the fused kernels' device-side indexing), then per pair:
+dequant gate/up MXFP4 rows to f16 (`mxfp4_dequant_f16_kernel`, reused verbatim), a cuBLAS
+f16 GEMM each, an elementwise SiLU(gate)*up*routing-weight combine kernel, a dequant+GEMM
+down projection, and the existing `moe_sum_kernel` / `moe_sum_owned_kernel` for the
+cross-expert sum -- same accumulation machinery every other type path uses. No new tile
+kernels. Covers both decode (n_tokens=1) and prefill (n_tokens>1) through the same loop;
+per-pair GEMMs are the acknowledged P3 speed gap.
+
+Validated with `research/gb10/test_mxfp4_moe.c`: synthetic MXFP4 gate/up/down expert
+tensors through the public `ds4_gpu_routed_moe_batch_tensor()` entry point, decode-shaped
+(n_tokens=1, n_expert=6) and prefill-shaped (n_tokens=5, n_expert=3) cases, both matching
+an independent CPU dequant+matvec reference within f16-GEMM tolerance. Note:
+`routed_moe_launch`'s shared top-of-function validation (pre-existing, not touched here)
+hard-requires `expert_in_dim`/`expert_mid_dim % CUDA_QK_K(=256) == 0` for every routed
+type, inherited by MXFP4 even though its own block size is 32 -- fine for real MoE hidden
+dims (always multiples of 256 in practice) but worth knowing if a future test wants
+smaller synthetic dims.
+
+CPU (non-CUDA) routed-expert path was scoped and explicitly **not** wired: it dispatches
+per weight-type via ~17 separate hand-specialized worker functions in `ds4.c`
+(`matvec_q2_k_expert*`, `matvec_q4_k_experts_*_prequant`, the `matvec_expert_pair_prequant`
+/ `matvec_expert_down` tracing helpers, and batch variants around `ds4.c:11457`/`11553`),
+each with its own `ds4_die("unsupported gate/up expert tensor type")` /
+`ds4_die("unsupported down expert tensor type")` fallback -- not a single generic dispatch
+point the way the CUDA side has `ds4_gpu_matmul_quant_tensor`. Wiring `dequantize_row_mxfp4`
+(already ported, `ds4.c` ~3504) into all of them is real, scattered work; deferred and
+reported per the ticket's own escape hatch rather than forced. Net effect: an MXFP4_MOE
+GGUF run with `--ssd-streaming` or on a CPU-only build still `ds4_die`s the first time a
+CPU-side routed-expert matvec sees type 39. GPU-resident (non-streaming-CPU-fallback)
+execution is what's covered by this pass.
 - **P2 — NVFP4**: same skeleton, E4M3 sub-scales (worth ~3.1 PPL per FP4 research); blocked
   upstream on quantize-tool emit (ftype 39 reserved in llama.h but no CLI entry at donor
   HEAD) unless we target an existing NVFP4 GGUF.
