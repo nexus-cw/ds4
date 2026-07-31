@@ -435,6 +435,122 @@ failures, all within the pre-existing flaky set from the prior pass's own two-ru
 comparison (`tool-call-quality`, `think-tool-recovery`, `logprob-vectors`, `metal-kernels`;
 `metal-tensor-equivalence` passed this run). No new failing test names.
 
+### P1 status update (2026-07-31, cont'd): F32->F16 sign-off, --inspect reaches summary, first real --ssd-streaming run
+
+Operator sign-off granted on the F32 question above. Extended `model_convert_dense_bf16_q6k()`
+(renamed conceptually, not literally, to also cover F32) to convert F32 tensors to F16
+under a narrower, explicitly source-checked eligibility rule, factored into a shared
+`tensor_is_dense_conversion_candidate(type, ndim)` predicate:
+
+- BF16/Q6_K: unchanged, `ndim <= 2`.
+- F32: only `ndim == 2` (never `ndim == 1` -- every 1D F32 tensor in every validate path
+  checked, deepseek4 FLASH/PRO, GLM, MTP, and DSpark alike, is a norm/bias/scale vector
+  required to *stay* F32) **and** only when compiled `DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4`.
+  Verified directly against source before writing the rule: in `weights_validate_layout()`
+  (deepseek4, non-GLM -- what this build is) every 2D tensor is hardcoded
+  `DS4_TENSOR_F16` or dense-quant/routed-expert, *never* F32, so this is exhaustively safe
+  there. `weights_validate_glm_dsa_layout()` (GLM) is the opposite: `ffn_gate_inp` and
+  `indexer_proj` are *required* as literal 2D F32 -- the family gate exists specifically to
+  keep this pass a no-op for a GLM-family build, so it cannot break GLM's real requirement.
+  `mtp_weights_validate_layout()` uses `tensor_expect_plain_layout()` (F16-or-F32 accepted)
+  for its 2D hc tensors, so F32->F16 there is harmless either way.
+
+**A dense-tensor validator gap this surfaced**: `tensor_type_is_dense_quant()` (gates
+`attn_q_a/q_b`, `attn_kv`, `attn_output_a/b`, `ffn_*_shexp`, `output` -- the exact BF16/Q6_K
+families from the prior pass) accepted only Q8_0/Q4_K/Q4_0 -- not F16. Harmless before this
+port (a "normal" `MXFP4_MOE` GGUF puts Q8_0 there per llama.cpp's own quantize recipe), but
+our BF16/Q6_K->F16 conversion made these tensors F16, and validation for that whole role
+group is only ever reached *after* the top-level output-head checks earlier in the same
+function -- so the previous pass's `--inspect` run never actually exercised it (it died on
+`hc_head_fn` first, before the per-layer loop). Fixed by adding `DS4_TENSOR_F16` to
+`tensor_type_is_dense_quant()`'s accepted set; confirmed harmless everywhere else it's used
+(e.g. `metal_graph_matmul_plain_tensor()` already special-cases F16 *before* falling through
+to this check, so F16 tensors there were always routed to the dedicated F16 matmul path
+regardless).
+
+**Result**: `--inspect` now reaches the model summary, zero clamps across all 22 converted
+tensor families (16 BF16/Q6_K + 6 new F32 ones: top-level `hc_head_fn`, and per-layer
+`blk.N.ffn_gate_inp.weight`, `blk.N.hc_attn_fn`, `blk.N.hc_ffn_fn`, `blk.N.attn_compress_ape`,
+`blk.N.indexer.compress_ape`):
+
+```
+model: DeepSeek V4 Flash
+arch:  deepseek4
+gguf:  v3, 51 metadata keys, 1328 tensors
+layers: 43
+train context: 1048576
+attention: heads=64 kv_heads=1 head_dim=512 swa=128
+indexer: heads=64 head_dim=128 top_k=512
+experts: count=256 used=6 groups=0 groups_used=0
+file size: 153.52 GiB
+tensor bytes described by GGUF: 144.90 GiB
+logical parameters: 284.33 B
+tensor types:
+  f32        492 tensors, 0.00 GiB
+  f16        704 tensors, 13.61 GiB
+  q3_k        30 tensors, 25.78 GiB
+  q5_k         1 tensors, 1.38 GiB
+  i32          3 tensors, 0.01 GiB
+  mxfp4       98 tensors, 104.12 GiB
+```
+
+**Two more blockers hit and fixed while running the actual smoke generation** (both in
+`ds4_cuda.cu`, both a consequence of the same root cause: this build's SSD-streaming path
+has several places that assume every host-mapped tensor byte is also reachable via a
+direct read of the *real on-disk file* at the same offset -- an assumption our load-time
+conversion (which grows the host mapping past the real file's end to hold converted bytes)
+breaks for exactly the tensors this port converts, and only those):
+
+1. `cuda_model_range_ptr_from_fd()`: the direct/O_DIRECT-file-read fast path used under
+   `--ssd-streaming` read via `pread(g_model_fd, ..., offset)` at the tensor's *current*
+   (post-conversion) offset -- valid inside the grown host mapping, but past
+   `g_model_file_size` (an `fstat` of the same fd, captured once, reflecting the real
+   on-disk length) for every converted tensor, so the disk read was doomed regardless of
+   retry. Fixed by checking `offset >= g_model_file_size` up front and short-circuiting
+   straight to the host-mapping pointer in that case (the bytes are already correctly
+   resident there -- nothing to fetch from disk).
+2. `ds4_gpu_cache_model_range()` (called while preparing the token-embedding span)
+   additionally requires the resolved range to show up in `cuda_model_range_is_cached()`'s
+   bookkeeping (`g_model_ranges`) before it reports success, which only the *other*
+   resolution branches populated -- the (1) fast-path bypass didn't. Fixed by pushing the
+   same `g_model_ranges` entry the other successful-resolution branches push, so a later
+   "is this range ready" query also sees it as covered.
+
+Both fixes are scoped to `offset >= g_model_file_size`, i.e. they only change behavior for
+bytes that did not exist on disk before this port's conversion pass -- zero behavior change
+for any tensor at its real on-disk offset.
+
+**Smoke generation** (`--cuda --ssd-streaming --ssd-streaming-cold --ssd-streaming-cache-experts
+40GB --nothink -p "Reply with exactly: ok"`, foreground, 600s timeout): gets through model
+load, the (now-fixed) token-embedding span preparation, and into prefill, then hits a
+**third, unrelated** blocker -- unrelated to this pass's BF16/Q6_K/F32 conversion work, in
+the pre-existing generic MXFP4/Q3_K/Q5_K routed-expert dequant+GEMM dispatch path
+(`routed_moe_dequant_gemm_dispatch` family, `ds4_cuda.cu`): under `--ssd-streaming`, that
+path requires a populated per-layer `g_stream_selected_cache` ("which experts are selected,
+and their host-resolved gate/up/down pointers") before it will run, and reports rather than
+crashes when it isn't populated:
+
+```
+ds4: CUDA streaming selected experts are unavailable for layer 0
+ds4: prompt processing failed: cuda prefill failed
+```
+
+This is the "known unwired streaming-expert" class of gap the ticket anticipated (a
+different specific mechanism than a CPU-matvec `ds4_die`, but the same general shape: P1's
+GPU dequant+GEMM MoE path -- landed and unit-tested in isolation per the 2026-07-31 P1
+status entry above -- was never previously exercised against a real `--ssd-streaming` run
+of the actual 150GB artifact, since no full-model load had reached this far before this
+pass). Populating/wiring `g_stream_selected_cache` for the generic dequant+GEMM family under
+cold SSD streaming is real, scoped follow-up work, but is routed-expert MoE streaming
+infrastructure, not a dense-tensor dtype question -- outside this pass's scope, reported
+per the ticket's own stop-and-document instruction rather than chased further here. No
+tok/s measured (prefill never completed).
+
+**Verification**: `make cuda-spark` -- clean build, no warnings, across both the `ds4.c`
+and `ds4_cuda.cu` changes in this update. `./ds4_test` -- 6 failures, same names as every
+prior run (`tool-call-quality`, `think-tool-recovery`, `logprob-vectors`, `metal-kernels`);
+no new failing test names.
+
 ## Target artifact
 
 Chosen (checkpoint hunt 2026-07-31): **lovedheart/DeepSeek-V4-Flash-GGUF**
