@@ -796,6 +796,23 @@ typedef struct {
     uint16_t qs[QK_K / 8];
 } block_iq2_xxs;
 
+/* MXFP4 (GGUF tensor type 39): OCP microscaling FP4, block-32, 1 byte
+ * E8M0 power-of-two scale + 16 bytes packed E2M1 nibbles.
+ * ported from llama.cpp (MIT) ggml-common.h / ggml-quants.c @5f55650 */
+#define QK_MXFP4 32
+typedef struct {
+    uint8_t e;               /* E8M0 exponent-only scale */
+    uint8_t qs[QK_MXFP4 / 2]; /* packed 4-bit E2M1 values */
+} block_mxfp4;
+
+/* E2M1 value table (doubled, per ggml convention): kvalues_mxfp4[nibble]
+ * gives 2x the represented FP4 value; paired with the "_half" E8M0
+ * conversion below so the product is exact.
+ * ported from llama.cpp (MIT) ggml-common.h @5f55650 */
+static const int8_t kvalues_mxfp4[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
+};
+
 #define DS4_STATIC_ASSERT(name, cond) typedef char name[(cond) ? 1 : -1]
 DS4_STATIC_ASSERT(ds4_block_q2_k_size, sizeof(block_q2_K) == 84);
 DS4_STATIC_ASSERT(ds4_block_q4_k_size, sizeof(block_q4_K) == 144);
@@ -803,6 +820,7 @@ DS4_STATIC_ASSERT(ds4_block_q5_k_size, sizeof(block_q5_K) == 176);
 DS4_STATIC_ASSERT(ds4_block_q6_k_size, sizeof(block_q6_K) == 210);
 DS4_STATIC_ASSERT(ds4_block_q8_k_size, sizeof(block_q8_K) == 292);
 DS4_STATIC_ASSERT(ds4_block_iq2_xxs_size, sizeof(block_iq2_xxs) == 66);
+DS4_STATIC_ASSERT(ds4_block_mxfp4_size, sizeof(block_mxfp4) == 17);
 
 typedef struct {
     uint32_t ctx_size;
@@ -2035,6 +2053,7 @@ static const gguf_type_info gguf_types[] = {
     [28] = {"f64",      1,   8},
     [29] = {"iq1_m",  256,  56},
     [30] = {"bf16",     1,   2},
+    [39] = {"mxfp4",   32,  17},
 };
 
 enum {
@@ -2048,6 +2067,7 @@ enum {
     DS4_TENSOR_Q6_K     = 14,
     DS4_TENSOR_Q8_K     = 15,
     DS4_TENSOR_IQ2_XXS  = 16,
+    DS4_TENSOR_MXFP4    = 39,
     DS4_TENSOR_I32      = 26,
 };
 
@@ -3463,6 +3483,53 @@ static void ds4_vec_dot_q2_K_q8_K(int n, float *s, const block_q2_K *x, const bl
 #endif
 }
 
+/* E8M0 (8-bit power-of-two exponent, no mantissa/sign) -> fp32, halved.
+ * "_half" matches ggml's convention that MXFP4's E2M1 table is stored
+ * pre-doubled, so scale*value reproduces the true magnitude.
+ * ported from llama.cpp (MIT) ggml-impl.h ggml_e8m0_to_fp32_half @5f55650 */
+static inline float mxfp4_e8m0_to_fp32_half(uint8_t x) {
+    uint32_t bits;
+    if (x < 2) {
+        bits = 0x00200000u << x;
+    } else {
+        bits = (uint32_t)(x - 1) << 23;
+    }
+    float result;
+    memcpy(&result, &bits, sizeof(float));
+    return result;
+}
+
+/* CPU dequant: block_mxfp4 -> contiguous float row of length k (k % 32 == 0).
+ * ported from llama.cpp (MIT) ggml-quants.c dequantize_row_mxfp4 @5f55650 */
+static DS4_MAYBE_UNUSED void dequantize_row_mxfp4(const block_mxfp4 *x, float *y, int64_t k) {
+    const int64_t qk = QK_MXFP4;
+    const int64_t nb = k / qk;
+    for (int64_t i = 0; i < nb; i++) {
+        const float d = mxfp4_e8m0_to_fp32_half(x[i].e);
+        for (int64_t j = 0; j < qk / 2; ++j) {
+            const int8_t x0 = kvalues_mxfp4[x[i].qs[j] & 0x0F];
+            const int8_t x1 = kvalues_mxfp4[x[i].qs[j] >> 4];
+            y[i * qk + j + 0]      = x0 * d;
+            y[i * qk + j + qk / 2] = x1 * d;
+        }
+    }
+}
+
+static inline float mxfp4_value_f32(const block_mxfp4 *blocks, uint32_t k) {
+    const uint32_t block = k / QK_MXFP4;
+    const uint32_t idx = k - block * QK_MXFP4;
+    const block_mxfp4 *xb = blocks + block;
+    const float d = mxfp4_e8m0_to_fp32_half(xb->e);
+    const uint32_t half = QK_MXFP4 / 2;
+    uint8_t nibble;
+    if (idx < half) {
+        nibble = xb->qs[idx] & 0x0F;
+    } else {
+        nibble = xb->qs[idx - half] >> 4;
+    }
+    return (float)kvalues_mxfp4[nibble] * d;
+}
+
 static inline float q2_k_value_f32(const block_q2_K *blocks, uint32_t k) {
     const uint32_t block = k / QK_K;
     const uint32_t idx = k - block * QK_K;
@@ -4370,7 +4437,8 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
            type == DS4_TENSOR_Q2_K ||
            type == DS4_TENSOR_Q4_K ||
            type == DS4_TENSOR_Q5_K ||
-           type == DS4_TENSOR_Q6_K;
+           type == DS4_TENSOR_Q6_K ||
+           type == DS4_TENSOR_MXFP4;
 }
 
 static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
@@ -4381,6 +4449,7 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     case DS4_TENSOR_Q4_K:    return sizeof(block_q4_K);
     case DS4_TENSOR_Q5_K:    return sizeof(block_q5_K);
     case DS4_TENSOR_Q6_K:    return sizeof(block_q6_K);
+    case DS4_TENSOR_MXFP4:   return sizeof(block_mxfp4);
     default:                 ds4_die("unsupported routed expert tensor type");
     }
     return 0;

@@ -12083,6 +12083,54 @@ __global__ static void q8_0_dequant_f16_kernel(
     }
 }
 
+/* MXFP4 (GGUF tensor type 39) CPU-mirrored dequant constants: E2M1 value
+ * table (doubled, per ggml convention) and the E8M0-halved scale
+ * conversion, matching ds4.c's kvalues_mxfp4 / mxfp4_e8m0_to_fp32_half.
+ * ported from llama.cpp (MIT) ggml-common.h / ggml-impl.h @5f55650 */
+__device__ static const int8_t kvalues_mxfp4_dev[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
+};
+
+__device__ static float mxfp4_e8m0_to_fp32_half_dev(uint8_t x) {
+    uint32_t bits;
+    if (x < 2) {
+        bits = 0x00200000u << x;
+    } else {
+        bits = (uint32_t)(x - 1) << 23;
+    }
+    float result;
+    memcpy(&result, &bits, sizeof(float));
+    return result;
+}
+
+/* Mirrors q8_0_dequant_f16_kernel above for the streaming dequant + f16
+ * GEMM fallback path, but for MXFP4 routed-expert blocks (17 bytes: 1
+ * E8M0 scale byte + 16 bytes packed E2M1 nibbles, QK_MXFP4=32). One
+ * thread per block; phase 1 is correctness, not throughput. */
+__global__ static void mxfp4_dequant_f16_kernel(
+        __half *out,
+        const unsigned char *w,
+        uint64_t total_blocks,
+        uint32_t blocks_per_row,
+        uint32_t in_dim) {
+    const uint64_t b = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= total_blocks) return;
+    const unsigned char *blk = w + b * 17u;
+    const float d = mxfp4_e8m0_to_fp32_half_dev(blk[0]);
+    const unsigned char *qs = blk + 1;
+    const uint64_t row = b / blocks_per_row;
+    const uint32_t col = (uint32_t)(b - row * blocks_per_row) * 32u;
+    __half *dst = out + row * in_dim + col;
+    #pragma unroll
+    for (int j = 0; j < 16; j++) {
+        const uint8_t byte = qs[j];
+        const int8_t x0 = kvalues_mxfp4_dev[byte & 0x0F];
+        const int8_t x1 = kvalues_mxfp4_dev[byte >> 4];
+        dst[j]      = __float2half(d * (float)x0);
+        dst[j + 16] = __float2half(d * (float)x1);
+    }
+}
+
 static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
     if (!out || !x || !model_map) return 0;
     uint64_t blocks = (in_dim + 31) / 32;
@@ -12368,6 +12416,59 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
 extern "C" int ds4_gpu_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     return cuda_matmul_q8_0_tensor_labeled(out, model_map, model_size, weight_offset,
                                            in_dim, out_dim, x, n_tok, "q8_0");
+}
+
+/* MXFP4 routed-expert dequant + f16 GEMM fallback (P1 correctness path,
+ * no tensor-core MMA kernels yet -- see FP4_PORT_SCOPE.md). Dequantizes
+ * an [out_dim x in_dim] MXFP4 weight into an f16 scratch buffer with
+ * mxfp4_dequant_f16_kernel, converts the f32 activations to f16, and
+ * runs a single cuBLAS f16 GEMM. Mirrors the g_q8_dequant_gemm_enabled
+ * branch of cuda_matmul_q8_0_tensor_labeled above, generalized to the
+ * 17-byte/32-elem MXFP4 block instead of the 34-byte/32-elem Q8_0 one.
+ * NOTE: not yet reachable from routed_moe_launch's per-expert dispatch
+ * (ds4_cuda.cu, "routed_moe_launch"), which still hard-gates on legacy
+ * type IDs 16/10/12 -- wiring that up is the remaining P1/P2 work. */
+extern "C" int ds4_gpu_matmul_mxfp4_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+    if (!out || !x || !model_map || !g_cublas_ready || (in_dim & 31u) != 0u) return 0;
+    const uint64_t blocks = in_dim / 32u;
+    if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 17u)) return 0;
+    const uint64_t weight_bytes = out_dim * blocks * 17u;
+    if (weight_bytes > model_size - weight_offset) return 0;
+    if (x->bytes < n_tok * in_dim * sizeof(float) ||
+        out->bytes < n_tok * out_dim * sizeof(float)) return 0;
+    const int logical_tier = ds4_tensor_device_idx(out);
+    const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes, logical_tier, "mxfp4");
+    if (!wptr) return 0;
+    const uint64_t wh_bytes = in_dim * out_dim * sizeof(__half);
+    const uint64_t xh_off = (wh_bytes + 255u) & ~255ull;
+    const uint64_t gemm_tmp = xh_off + n_tok * in_dim * sizeof(__half);
+    void *tmp16 = cuda_tmp_alloc_on(logical_tier, gemm_tmp, "mxfp4 dequant gemm");
+    if (!tmp16) return 0;
+    __half *wh = (__half *)tmp16;
+    __half *xh = (__half *)((char *)tmp16 + xh_off);
+    const uint64_t total_blocks = out_dim * blocks;
+    mxfp4_dequant_f16_kernel<<<(unsigned)((total_blocks + 255u) / 256u), 256>>>(
+            wh, reinterpret_cast<const unsigned char *>(wptr),
+            total_blocks, (uint32_t)blocks, (uint32_t)in_dim);
+    const uint64_t xh_count = n_tok * in_dim;
+    f32_to_f16_kernel<<<(xh_count + 255) / 256, 256>>>(xh, (const float *)x->ptr, xh_count);
+    if (!cuda_ok(cudaGetLastError(), "mxfp4 dequant gemm staging")) return 0;
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasStatus_t st = cublasGemmEx(cuda_cublas_for_tier(logical_tier),
+                                     CUBLAS_OP_T, CUBLAS_OP_N,
+                                     (int)out_dim, (int)n_tok, (int)in_dim,
+                                     &alpha,
+                                     wh, CUDA_R_16F, (int)in_dim,
+                                     xh, CUDA_R_16F, (int)in_dim,
+                                     &beta,
+                                     out->ptr, CUDA_R_32F, (int)out_dim,
+                                     CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "ds4: cuBLAS mxfp4 dequant gemm failed: status %d\n", (int)st);
+        return 0;
+    }
+    return 1;
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_top1_tensor(
