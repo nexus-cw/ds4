@@ -714,3 +714,71 @@ explicit page-cache drop -- the acceptance bar this unit was scoped to. The prev
 undocumented `--ssd-streaming` decode-style-vs-layer-major prefill split (governed by
 `metal_graph_streaming_decode_prefill_max_tokens()`'s 18/64-token cap) is now exercised by
 these >18-token runs, confirming the fix, not just the workaround's continued effectiveness.
+
+## P3b item 2: prefill batching for the generic dequant+GEMM routed-MoE fallback
+(2026-08-01)
+
+**Motivation.** `routed_moe_dequant_gemm_dispatch` (the P1 correctness-path fallback for
+MXFP4/Q3_K/Q5_K experts not covered by P3a's fused decode kernels, and the *only* path
+`n_tokens>1` prefill ever uses regardless of type -- P3a's fused kernels are decode-only)
+loops per-(token,expert) pair: for every pair it dequantizes that expert's whole gate/up/
+down weight matrix from scratch, then runs a memory-bound `m=1` cuBLAS GEMV against it. For
+a real prefill, many tokens route to the same popular expert, so the same weight matrix gets
+redundantly re-dequantized once per token that selected it.
+
+**Fix.** New `routed_moe_dequant_gemm_dispatch_prefill_grouped()` (`ds4_cuda.cu`), used
+whenever `n_tokens > 1` (gated by a new `DS4_CUDA_DISABLE_DEQUANT_GEMM_PREFILL_BATCH` escape
+hatch, used below as the A/B toggle; decode, `n_tokens==1`, is completely untouched -- same
+loop as before). Host-side (the function already does one device->host readback of the
+selected-expert table per MoE-layer call, since cuBLAS needs the weight pointer on the host;
+grouping reuses that same readback), pairs are stable-sorted by expert id (plain `qsort`,
+mirroring -- structurally, not literally -- what the Q4_K tile8 fused prefill path already
+does with its own device-side `sorted_pairs`/`offsets`). Token activation rows are gathered
+into a compact, expert-grouped block ONCE for the whole call (not re-gathered per group).
+Per distinct expert (a contiguous run in the sorted array): dequantize its gate/up/down
+weight matrices ONCE, then one cuBLAS GEMM per matrix with `n = group_size` (the number of
+tokens that selected this expert) instead of `n = 1` against the pre-gathered group block --
+the exact same row-major/column-major reinterpretation trick the existing single-row
+`dequant_gemm_row_f16gemm` already relies on for `n=1` extends to `n=group_size` with no
+other change to the GEMM call. The down-projection's compact per-group output is scattered
+back into the existing pair-indexed `down` buffer via a new small kernel, so
+`moe_sum_kernel`/`moe_sum_owned_kernel` (and `owned_filtered`'s `<0`-selected-slot skip
+semantics) are completely unchanged -- the selected-cache/LRU population protocol upstream
+of this function (P3a-fix's CUDA expert LRU, `416533c`) is untouched by this change; this
+is purely a compute-shape optimization downstream of expert-pointer resolution.
+
+**Correctness.** `test_mxfp4_moe`/`test_mixed_moe` already include `n_tokens=5`
+prefill-shaped cases (MXFP4/MXFP4 and MXFP4-gate-up with Q3_K/Q5_K-down), which route
+through `routed_moe_dequant_gemm_dispatch` and therefore now exercise the new grouped path
+by default -- all pass against the independent CPU reference, both with the grouped path
+default-enabled and with `DS4_CUDA_DISABLE_DEQUANT_GEMM_PREFILL_BATCH=1` forcing the old
+per-pair loop. `test_mxfp4_dequant`: unaffected (CPU-only), still passes. Real 150GB
+artifact smoke ladder (`--cuda --ssd-streaming --ssd-streaming-cache-experts 40GB
+--nothink`): `-p "Reply with exactly: ok"` -> `ok` (exact match); `-p "What is the capital
+of France?"` -> `The capital of France is Paris.` (exact match, coherent) -- both with the
+grouped path default-enabled, no regression from item 1's fix.
+
+**Performance**, same warm state (no cache drops between conditions, both measured back to
+back on the same warm page cache), a 211-word (~300-token) four-part prompt (water/carbon/
+plate-tectonics cycles + synthesis question), `-n 5`, 3 runs each, prefill t/s from the
+`prefill:` field ds4 prints itself:
+
+| run | before (`DS4_CUDA_DISABLE_DEQUANT_GEMM_PREFILL_BATCH=1`) | after (grouped, default) |
+|---|---|---|
+| 1 | 1.74 t/s | 4.62 t/s |
+| 2 | 1.73 t/s | 4.64 t/s |
+| 3 | 1.72 t/s | 4.60 t/s |
+
+Prefill: ~1.72-1.74 t/s before -> ~4.60-4.64 t/s after -- roughly a **2.65x** prefill
+speedup on this prompt from grouping dequant+GEMM by expert instead of redoing it per
+token. (The "before" baseline here is higher than P1/P3a's own earlier 0.92-0.96 t/s
+figures for the ungrouped path -- expected, since this unit's baseline already includes
+every prior pass's fixes, in particular P3a-fix's CUDA expert LRU giving warm-cache hits
+on repeated experts across this run, and item 1's layer-major prefill fix; this table is a
+same-commit, same-warm-state, env-toggle-only A/B, isolating exactly this change's own
+effect.) Generation (decode) t/s is unaffected as expected (before: 1.75-1.82 t/s, after:
+1.75-1.87 t/s -- within normal run-to-run noise, decode dispatch code is untouched).
+
+**Verification.** `make clean && make cuda-spark`: clean rebuild, no warnings.
+`test_mxfp4_moe`/`test_mixed_moe`/`test_mxfp4_dequant`: all pass, both with the grouped
+path default-enabled and with it disabled via the new env var.

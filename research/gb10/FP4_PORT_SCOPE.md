@@ -1515,3 +1515,25 @@ prose prompt + a 158-word GPQA-style prompt, all without the env-var workaround,
 repeated including immediately after an explicit page-cache drop) in `MEASUREMENTS.md`'s
 "P3b item 1" section. `make clean && make cuda-spark`: clean, no warnings.
 `test_mxfp4_moe`/`test_mixed_moe`/`test_mxfp4_dequant`: all pass.
+
+## P3b item 2: prefill batching for the generic dequant+GEMM routed-MoE fallback
+(2026-08-01)
+
+New `routed_moe_dequant_gemm_dispatch_prefill_grouped()` (`ds4_cuda.cu`): for prefill-shaped
+(`n_tokens>1`) calls, groups (token,expert) pairs by expert (host-side stable `qsort` on the
+call's own already-required selected-expert readback -- structurally mirroring the Q4_K
+tile8 fused prefill path's own device-side `sorted_pairs`/`offsets` grouping, just done
+host-side since this fallback already needs the expert table on the host for cuBLAS), so
+each distinct expert's gate/up/down weight matrices are dequantized ONCE per prefill call
+(not once per token that selected it) and driven through a single `n=group_size` cuBLAS GEMM
+(not `n=1` per token). Decode (`n_tokens==1`) is untouched; new
+`DS4_CUDA_DISABLE_DEQUANT_GEMM_PREFILL_BATCH` escape hatch forces the old per-pair loop.
+Selected-cache/LRU population protocol (P3a-fix's CUDA expert LRU) is unchanged -- purely a
+compute-shape change downstream of expert-pointer resolution.
+
+Full design rationale, correctness verification (`test_mxfp4_moe`/`test_mixed_moe`'s own
+`n_tokens=5` prefill-shaped cases now exercise this path by default; both pass with the
+grouped path on and off), and before/after prefill throughput on a ~300-token prompt
+(~1.72-1.74 t/s -> ~4.60-4.64 t/s, ~2.65x, 3 reps each, same warm state) in
+`MEASUREMENTS.md`'s "P3b item 2" section. `make clean && make cuda-spark`: clean, no
+warnings.

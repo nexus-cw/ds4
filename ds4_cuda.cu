@@ -21573,6 +21573,357 @@ static int dequant_gemm_row_f16gemm(
  * (n_tokens>1) with the same loop; no separate kernels for the two, per
  * the P1 scope (throughput work is P3). gate_type covers both gate and
  * up (ds4's existing invariant, enforced at load); down_type may differ. */
+/* P3b: prefill batching for the generic dequant+GEMM routed-MoE fallback.
+ *
+ * routed_moe_dequant_gemm_dispatch's per-(token,expert)-pair loop above
+ * dequantizes every selected expert's gate/up/down weight matrix ONCE PER
+ * TOKEN THAT SELECTED IT -- for a real prefill, the same popular expert is
+ * typically selected by many different tokens, so the naive loop redoes
+ * the (relatively expensive) dequant of that expert's full weight matrix
+ * once per token, then runs a memory-bound m=1 GEMV against it, when a
+ * single dequant followed by one wider (m=group_size) GEMM would produce
+ * byte-identical results for a fraction of the dequant work and much
+ * better GEMM utilization. This mirrors what the Q4_K tile8 fused prefill
+ * path already does structurally (`sorted_pairs`/`offsets`): group
+ * (token,expert) pairs by expert, process each distinct expert once.
+ *
+ * Unlike the Q4_K/IQ2_XXS fused paths (which sort pairs device-side and
+ * index everything device-side, never touching the host), this fallback
+ * already does one device->host readback of the selected-expert table per
+ * MoE-layer call (see routed_moe_dequant_gemm_dispatch below) because
+ * cuBLAS needs the per-expert weight pointer on the host at launch time.
+ * Grouping is therefore done host-side too, with a plain qsort over the
+ * (already-small, pair_count = n_tokens*n_expert) selected-pair array --
+ * simpler and just as correct as a device-side sort at this scale, and it
+ * reuses the same host-resolved gate_w/up_w/down_w addressing the
+ * ungrouped path already relies on (the selected-cache/LRU population
+ * protocol upstream of this function is completely unchanged).
+ *
+ * Per distinct expert (a contiguous run in the sorted-by-expert array):
+ *   1. dequantize its gate/up/down weight matrices ONCE (same
+ *      launch_dequant_f16 call as the ungrouped path, just called once per
+ *      expert instead of once per (token,expert) pair that selected it).
+ *   2. one cuBLAS GEMM per matrix with n = the expert's token-group size
+ *      instead of n = 1, against a compact, expert-grouped block of the
+ *      group's token activation rows (gathered once, up front, for the
+ *      whole call -- not re-gathered per group).
+ *   3. scatter the down-projection's compact group output back into the
+ *      pair-indexed `down` buffer moe_sum_kernel/moe_sum_owned_kernel
+ *      already consume unchanged, so the final per-token expert-sum
+ *      reduction (and owned_filtered's <0-selected-slot skip semantics)
+ *      needs no changes at all.
+ *
+ * cuBLAS orientation note: with wh dequantized row-major as
+ * [out_dim x in_dim] and x rows gathered row-major as
+ * [group_size x in_dim], reinterpreting either buffer as column-major
+ * with leading dimension in_dim/out_dim (respectively) is exactly the
+ * same memory layout ggml/ds4's existing single-row dequant_gemm_row_f16gemm
+ * already relies on for n=1 -- extending n from 1 to group_size needs no
+ * other change to the GEMM call's arguments beyond n itself and the
+ * output leading dimension, which was already out_dim. */
+
+typedef struct {
+    int32_t expert;
+    int32_t pair;
+    int32_t tok;
+} dqg_sorted_entry;
+
+static int dqg_sorted_entry_cmp(const void *a, const void *b) {
+    const dqg_sorted_entry *ea = (const dqg_sorted_entry *)a;
+    const dqg_sorted_entry *eb = (const dqg_sorted_entry *)b;
+    if (ea->expert != eb->expert) return ea->expert < eb->expert ? -1 : 1;
+    if (ea->pair != eb->pair) return ea->pair < eb->pair ? -1 : 1;
+    return 0;
+}
+
+__global__ static void dqg_gather_x_rows_kernel(
+        float *dst,
+        const float *x,
+        const int32_t *token_idx,
+        uint32_t num_valid,
+        uint32_t in_dim) {
+    const uint32_t row = blockIdx.x;
+    if (row >= num_valid) return;
+    const float *src = x + (uint64_t)token_idx[row] * in_dim;
+    float *out = dst + (uint64_t)row * in_dim;
+    for (uint32_t i = threadIdx.x; i < in_dim; i += blockDim.x) out[i] = src[i];
+}
+
+__global__ static void dqg_group_silu_mul_kernel(
+        float *mid_out,
+        const float *gate_in,
+        const float *up_in,
+        const float *weights,
+        const int32_t *pair_idx,
+        uint32_t group_start,
+        uint32_t group_size,
+        uint32_t mid_dim,
+        float clamp) {
+    const uint32_t row = blockIdx.y;
+    if (row >= group_size) return;
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= mid_dim) return;
+    const uint64_t off = (uint64_t)row * mid_dim + i;
+    float gate = gate_in[off];
+    float up = up_in[off];
+    if (clamp > 1.0e-6f) {
+        if (gate > clamp) gate = clamp;
+        if (up > clamp) up = clamp;
+        if (up < -clamp) up = -clamp;
+    }
+    const float w = weights[pair_idx[group_start + row]];
+    mid_out[off] = (gate / (1.0f + expf(-gate))) * up * w;
+}
+
+__global__ static void dqg_scatter_down_rows_kernel(
+        float *down_out,
+        const float *down_group,
+        const int32_t *pair_idx,
+        uint32_t group_start,
+        uint32_t group_size,
+        uint32_t out_dim) {
+    const uint32_t row = blockIdx.x;
+    if (row >= group_size) return;
+    const uint32_t dst_pair = (uint32_t)pair_idx[group_start + row];
+    float *dst = down_out + (uint64_t)dst_pair * out_dim;
+    const float *src = down_group + (uint64_t)row * out_dim;
+    for (uint32_t i = threadIdx.x; i < out_dim; i += blockDim.x) dst[i] = src[i];
+}
+
+/* Dequant-once, GEMM-with-n=group_size sibling of dequant_gemm_row_f16gemm
+ * above. `wh_scratch` must already be sized to hold >= out_dim*in_dim f16
+ * elements (the caller carves it out of one shared cuda_tmp_alloc_on
+ * allocation, matching the existing single-row helper's own convention). */
+static int dqg_group_gemm(
+        uint32_t type,
+        float *out_group,
+        const char *w,
+        uint64_t row_bytes,
+        const __half *xh_group,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        uint32_t group_size,
+        __half *wh_scratch,
+        int logical_tier) {
+    if (!out_group || !w || !xh_group || !wh_scratch || !g_cublas_ready) return 0;
+    const uint32_t block_elems = dequant_gemm_block_elems(type);
+    const uint64_t block_bytes = dequant_gemm_block_bytes(type);
+    if (block_elems == 0u || in_dim % block_elems != 0u) return 0;
+    const uint32_t blocks = in_dim / block_elems;
+    if (row_bytes != (uint64_t)blocks * block_bytes) return 0;
+    const uint64_t total_blocks = (uint64_t)out_dim * blocks;
+    launch_dequant_f16(type, wh_scratch, reinterpret_cast<const unsigned char *>(w),
+                        total_blocks, blocks, in_dim);
+    if (!cuda_ok(cudaGetLastError(), "routed_moe grouped dequant gemm dequant launch")) {
+        return 0;
+    }
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasStatus_t st = cublasGemmEx(cuda_cublas_for_tier(logical_tier),
+                                     CUBLAS_OP_T, CUBLAS_OP_N,
+                                     (int)out_dim, (int)group_size, (int)in_dim,
+                                     &alpha,
+                                     wh_scratch, CUDA_R_16F, (int)in_dim,
+                                     xh_group, CUDA_R_16F, (int)in_dim,
+                                     &beta,
+                                     out_group, CUDA_R_32F, (int)out_dim,
+                                     CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "ds4: cuBLAS routed_moe grouped dequant gemm failed: status %d\n", (int)st);
+        return 0;
+    }
+    return 1;
+}
+
+static int routed_moe_dequant_gemm_dispatch_prefill_grouped(
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *down,
+        const char *gate_w,
+        const char *up_w,
+        const char *down_w,
+        uint32_t gate_type,
+        uint32_t down_type,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_expert,
+        float clamp,
+        const ds4_gpu_tensor *x,
+        uint32_t n_tokens,
+        int owned_filtered,
+        int logical_tier,
+        const int32_t *sel_host) {
+    const uint32_t pair_count = n_tokens * n_expert;
+    dqg_sorted_entry *entries = (dqg_sorted_entry *)malloc((size_t)pair_count * sizeof(*entries));
+    if (!entries) return 0;
+    uint32_t num_valid = 0;
+    for (uint32_t pair = 0; pair < pair_count; pair++) {
+        int32_t expert_i = sel_host[pair];
+        if (expert_i < 0) {
+            if (owned_filtered) continue;
+            expert_i = 0;
+        }
+        entries[num_valid].expert = expert_i;
+        entries[num_valid].pair = (int32_t)pair;
+        entries[num_valid].tok = (int32_t)(pair / n_expert);
+        num_valid++;
+    }
+    if (num_valid == 0) {
+        free(entries);
+        const uint64_t n0 = (uint64_t)n_tokens * out_dim;
+        if (owned_filtered) {
+            moe_sum_owned_kernel<<<(unsigned)((n0 + 255) / 256), 256>>>(
+                    (float *)out->ptr, (const float *)down->ptr,
+                    (const int32_t *)selected->ptr, out_dim, n_expert, n_tokens);
+        } else {
+            moe_sum_kernel<<<(unsigned)((n0 + 255) / 256), 256>>>(
+                    (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
+        }
+        return cuda_ok(cudaGetLastError(), "routed_moe grouped dequant gemm empty sum launch");
+    }
+    qsort(entries, num_valid, sizeof(*entries), dqg_sorted_entry_cmp);
+
+    /* Max run length across the sorted-by-expert array -- the widest any
+     * single group's GEMM/scratch usage needs to be. */
+    uint32_t max_group = 0;
+    for (uint32_t i = 0; i < num_valid; ) {
+        uint32_t j = i + 1;
+        while (j < num_valid && entries[j].expert == entries[i].expert) j++;
+        const uint32_t len = j - i;
+        if (len > max_group) max_group = len;
+        i = j;
+    }
+
+    int32_t *token_idx_host = (int32_t *)malloc((size_t)num_valid * sizeof(int32_t));
+    int32_t *pair_idx_host = (int32_t *)malloc((size_t)num_valid * sizeof(int32_t));
+    if (!token_idx_host || !pair_idx_host) {
+        free(entries); free(token_idx_host); free(pair_idx_host);
+        return 0;
+    }
+    for (uint32_t i = 0; i < num_valid; i++) {
+        token_idx_host[i] = entries[i].tok;
+        pair_idx_host[i] = entries[i].pair;
+    }
+
+    /* One shared scratch allocation, manually carved up (matches the
+     * cuda_tmp_alloc_on single-growing-slab convention every other
+     * dequant+GEMM helper in this file already follows): token_idx,
+     * pair_idx (int32 x num_valid each), x_sorted (f32, num_valid x
+     * in_dim), xh_all (f16, num_valid x in_dim -- converted once, reused
+     * by every group), wh (f16, max(out_dim*in_dim, mid_dim*out_dim),
+     * reused sequentially per expert/matrix), gate/up/mid (f32,
+     * max_group x mid_dim each), midh (f16, max_group x mid_dim), down
+     * (f32, max_group x out_dim). */
+    const uint64_t off_token_idx = 0;
+    const uint64_t off_pair_idx = cuda_round_up(off_token_idx + (uint64_t)num_valid * sizeof(int32_t), 256);
+    const uint64_t off_x_sorted = cuda_round_up(off_pair_idx + (uint64_t)num_valid * sizeof(int32_t), 256);
+    const uint64_t off_xh_all = cuda_round_up(off_x_sorted + (uint64_t)num_valid * expert_in_dim * sizeof(float), 256);
+    const uint64_t wh_elems_gate = (uint64_t)expert_mid_dim * expert_in_dim;
+    const uint64_t wh_elems_down = (uint64_t)out_dim * expert_mid_dim;
+    const uint64_t wh_elems = wh_elems_gate > wh_elems_down ? wh_elems_gate : wh_elems_down;
+    const uint64_t off_wh = cuda_round_up(off_xh_all + (uint64_t)num_valid * expert_in_dim * sizeof(__half), 256);
+    const uint64_t off_gate = cuda_round_up(off_wh + wh_elems * sizeof(__half), 256);
+    const uint64_t off_up = cuda_round_up(off_gate + (uint64_t)max_group * expert_mid_dim * sizeof(float), 256);
+    const uint64_t off_mid = cuda_round_up(off_up + (uint64_t)max_group * expert_mid_dim * sizeof(float), 256);
+    const uint64_t off_midh = cuda_round_up(off_mid + (uint64_t)max_group * expert_mid_dim * sizeof(float), 256);
+    const uint64_t off_down = cuda_round_up(off_midh + (uint64_t)max_group * expert_mid_dim * sizeof(__half), 256);
+    const uint64_t total_bytes = off_down + (uint64_t)max_group * out_dim * sizeof(float);
+
+    void *scratch = cuda_tmp_alloc_on(logical_tier, total_bytes, "routed_moe prefill-batched dequant gemm");
+    if (!scratch) {
+        free(entries); free(token_idx_host); free(pair_idx_host);
+        return 0;
+    }
+    int32_t *token_idx_dev = (int32_t *)((char *)scratch + off_token_idx);
+    int32_t *pair_idx_dev = (int32_t *)((char *)scratch + off_pair_idx);
+    float *x_sorted = (float *)((char *)scratch + off_x_sorted);
+    __half *xh_all = (__half *)((char *)scratch + off_xh_all);
+    __half *wh = (__half *)((char *)scratch + off_wh);
+    float *gate_scratch = (float *)((char *)scratch + off_gate);
+    float *up_scratch = (float *)((char *)scratch + off_up);
+    float *mid_scratch = (float *)((char *)scratch + off_mid);
+    __half *midh_scratch = (__half *)((char *)scratch + off_midh);
+    float *down_scratch = (float *)((char *)scratch + off_down);
+
+    int ok = cuda_ok(cudaMemcpy(token_idx_dev, token_idx_host, (size_t)num_valid * sizeof(int32_t),
+                                cudaMemcpyHostToDevice), "routed_moe grouped token_idx upload") &&
+              cuda_ok(cudaMemcpy(pair_idx_dev, pair_idx_host, (size_t)num_valid * sizeof(int32_t),
+                                cudaMemcpyHostToDevice), "routed_moe grouped pair_idx upload");
+    free(token_idx_host);
+    free(pair_idx_host);
+    if (ok) {
+        dqg_gather_x_rows_kernel<<<num_valid, 256>>>(
+                x_sorted, (const float *)x->ptr, token_idx_dev, num_valid, expert_in_dim);
+        ok = cuda_ok(cudaGetLastError(), "routed_moe grouped x gather launch");
+    }
+    if (ok) {
+        const uint64_t n_xh = (uint64_t)num_valid * expert_in_dim;
+        f32_to_f16_kernel<<<(unsigned)((n_xh + 255) / 256), 256>>>(xh_all, x_sorted, n_xh);
+        ok = cuda_ok(cudaGetLastError(), "routed_moe grouped x f16 launch");
+    }
+
+    for (uint32_t i = 0; ok && i < num_valid; ) {
+        uint32_t j = i + 1;
+        while (j < num_valid && entries[j].expert == entries[i].expert) j++;
+        const uint32_t group_start = i;
+        const uint32_t group_size = j - i;
+        const int32_t expert_i = entries[i].expert;
+        const char *gate_row_base = gate_w + (uint64_t)(uint32_t)expert_i * gate_expert_bytes;
+        const char *up_row_base = up_w + (uint64_t)(uint32_t)expert_i * gate_expert_bytes;
+        const char *down_row_base = down_w + (uint64_t)(uint32_t)expert_i * down_expert_bytes;
+        const __half *xh_group = xh_all + (uint64_t)group_start * expert_in_dim;
+
+        ok = dqg_group_gemm(gate_type, gate_scratch, gate_row_base, gate_row_bytes,
+                            xh_group, expert_in_dim, expert_mid_dim, group_size, wh, logical_tier);
+        if (ok) {
+            ok = dqg_group_gemm(gate_type, up_scratch, up_row_base, gate_row_bytes,
+                                xh_group, expert_in_dim, expert_mid_dim, group_size, wh, logical_tier);
+        }
+        if (!ok) break;
+
+        const dim3 silu_grid((expert_mid_dim + 255u) / 256u, group_size);
+        dqg_group_silu_mul_kernel<<<silu_grid, 256>>>(
+                mid_scratch, gate_scratch, up_scratch, (const float *)weights->ptr,
+                pair_idx_dev, group_start, group_size, expert_mid_dim, clamp);
+        ok = cuda_ok(cudaGetLastError(), "routed_moe grouped silu launch");
+        if (!ok) break;
+
+        const uint64_t n_midh = (uint64_t)group_size * expert_mid_dim;
+        f32_to_f16_kernel<<<(unsigned)((n_midh + 255) / 256), 256>>>(midh_scratch, mid_scratch, n_midh);
+        ok = cuda_ok(cudaGetLastError(), "routed_moe grouped mid f16 launch");
+        if (!ok) break;
+
+        ok = dqg_group_gemm(down_type, down_scratch, down_row_base, down_row_bytes,
+                            midh_scratch, expert_mid_dim, out_dim, group_size, wh, logical_tier);
+        if (!ok) break;
+
+        dqg_scatter_down_rows_kernel<<<group_size, 256>>>(
+                (float *)down->ptr, down_scratch, pair_idx_dev, group_start, group_size, out_dim);
+        ok = cuda_ok(cudaGetLastError(), "routed_moe grouped down scatter launch");
+
+        i = j;
+    }
+    free(entries);
+    if (!ok) return 0;
+
+    const uint64_t n = (uint64_t)n_tokens * out_dim;
+    if (owned_filtered) {
+        moe_sum_owned_kernel<<<(unsigned)((n + 255) / 256), 256>>>(
+                (float *)out->ptr, (const float *)down->ptr,
+                (const int32_t *)selected->ptr, out_dim, n_expert, n_tokens);
+    } else {
+        moe_sum_kernel<<<(unsigned)((n + 255) / 256), 256>>>(
+                (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
+    }
+    return cuda_ok(cudaGetLastError(), "routed_moe grouped dequant gemm sum launch");
+}
+
 static int routed_moe_dequant_gemm_dispatch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -21626,6 +21977,27 @@ static int routed_moe_dequant_gemm_dispatch(
     if (!synced) {
         free(sel_host);
         return 0;
+    }
+
+    /* P3b prefill batching: for prefill-shaped calls (n_tokens>1), group
+     * (token,expert) pairs by expert and dequant+GEMM each distinct expert
+     * once instead of once per pair -- see
+     * routed_moe_dequant_gemm_dispatch_prefill_grouped's own comment above
+     * for the full rationale. Decode (n_tokens==1) is left completely
+     * untouched, matching the ticket's own scope and every prior P3a
+     * pass's own care to leave decode alone when adding prefill-only
+     * mechanisms. Escape hatch mirrors the existing per-family opt-out
+     * idiom (e.g. DS4_CUDA_DISABLE_FUSED_FP4_DECODE), used both as a
+     * correctness fallback and as this unit's own A/B measurement
+     * toggle. */
+    if (n_tokens > 1u && !getenv("DS4_CUDA_DISABLE_DEQUANT_GEMM_PREFILL_BATCH")) {
+        const int grouped_ok = routed_moe_dequant_gemm_dispatch_prefill_grouped(
+                out, down, gate_w, up_w, down_w, gate_type, down_type,
+                gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+                expert_in_dim, expert_mid_dim, out_dim, selected, weights, n_expert,
+                clamp, x, n_tokens, owned_filtered, logical_tier, sel_host);
+        free(sel_host);
+        return grouped_ok;
     }
 
     const char *dbg_dispatch_env = getenv("DS4_DEBUG_STREAM_CACHE_LAYER");
