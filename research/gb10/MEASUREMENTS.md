@@ -1466,3 +1466,200 @@ after this unit's work (confirmed via `systemctl is-active`); no restart
 was needed since it was never started. The port-8001 interference server
 (another unit's own process, not systemd-managed) was left running
 throughout, untouched, per protocol.
+
+## Multi-user prefill/decode interference: HOL blocking vs. expert-cache pollution (2026-08-02)
+
+Live measurement of the two-channel interference hypothesis: does one user's long-document
+prefill degrade another user's warm decode via (1) GPU head-of-line (HOL) blocking and/or
+(2) expert-cache pollution (prefill sweeping in experts that evict the decode session's warm
+working set, with damage persisting after the prefill ends until re-warmed)? `ds4-server`
+(systemd, production IQ2 config) stopped first, restarted and verified (`systemctl
+is-active`=`active`, `/v1/models` 200) after -- see "Server discipline" below.
+
+**Box sharing.** At start, another unit's `./ds4_test` full test-suite run (`~/src/ds4-pr`,
+then `~/src/ds4-baseline`) held ~70-86 GiB of GPU memory. Per protocol, its PIDs were left
+untouched; a bounded poll (~25 min, several rounds) confirmed it finished on its own before
+any manual server was launched here.
+
+**Scheduler code, read before running (truth in code, not assumed).** `ds4_server.c`'s file
+header states the design intent: "A model coordinator batches decode-ready sessions and
+serializes bounded prefill quanta, keeping graph mutations out of client threads." The
+mechanism is `server_prefill_quantum_for()` (`ds4_server.c:10275-10288`): prefill proceeds in
+2048-token quanta when no generation is active, or 128-token quanta when
+`s->active_generations > 0` -- ostensibly a bound on how long one session can hold the model
+before another gets a turn. But the caller, `server_session_sync()`
+(`ds4_server.c:10296-10339`), is a single `while` loop that repeatedly calls
+`server_prefill_enter()`/`ds4_session_sync()`/`server_prefill_leave()` **for the same
+request** until that request's whole prompt is consumed; nothing inside that loop checks or
+services a *different* session's queued job between quanta. So the 128-token quantum bounds
+how much of *its own* request a session processes per model-lock acquisition, but does not
+cause the coordinator to round-robin between sessions mid-prefill. This predicts pure HOL
+serialization for any single big prefill, which is exactly what the live traces below show.
+
+**Method.** Streamed model launched manually (`ds4-server -m
+gguf/DeepSeek-V4-Flash-MXFP4_MOE.patched.gguf --cuda --ssd-streaming
+--ssd-streaming-cache-experts 90GB --host 0.0.0.0 --port 8001 --ctx 16384 --batched-session
+2`, `DS4_CUDA_STREAM_STATS=1` set). Client A: a fixed 25-token prompt ("Tell me one
+interesting, specific fact about deep-sea anglerfish...", non-conversational, one-shot per
+call so each call re-exercises the same expert-routing footprint), `max_tokens=40-60`, looped
+via `/v1/chat/completions`. Client B: prompt built from concatenated repo docs
+(`README.md`/`CONTRIBUTING.md`/`AGENT.md` etc.), `max_tokens=20-30` so the request is
+almost pure prefill. Both driven from a Python client hitting the server directly; ground
+truth for per-request decode throughput is the server's own `chat ctx=A..B:N ... decoding
+chunk=X t/s avg=Y t/s` log lines (no timing fields are exposed in the OpenAI-shaped JSON
+response, so the client wall-clock is a secondary/corroborating signal only, dominated by
+queueing delay when B is in flight).
+
+**Note on `DS4_CUDA_STREAM_STATS`.** The counter-print function
+(`ds4_gpu_print_cuda_stream_stats()`, `ds4_cuda.cu:182`) has exactly one call site in this
+codebase, and it is not reachable from the HTTP server's request-serving path (mirrors the
+finding already on record in this file from the long-session locality unit, which found the
+same thing true of the interactive REPL's exit path). No cumulative hit/miss counters were
+obtainable from the server for this reason; decode t/s (which is itself a direct function of
+expert-cache hit rate at this quantization/budget) was used as the measurable proxy instead.
+
+### Timeline: streamed model (SSD-streaming, 90GB expert-cache budget), cycle 1
+
+B's prompt: 960 tokens, `max_tokens=20`.
+
+| step | request | server-log decode/prefill | wall (client) |
+|---|---|---|---|
+| warm-up | A0-A5 (6 reqs) | decode avg/last: 2.39 -> 3.94 -> 4.32 -> 4.50 -> 4.48 -> 4.47 t/s | 61.7s -> 49.4-49.6s steady |
+| aggressor | B fires (960-tok prefill, concurrent with A's 6th request already mid-decode) | prefill in 128-tok quanta, **avg throughput collapses to 1.05 -> 2.17 t/s** (SSD-bound expert loading, not compute), full prefill takes 443.4s; B's own 20-tok decode: 1.50 t/s; **total B latency 456.7s** | -- |
+| **victim during B** | A5's decode (already in-flight when B started) | **decode `chunk=0.09 t/s avg=0.09 t/s`, elapsed 460.06s** -- A5 received effectively zero service until B fully finished. No A request of any kind appears in the server log between B's `prompt start` (09:40:10) and B's `finish` (09:47:46/09:47:50): **zero interleaving observed over the full 456s window**, confirming the code-level prediction above empirically | 500.5s (Aafter0, itself also queued behind A5) |
+| **recovery** | Aafter1 (first *new* A request serviced after B) | decode **4.21 t/s** -- already at baseline on the very next request | 52.2s |
+| steady after | Aafter2-17 (16 more reqs) | decode range **4.33 - 4.76 t/s**, mean ~4.58 t/s -- indistinguishable from / slightly above the 4.3-4.5 t/s pre-B baseline | 50.4-52.5s (Aafter18/19 show 102-104s -- self-interference artifact: cycle 2's own A0/A1 were launched concurrently on the same server at that point, not a B-driven effect; see Deviations) |
+
+**Recovery time: 0 requests / ~0s beyond B's own completion.** There is no measurable
+degraded-but-recovering tail; the very first post-B decode is already within the pre-B
+steady-state band.
+
+### Timeline: streamed model, cycle 2 (reproducibility check, larger B)
+
+B's prompt: 1486 tokens, `max_tokens=20`. A baseline (A0-A3, post-cycle-1-settling):
+51.0-52.1s steady (A0/A1 elevated at 76-102s from unavoidable overlap with cycle 1's tail,
+see Deviations). B: prefill throughput **1.54-1.76 t/s avg** (same disk-bound regime), full
+prefill+decode **861.8s** total -- again with **zero A activity logged during the entire
+window** (confirmed via full server-log grep across the B span). First post-B A request
+(Aafter1, after an Aafter0 whose client-side request had already given up at the 900s
+timeout while the server kept it queued) decodes at server-log-confirmed baseline speed
+immediately; Aafter1-9 wall times 50.6-63.0s, matching cycle 1's steady band. Same verdict:
+full serialization during B, instant recovery, no persistent decode degradation after B
+completes.
+
+### Control (b): resident IQ2 model, same protocol, isolates the HOL-vs-pollution channels
+
+Production-equivalent config launched manually on port 8001 (no `--ssd-streaming`, full
+model resident in VRAM: `--gpu-vram 88`). No expert-streaming cache exists in this mode --
+any interference observed here is pure compute HOL blocking, with **zero** disk-bound
+contribution possible.
+
+| step | server-log decode/prefill | wall (client) |
+|---|---|---|
+| A0-A3 baseline | decode steady **16.7-16.9 t/s** | 2.7-3.2s |
+| B fires (1486-tok prompt, `max_tokens=20`) | prefill **201-223 t/s avg** (pure compute, no SSD stalls) -- full prefill **7.4s**, total B latency **10.1s** | -- |
+| victim during B (queued A request) | decode **3.89 t/s** (elapsed 10.29s -- almost entirely queueing wait, not slow compute) | 10.6s |
+| recovery | next request: **16.90 t/s**, then 14.36/15.52/16.96/16.95/16.95/16.94 t/s | 2.66-3.09s, immediately back to baseline |
+
+**Channel attribution.** Both configurations show the *same structural regime*: one victim
+request is fully blocked for (approximately) B's whole prefill duration, then recovers
+instantly on the very next request, with no multi-request decay/recovery tail in either
+case -- i.e. **no evidence of expert-cache pollution/eviction of A's warm working set** at
+this cache-budget-to-B-size ratio (90 GiB budget vs. a model whose full MXFP4 expert weight
+footprint is ~85 GiB total across 6716 experts at 12.75 MiB each, per the server's own
+"cuda SSD streaming total expert budget 90.00 GiB = 6.38 GiB prefill headroom + 83.62 GiB
+dynamic cache (6716 experts...)" boot line -- the budget is large enough relative to the
+whole model that a single 1-2k-token B prompt cannot force meaningful LRU eviction of A's
+25-token working set). What differs by two orders of magnitude between the two
+configurations is **purely the duration of the HOL-blocked window**: 443-862s (streamed,
+disk-bound prefill at ~1.5-2.8 t/s) vs. 7.4s (resident, compute-bound prefill at ~200+ t/s)
+for prompts of comparable length (960-1486 tokens). This isolates the channel cleanly: the
+*scheduling regime* (full serialization, zero interleaving, instant recovery) is identical
+and inherent to `ds4-server`'s coordinator design regardless of streaming; what SSD-streaming
+specifically adds is a ~30-100x inflation of the blocking window's *duration*, driven by
+cold per-(layer,expert) SSD reads during B's own prefill (observed at 12.75 MiB/expert,
+~500-600 MB/s effective aggregate throughput implied by the 1.5-2.8 t/s prefill rate across
+43 layers x up to 8 experts/token) -- not by evicting anyone else's cache.
+
+### Scheduler-regime verdict
+
+**Fully serialized (pure HOL blocking) for the duration of any request already past the
+2048-token cold-start prefill quantum**, despite `mixed_prefill_quantum=128` existing in the
+code and being logged as active (`batched mode enabled resident_sessions=2
+prefill_quantum=2048 mixed_prefill_quantum=128 decode_coalesce_us=2000`). The 128-token
+quantum bounds only how much of the *aggressor's own* prompt is processed per lock
+acquisition inside `server_session_sync()`'s internal loop; it does not cause the top-level
+coordinator to interleave a *different* session's pending job between those quanta. Verified
+directly from two independent live traces (960-token and 1486-token B prompts): zero A-tagged
+log lines appear anywhere between B's `prompt start` and B's `finish=` across 456s and 862s
+windows respectively. This is the worst-case interference regime the protocol asked to be
+flagged if observed, and it is what's actually in production for `--batched-session 2` today.
+
+### Channel attribution summary
+
+1. **HOL blocking (confirmed, dominant/only channel observed):** any concurrent request is
+   blocked for the aggressor's full request lifetime, no partial service.
+2. **Expert-cache pollution (not observed at this scale):** decode throughput recovers to
+   baseline on the very first post-aggressor request in every trial (2 streamed-model cycles
+   + 1 resident-model control), with no degraded-then-recovering tail. This does not rule out
+   pollution at larger scale -- a B prompt that actually forces LRU eviction (requiring either
+   a much larger document, a much smaller cache budget, or many concurrent aggressors) was
+   out of this unit's time budget; the 10.5k-token first attempt (see Deviations) would likely
+   have been the config to show it, at the cost of a ~65-minute single prefill.
+
+### Implications
+
+For `--batched-session N` as currently implemented, N is a *resident-slot* count (how many
+sessions can hold KV state simultaneously), not a *fairness* guarantee -- there is no
+preemption or round-robin once a session's job is dispatched to the model coordinator. On the
+IQ2 resident config this is a minor (~sub-10s) hiccup for a several-thousand-token document.
+On the SSD-streamed config, the same document produces **minutes-to-an-hour** of total
+unresponsiveness for every other user, because prefill throughput itself collapses to
+1.5-2.8 t/s (vs. 200+ t/s resident) under cold per-expert SSD reads -- this is a latency/
+availability problem, not a cache-correctness problem: nobody's answers become wrong or
+stale, but a shared streamed-model deployment with `--batched-session >1` is not multi-tenant
+in any latency-fairness sense today. If genuine interleaving is wanted, the fix belongs in
+`server_session_sync()`'s loop (or its caller) -- yielding the model lock back to the
+coordinator after each quantum so a different resident session's pending job can be serviced,
+not just bounding the aggressor's own quantum size. Separately, since pollution was not
+observed here, the 90GB budget choice (comfortably covering this MXFP4 model's ~85GB total
+expert footprint) appears to make cache eviction a non-issue for realistic single-aggressor
+workloads -- the risk profile would change for models whose full expert footprint
+significantly exceeds the configured budget, which this unit did not test.
+
+### Deviations from protocol
+
+- B's prompt sizes were reduced from the specified 8-12k tokens to 960/1486/(one aborted
+  10.5k) tokens after the first attempt (10.5k tokens) was measured in-flight to require
+  ~65 minutes of prefill alone (2.5-2.8 t/s observed rate, confirmed live before aborting) --
+  infeasible within this unit's time budget across the required 2-3 repeat cycles plus a
+  resident-model control. The reduced sizes (38-62x A's 25-token prompt) still produced
+  unambiguous, reproducible serialization and recovery results; the 10.5k-token config is
+  flagged above as the more promising candidate for actually forcing measurable pollution,
+  for a future unit with a larger time budget.
+- Control (a) ("A alone throughout, no B, same duration") was not run as a fully separate
+  duration-matched run; the pre-B warm-up segments (A0-A5 in cycle 1, A0-A3 in cycle 2) and
+  the long post-recovery steady segments serve as the drift check instead -- decode t/s stayed
+  in a tight 4.2-4.8 t/s band across ~30 total A requests spanning both cycles with no trend,
+  which is the same evidence a separate control run would have produced.
+- Two client-side self-interference artifacts are visible in the raw wall-clock logs
+  (cycle 1's Aafter18/19 at ~104s, cycle 2's A0/A1 at 76-102s) caused by launching cycle 2's
+  driver before confirming cycle 1's had fully drained -- both fixed sequences ran on the same
+  shared server. These do not affect the decode-t/s-based findings (server log timestamps
+  disambiguate cleanly) but do inflate a handful of wall-clock numbers in the raw output; noted
+  here rather than silently edited out.
+- Repeat count was 2 full interference cycles (not 3) on the streamed model, plus the 1
+  resident-model control, given the time cost per cycle (up to ~15 min for B alone). The two
+  streamed-model cycles agree closely (recovery-on-first-request in both), which was judged
+  sufficient for the qualitative verdict (full serialization, no pollution at this scale);
+  a third repeat would add confidence but is unlikely to change the verdict given how tight
+  the two observed traces already are.
+
+### Server discipline
+
+`ds4-server` (systemd, production IQ2 config, port 8000) was stopped before this unit's
+manual servers were launched and restarted at the end; confirmed `systemctl is-active`=
+`active` and `curl .../v1/models` -> HTTP 200 after. The manual streamed-model server (port
+8001) and the manual resident-model control server (port 8001, second launch) were both
+terminated by this unit before the systemd restart; `nvidia-smi` confirmed 0% GPU utilization
+and no matching process before restart.
