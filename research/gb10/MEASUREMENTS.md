@@ -979,3 +979,17 @@ research/gb10/test_mxfp4_mma_gemm.c / test_mxfp4_mma_diag.c). Measuring A/B pref
 or SASS evidence against a known-broken kernel would produce numbers that could be
 mistaken for a real result; skipped on that basis. The P3b grouped dequant+cuBLAS path
 (~4.6-4.64 t/s prefill, entry above) remains the production path, unchanged by this pass.
+
+## P3c-1 take 3: B-operand transpose bug fixed, gate stays default OFF (2026-08-01)
+
+No prefill t/s or end-to-end A/B measurement taken this pass either -- the correctness gate
+for that (`test_mxfp4_mma_gemm` passing at its stated tolerance) is still not met, so
+measuring speed/quality against a still-partially-broken kernel would produce numbers that
+could be mistaken for a real result. Progress this pass: root-caused and fixed the
+documented transpose bug in the B-operand (activation) packing (see FP4_PORT_SCOPE.md's
+P3c-1 take 3 section for the full diagnostic), taking the one-hot isolation test from 2/16
+to 16/16 correct rows and the randomized isolation test from 0/7 to 3/7 passing cases. The
+remaining 4/7 randomized cases still fail; root cause not yet isolated (fast-math and
+host/device `log2f` non-determinism theories were tested and ruled out). The P3b grouped
+dequant+cuBLAS path (~4.6-4.64 t/s prefill, entry above) remains the production path,
+unchanged by this pass.

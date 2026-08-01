@@ -1896,3 +1896,146 @@ a live France-capital smoke prompt coherently post-restart.
    guarded, and is what makes `test_mxfp4_mma_gemm.c`/`test_mxfp4_mma_diag.c` possible without
    a full MoE harness -- but should get a proper comment marking it as a permanent test-only
    API if it's going to stay past the next pass, rather than "temporary" as currently written.
+
+## P3c-1 take 3: root-caused and fixed the B-operand transpose bug -- one-hot diagnostic now 16/16, randomized isolation test still fails on larger/denser cases, gate stays DEFAULT OFF (2026-08-01)
+
+Follow-on to take 2's own explicit next step ("dump `A.x[]` via a single-lane `printf` for a
+controlled input and compare against hand-computed expected register contents"). Read the
+full P3c-1 take-2 writeup above, the 75c8185 diff, and re-derived the donor's `tile<>`/
+`load_ldmatrix`/`load_generic` register-layout formulas from `~/src/llama.cpp/ggml/src/
+ggml-cuda/mma.cuh` and `mmq.cuh` (`vec_dot_fp4_fp4_mma`, `load_tiles_mxfp4_fp4`) by hand
+before touching any code.
+
+### Root cause: B-operand (activation) pack/read transpose, not A or C
+
+Hand-deriving the A-operand `ldmatrix` address formula and the `tile<16,8,int>`/
+`tile<16,8,float>` `get_i`/`get_j` register-layout formulas against the donor's own
+(non-AMD, non-Volta, i.e. Turing/Blackwell) branch showed the ported A-operand addressing
+and the C-tile write-back (`out_row0 + ((l/2)*8) + (lane/4)`, `tok0 + ((lane%4)*2) + (l%2)`)
+both match the donor's formulas exactly -- the take-2 writeup's own two suspects were
+**not** where the bug was. Re-deriving the B-operand (activation) side instead found a
+genuine transposition: `dsv4_mxfp4_mma_gemm_kernel`'s "pack B nibbles into the 8x8
+physical-int layout" step wrote `b_qs[i * 8 + j]` (`i` = int-column 0..7, `j` = token 0..7,
+i.e. **intcol-major**), while the B-tile load immediately below it read `b_qs[bi * 8 + bj]`
+with `bi = lane/4` (token) and `bj` = int-column -- i.e. **token-major**. These two index
+conventions are transposed; they only coincide on the `token == intcol` diagonal, which
+exactly explains take 2's one-hot diagnostic finding ("only 2 of 16 output rows -- a fixed,
+lane-correlated pair -- come out correct").
+
+Confirmed via single-lane `printf` register dumps (temporary, removed before the final
+commit) of `A.x[]`/`B.x[]`/`a_scale`/`b_scale` for the exact one-hot input from `test_
+mxfp4_mma_diag.c`: `A.x[]` and the scale registers matched hand-derived expectations from
+the donor formulas exactly; `B.x[]` did not (e.g. lane 4's `B.x[0]` held nonzero real
+activation data pulled from the wrong (intcol, token) cell rather than the expected
+all-zero padding-token value).
+
+### Fix
+
+One-line fix in `dsv4_mxfp4_mma_gemm_kernel`'s B-packing loop: `b_qs[i * 8 + j]` ->
+`b_qs[j * 8 + i]`, making the store token-major to match the token-major read (`bi =
+lane/4`, matching the donor's `tile<8,8,int>::get_i(l) = threadIdx.x/4` convention).
+Comment added in place documenting the convention and the bug it fixes.
+
+### One-hot diagnostic: now 16/16 correct
+
+`research/gb10/test_mxfp4_mma_diag.c`, unchanged: all 16 output rows now match the
+expected quantized value (`out[r] == quantized(x[r])`, verified by hand against the E2M1
+LUT/E8M0 scale for the test's specific data), up from 2/16 before the fix. Also spot-checked
+with three additional hand-built one-hot variants (not committed -- ad hoc `/tmp` programs)
+to close gaps the original diagnostic didn't cover: weight one-hot in the *second* k32
+sub-block of a single k64 tile (block1, k=32..63) -- correct; weight one-hot in a *second*
+k64 tile (`in_dim=128`, kt=1, k=64..95) with correct hi/lo-nibble placement -- correct
+(a first attempt at this variant showed a large discrepancy that turned out to be an error
+in the throwaway test's own nibble packing, not a kernel bug -- caught and corrected before
+drawing any conclusion from it); multi-token (`group_size=5`) with per-token near-identical
+activations -- correct (only the expected tie-break-sensitive row differed, consistent with
+genuine E2M1 rounding, not a swap).
+
+### Randomized isolation test: still fails on larger/denser cases -- root cause not fully isolated
+
+`research/gb10/test_mxfp4_mma_gemm.c` (full random weights + activations, CPU reference
+re-derives the tensor core's exact quantized math): the two smallest cases (`in=64,out=16,
+group=1` and `group=3`) and one larger case (`in=512,out=256,group=4`) now **pass exactly**
+(0 mismatches) -- a real improvement from take 2's "fails on every case". The remaining four
+cases (`in=128,out=32,group=5`; `in=512,out=256,group=5`; `in=4096,out=2048,group=3`;
+`in=2048,out=4096,group=7`) still fail, with mismatches on roughly 12-70% of (token, row)
+positions, magnitudes ranging from sub-1 to several hundred (both plausible as single-LUT-
+step tie-break noise near the small end, and clearly structural at the large end).
+
+Two hypotheses were formed and empirically ruled out this pass, both with zero effect on
+the failure set (byte-identical mismatch lists before/after):
+
+1. **`--use_fast_math` imprecision in the activation-quantization `log2f`.** Rebuilt
+   `ds4_cuda.o` without `--use_fast_math` entirely -- identical failures, byte for byte.
+   Ruled out.
+2. **Host vs. device `log2f` non-bit-identical rounding at the E8M0 scale-bucket boundary**
+   (`dsv4_compute_e8m0_scale`'s `log2f` + round-to-nearest-int, mirrored by the CPU
+   reference's own `log2f` + `lrintf` -- these two library implementations are not
+   guaranteed bit-identical). Replaced both the kernel's and the CPU reference's scale
+   computation with a bit-exact `frexpf`-based equivalent (exact exponent/mantissa
+   extraction plus a single fixed `1/sqrt(2)` threshold comparison, mathematically
+   equivalent to `round(log2(amax))` but reproducible cross-platform) -- identical failures,
+   byte for byte. Ruled out and reverted (kept the diff minimal since it demonstrably
+   didn't help).
+
+Also algebraically verified (not empirically, since it's opaque hardware behaviour) that the
+CPU reference's weight-side dequant (`mxfp4_e8m0_to_fp32_half` + doubled `kvalues_mxfp4`)
+is exactly mathematically equivalent to the kernel's raw-byte-to-hardware interpretation
+(standard E2M1 magnitude LUT `{0,0.5,1,1.5,2,3,4,6}` + raw ue8m0 `2^(x-127)` scale) --
+the two "doublings" (nibble table and scale) cancel exactly, so this is not a format
+mismatch either.
+
+Given the one-hot diagnostic (sparse, mostly-zero data) is now fully correct but dense
+random data still shows scattered failures growing with problem size, the remaining bug
+(if it is one, rather than an as-yet-unidentified reference-side issue) most likely lives in
+either a synchronization/staging subtlety that only manifests when *most* lanes carry live
+nonzero data simultaneously (shared-memory bank/visibility edge case not exercised by sparse
+one-hot inputs), or a residual addressing issue specific to combinations of multiple
+`out_dim` row-blocks with `group_size` values that don't evenly fill the 8-token warp tile
+(`in=512,out=256` passes at `group=4` and fails at `group=5` with everything else held
+structurally equal, which is the closest lead to what actually differs, but did not resolve
+within this pass's time budget). Left open rather than guessed at further.
+
+### Gate: stays DEFAULT OFF
+
+Per the ticket's own explicit instruction ("if it degrades / not proven correct, leave the
+toggle default off"): `test_mxfp4_mma_gemm` does not pass at its stated tolerance, so the
+correctness gate for flipping `DS4_CUDA_ENABLE_MMA_PREFILL_EXPERIMENTAL` to default-on is
+**not met**. The gate is unchanged (`DS4_CUDA_ENABLE_MMA_PREFILL_EXPERIMENTAL=1` opt-in
+required, default off). End-to-end France/prose coherence A/B and prefill t/s measurement
+against the MMA path were **not performed** this pass, for the same reason take 2 skipped
+them: measuring a still-known-broken (albeit now less broken) kernel's speed/quality would
+produce numbers that could be mistaken for a real result.
+
+### Tests / build
+
+`make clean && make cuda-spark`: clean, zero warnings, ~56s wall (Makefile's `NVCC_ARCH_FLAGS`
+default unchanged from take 2). `./research/gb10/test_mxfp4_mma_diag`: all 16 rows correct
+(was 2/16). `./research/gb10/test_mxfp4_mma_gemm`: 3/7 cases pass exactly, 4/7 still fail
+(was 0/7 passing in take 2) -- see above. `test_mxfp4_moe`, `test_mixed_moe`, `test_mxfp4_
+dequant`: all pass (gate default = off, unaffected by this pass's change). `ds4-server`
+stopped before `./ds4_test`; `./ds4_test` (full run, no truncation): `ds4 tests: 7
+failure(s)` across three sections -- `think-tool-recovery`, `logprob-vectors`, `metal-
+tensor-equivalence` -- all three on the pre-existing flaky list documented by every prior
+pass on this hardware (see the 2026-07-31/08-01 entries above); no new failing test names.
+`ds4-server` restarted after; confirmed `active`, loaded its usual `DeepSeek-V4-Flash-
+IQ2XXS-...imatrix.gguf` normally, and answered a live France-capital smoke prompt
+coherently post-restart.
+
+### Follow-up (for whoever picks this up next)
+
+1. Isolate the remaining randomized-test failure: the `in=512,out=256,group=4` (passes) vs.
+   `group=5` (fails) pair is the tightest reproducer found this pass -- everything else
+   held equal, only `group_size` differs. Bisect by shrinking further (e.g. `in=512,out=32,
+   group=5` or smaller) to get a hand-traceable failing case, then apply the same
+   single-lane `printf` register-dump technique used successfully in this pass for the
+   B-operand bug.
+2. Once `test_mxfp4_mma_gemm` passes all 7 cases at its stated tolerance, re-run this
+   pass's still-skipped gate-flip criteria: existing tests pass (already true), end-to-end
+   France + ~300-token prose coherence A/B, numeric delta reported honestly, and only then
+   flip `DS4_CUDA_ENABLE_MMA_PREFILL_EXPERIMENTAL`'s default and measure prefill t/s A/B.
+3. `ds4_debug_mxfp4_mma_gemm` (the temporary isolation entry point) still carries a
+   "TEMPORARY ... to be removed before final commit" comment two passes running now --
+   worth either committing to keeping it (with a permanent-API comment, as take 2 already
+   flagged) or actually removing it once the isolation tests are no longer needed for
+   active debugging.

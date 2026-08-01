@@ -22007,7 +22007,16 @@ __global__ static void dsv4_mxfp4_mma_gemm_kernel(
         }
         __syncthreads();
 
-        /* ---- pack B nibbles into the 8x8 physical-int layout ---- */
+        /* ---- pack B nibbles into the 8x8 physical-int layout ----
+         * b_qs is [token][intcol] (row=token, stride 8) to match the B-tile
+         * load below (dsv4_tile8x8i, bi=lane/4=token, bj=intcol -- donor's
+         * tile<8,8,int>::get_i/get_j convention). i here is the intcol
+         * (0..7, one of the 8 packed-nibble ints spanning in_dim's 64
+         * elements), j is the token (0..7) -- so the store index must be
+         * j*8+i, NOT i*8+j (that was the P3c-1 take-2 bug: writing
+         * intcol-major while the read below is token-major, a silent
+         * transpose that only produced correct output on the diagonal
+         * token==intcol lanes). See FP4_PORT_SCOPE.md's P3c-1 take 3. */
         #pragma unroll
         for (int p = 0; p < 2; p++) {
             const int i_local = lane / 8;
@@ -22018,7 +22027,7 @@ __global__ static void dsv4_mxfp4_mma_gemm_kernel(
             unsigned int b1 = (unsigned int)b_nib[j][base + 1] | ((unsigned int)b_nib[j][base + 17] << 4);
             unsigned int b2 = (unsigned int)b_nib[j][base + 2] | ((unsigned int)b_nib[j][base + 18] << 4);
             unsigned int b3 = (unsigned int)b_nib[j][base + 3] | ((unsigned int)b_nib[j][base + 19] << 4);
-            b_qs[i * 8 + j] = (int)(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+            b_qs[j * 8 + i] = (int)(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
         }
         __syncthreads();
 
