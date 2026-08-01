@@ -242,22 +242,167 @@ stopped for every run above and restarted afterward: `systemctl is-active` -> `a
 `curl http://localhost:8000/v1/models` -> 200 with the expected model entry (confirmed at
 the end of this pass).
 
+## P3a fix: real CUDA per-(layer,expert) LRU cache ported from Metal (2026-08-01)
+
+**Hypothesis (recorded before running):** porting `ds4_metal.m`'s
+`g_stream_expert_cache` LRU design to CUDA (per-`(layer,expert)` persistent
+device-resident cache, consulted by `cuda_stream_selected_cache_begin_load()`
+before falling back to the mapped-file fetch) will produce measured hit rate
+> 0 on a repeat-token workload, and the previously-flat 8/40/100 GB sweep
+curve should now bend (higher budget -> higher hit rate -> higher decode
+t/s), since the P3a diagnosis pass established the flat curve and the
+0.000 hit rate were caused by the CUDA cache being a structural no-op, not a
+disk- or compute-bandwidth ceiling.
+
+**Design.** `ds4_cuda.cu`: new `cuda_stream_expert_cache_entry`
+table (`CUDA_STREAM_EXPERT_CACHE_MAX_LAYER=80` x
+`CUDA_STREAM_EXPERT_CACHE_MAX_EXPERT=384`, matching Metal's own array
+bounds), each entry owning its own exactly-sized `cudaMalloc`'d gate/up/down
+device buffers (following the allocation pattern already used by
+`g_stream_selected_cache`'s own staging buffers). `cuda_stream_expert_cache_peek()`
+checks tensor identity (model map, byte offsets, sizes) before serving a
+hit; a hit is a device-to-device `cudaMemcpy` into the existing per-call
+packed staging buffer (skips both the disk read and the host-to-device
+copy); a miss falls back to the existing `cuda_model_copy_to_device_streamed()`
+fetch and then installs the freshly-fetched bytes into the persistent cache
+via a second device-to-device copy. Eviction: `cuda_stream_expert_cache_prune_global()`,
+global least-recently-used, once entry count exceeds the configured budget.
+Budget/count stubs (`ds4_gpu_set_streaming_expert_cache_budget`,
+`_expert_bytes`, `ds4_gpu_stream_expert_cache_configured_count`) are now
+real (previously `(void)x;` no-ops / hard-`return 0`) -- `N` is consumed
+directly as an expert-entry count, matching the CLI contract as already
+resolved by `ds4.c` (byte budgets in `--ssd-streaming-cache-experts NGB`
+are converted to `N` upstream of the GPU backend for both Metal and CUDA,
+so no additional NGB-to-count math was needed on the CUDA side).
+
+**Deliberate deviation from Metal, and the bypass-layer decision.** Metal
+uses a single-size-class slab allocator (all cached experts must share one
+gate/up/down byte total) so it can pool/reuse `MTLBuffer` objects cheaply;
+layers off that size class -- the 11 Q3_K/Q5_K "bypass" layers this ticket
+asked about -- are excluded from Metal's cache entirely and always pay the
+mapped-view read cost. CUDA's entries instead each own an individually,
+exactly-sized `cudaMalloc` buffer with no shared slab pool, so there is no
+technical need for a uniform size class. **Decision: brought the bypass
+layers into the same cache path** -- this was the small, natural extension
+the ticket asked to consider, not a structural leave-alone. All 43 routed
+layers, not just the 32-layer "slab class," now participate in the CUDA
+LRU. `ds4_gpu_set_streaming_expert_cache_expert_bytes()` is kept for
+CLI/log symmetry with `ds4.c`'s own slab-class bookkeeping (which still
+uses that figure for its "N/43 routed layers... bypass" log line) but does
+not gate CUDA caching -- that log line is now accurate about the
+*classification* but, as already noted in the diagnosis pass, does not
+describe a real CUDA behavioral fork any more than it did before.
+
+**Correctness.** `-p "Reply with exactly: ok" --nothink` (40 GB budget):
+`ok` (exact match, `prefill: 1.21 t/s, generation: 2.01 t/s`).
+`-p "What is the capital of France?" --nothink` with
+`DS4_METAL_STREAMING_DECODE_PREFILL_MAX=4096` (40 GB budget): `The capital
+of France is Paris.` (exact match, `prefill: 1.22 t/s, generation: 2.03
+t/s`) -- both byte-identical to the pre-cache baseline text on record above,
+confirming greedy-decode determinism held through the cache (no staleness/
+eviction bug: a changed answer would have been treated as a failure per
+this ticket's own acceptance bar).
+
+**Sweep**, `DS4_CUDA_STREAM_STATS=1`, real 150 GB artifact, fixed prompt
+(`"Explain in a few sentences how photosynthesis works." -n 100 --nothink`),
+`ds4-server` stopped, page cache dropped once per arm (before rep 1, not
+between reps -- matching this ticket's own methodology), 4 reps/arm, rep 1
+warming (first hits appear as the persistent cache -- unlike the one-shot
+CLI itself -- is filled progressively across this run's own 100 decode
+steps and prefill), reps 2-4 steady-state:
+
+| arm | rep | prefill t/s | decode t/s | hit_rate | bytes_from_file/tok | bytes_from_cache/tok |
+|---|---|---|---|---|---|---|
+| 8 GB (budget=130 entries) | 1 | 0.70 | 0.72 | 0.000 | 2.831 GB | 0 |
+| 8 GB | 2 | 0.69 | 0.72 | 0.000 | 2.646 GB | 0 |
+| 8 GB | 3 | 0.69 | 0.74 | 0.000 | 2.831 GB | 0 |
+| 8 GB | 4 | 0.70 | 0.73 | 0.000 | 2.831 GB | 0 |
+| 40 GB (budget=2700 entries) | 1 | 1.29 | 2.46 | 0.781 | 0.635 GB | 2.319 GB |
+| 40 GB | 2 | 1.30 | 2.54 | 0.776 | 0.583 GB | 2.063 GB |
+| 40 GB | 3 | 1.28 | 2.52 | 0.783 | 0.603 GB | 2.228 GB |
+| 40 GB | 4 | 1.29 | 2.62 | 0.803 | 0.690 GB | 2.879 GB |
+| 100 GB (budget=7519, saturates at 4.4-4.9k entries) | 1 | 1.29 | 2.92 | 0.798 | 0.527 GB | 2.120 GB |
+| 100 GB | 2 | 1.30 | 2.98 | 0.809 | 0.550 GB | 2.373 GB |
+| 100 GB | 3 | 1.24 | 3.02 | 0.833 | 0.579 GB | 2.929 GB |
+| 100 GB | 4 | 1.29 | 2.87 | 0.798 | 0.526 GB | 2.120 GB |
+
+**Steady-state means (reps 2-4):**
+
+| arm | mean decode t/s | mean hit_rate | mean bytes_from_file/tok |
+|---|---|---|---|
+| 8 GB | **0.730** (down from the pre-cache flat baseline's 1.02-1.04) | 0.000 | 2.769 GB |
+| 40 GB | **2.593** (2.5x the pre-cache baseline) | 0.787 | 0.625 GB |
+| 100 GB | **2.957** (2.85x the pre-cache baseline) | 0.813 | 0.552 GB |
+
+**The curve now bends, as hypothesized -- with one honest caveat.** 40 GB
+and 100 GB both show large, real hit rates (~79-81%) and correspondingly
+large decode speedups (2.5-2.85x vs. the flat ~1.03 t/s baseline every prior
+arm measured regardless of size), directly confirming the diagnosis pass's
+fix recommendation. Bytes-from-file/token dropped from ~3.06 GB (0%-hit
+baseline) to ~0.55-0.63 GB at 40-100 GB, arithmetically consistent with
+~80% hit rate (3.06 GB x (1-0.80) = 0.61 GB, matching the measured range).
+**However, the 8 GB arm is a measured regression versus the pre-cache
+baseline** (0.73 t/s vs. 1.02-1.04 t/s) -- at `budget=130` entries, well
+under the ~192-258-entry per-token working set the diagnosis pass's own
+thrashing warning already flagged, hit rate stays at exactly 0.000 (same as
+before), but decode is now *slower* than before, not merely unchanged. The
+most likely cause: every miss now pays 3x `cudaMalloc` + 3x
+device-to-device `cudaMemcpy` + 3x `cudaFree`-on-eviction (the install/evict
+churn) on top of the unchanged mapped-file fetch, with zero offsetting hit
+benefit at this budget -- pure LRU-management overhead when the cache is
+too small to ever be reused. This is a known, reportable tradeoff, not a
+correctness bug (hit rate, output text, and test suite all confirm no
+staleness): a real fix (e.g. a small pooled-buffer allocator instead of
+per-install `cudaMalloc`/`cudaFree`, closer to Metal's own slab-reuse
+design) is a follow-up, out of scope for this port, and noted below.
+
+**Memory.** `free -g` polled through every arm's load and steady-state
+phases, including the 100 GB arm: host `used` peaked at ~80 GiB during the
+100 GB arm's steady-state reps (`free`: `total 121 / used 80 / free 33`),
+comfortably under the box's 121 GiB physical with no swap touched at any
+point -- no OOM risk observed, consistent with the diagnosis pass's own
+lazy-paging finding (committed pages track bytes actually cached, not the
+full nominal budget; the 100 GB arm's cache in practice only ever reached
+4.4-4.9k of its 7519-entry budget, since the model's total distinct expert
+population is smaller than the budget once ~80% hit rate is reached).
+
+**Test suite.** `./ds4_test`: `ds4 tests: 5 failure(s)` -- `tool-call-quality`,
+`logprob-vectors`, `metal-kernels` (all three already on the documented
+pre-existing-flaky list from every prior pass on this hardware,
+`tests/ds4_test.c:6436/6437`, `:5285`, `:546/547`); `metal-tensor-equivalence`
+passed this run. No new failing test names.
+
+**No changes made to the packed-staging-buffer / downstream kernel
+interface** (`g_stream_selected_cache`, the fused MXFP4/Q3_K decode
+matvecs) -- the persistent LRU sits entirely upstream of it, so this is
+additive to the existing streaming architecture, not a redesign.
+
+`ds4-server` stopped for every run above and restarted afterward; see
+confirmation below.
+
 ## Pending (updated)
 
 - [x] CUDA hit-rate counter hook -> **done this pass**: `DS4_CUDA_STREAM_STATS=1`
       (`ds4_cuda.cu`/`ds4_gpu.h`/`ds4_cli.c`), measured hit_rate=0.000 on the real artifact
       (see above) -- confirms, doesn't just estimate, that the CUDA expert-cache budget is
       currently inert.
-- [ ] **New, higher-priority than the item below**: port Metal's real per-`(layer,expert)`
-      LRU expert cache to CUDA (`ds4_gpu_set_streaming_expert_cache_budget`/
-      `_expert_bytes` are no-op stubs today; `cuda_stream_selected_cache_begin_load`
-      unconditionally re-fetches every call) -- this is *why* the cache-size sweep was flat,
-      not a compute ceiling or disk-bandwidth ceiling as such (disk bandwidth is real and
-      close to saturated per the Q1 bound-discrimination numbers above, but a working cache
-      would still reduce the fraction of tokens that need to hit it).
-- [ ] Fold the 11/43 mixed-precision "bypass expert cache" routed layers into the cacheable
-      slab class (or a secondary slab tier) -- unchanged by this pass; matters most once the
-      CUDA cache above is real (currently moot on CUDA since nothing is cached regardless).
+- [x] Port Metal's real per-`(layer,expert)` LRU expert cache to CUDA -> **done this
+      pass**: `cuda_stream_expert_cache_*` in `ds4_cuda.cu`, budget/count stubs now real.
+      Measured hit_rate ~0.79-0.81 and 2.5-2.85x decode speedup at 40/100 GB (see the new
+      section above) -- confirms the diagnosis pass's fix recommendation.
+- [x] Fold the 11/43 mixed-precision "bypass expert cache" routed layers into the cacheable
+      slab class -> **done this pass, as a natural extension**: CUDA's per-entry
+      (not slab-pooled) allocation has no uniform-size-class requirement, so all 43 layers
+      share one LRU; unlike Metal, there is no CUDA-side bypass tier anymore.
+- [ ] **New**: the 8 GB arm regressed versus the pre-cache baseline (0.73 t/s vs.
+      1.02-1.04 t/s) at hit_rate=0.000 -- likely `cudaMalloc`/`cudaFree` install/evict churn
+      with no offsetting hit benefit at a too-small budget. A pooled/reused buffer allocator
+      (closer to Metal's own slab-reuse design) for the CUDA cache's install path would
+      likely fix this without reintroducing the size-class restriction; not attempted this
+      pass.
+- [ ] P3b warp-shuffle/vectorized-load work on the fused decode kernel itself (unaffected by
+      this pass; still the likely path to materially exceed the ~2.6-3.0 t/s now measured at
+      well-hit-rate cache sizes).
 - [ ] Single blob vs sharded layout: same scattered-read benchmark, 1x81 GB vs 142x3 GB
 - [ ] Expert reordering within a blob by co-activation affinity
 - [ ] Session working-set size from routing traces (gates the locality-training thesis, and

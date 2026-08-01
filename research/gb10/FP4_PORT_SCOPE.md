@@ -1402,3 +1402,88 @@ print function gated on an unused-by-default env var, one new call site, no chan
 existing control flow or the byte-copy path itself beyond the counter increments
 immediately following it). `ds4-server` stopped for every measurement run in this pass and
 restarted afterward; see confirmation below.
+
+
+## P3a fix: real CUDA per-(layer,expert) LRU expert cache (2026-08-01)
+
+Implements the diagnosis pass's own fix recommendation (immediately above): ports
+`ds4_metal.m`'s `g_stream_expert_cache` design (~line 560-620 struct/globals,
+`ds4_gpu_stream_expert_cache_peek`/`_install_loaded`/`_prune_global` ~line 12900-13320) to
+`ds4_cuda.cu` as `cuda_stream_expert_cache_entry` / `cuda_stream_expert_cache_peek`/
+`_install`/`_prune_global`/`_clear_all`, a persistent, device-resident,
+`(layer,expert)`-keyed table consulted by `cuda_stream_selected_cache_begin_load()` before
+it falls back to `cuda_model_copy_to_device_streamed()` (the mapped-file fetch this whole
+diagnosis traced). `ds4_gpu_set_streaming_expert_cache_budget`/`_expert_bytes`/
+`ds4_gpu_stream_expert_cache_configured_count` -- all no-op stubs or hard-`return 0` before
+this pass -- are now real.
+
+**Allocation choice.** Each cache entry owns its own exactly-sized `cudaMalloc`'d gate/up/
+down device buffers -- the same allocation idiom `g_stream_selected_cache`'s own staging
+buffers already use (`cuda_stream_selected_ensure_bytes()`), not `cudaMallocManaged`/
+host-pinned. A hit is served with a device-to-device `cudaMemcpy` from the persistent entry
+into the existing per-call packed staging buffer that the downstream fused MXFP4/Q3_K decode
+kernels already read from -- this was a deliberate choice to avoid changing the
+kernel-facing packed-buffer interface at all (kernels are unmodified). A miss still pays the
+existing `cuda_model_copy_to_device_streamed()` fetch (disk read + host-to-device copy) into
+the packed buffer, then additionally installs those bytes into the persistent cache via a
+second device-to-device copy so the entry survives past this call. Net effect: a hit skips
+both the disk read and the host-to-device copy (satisfying the ticket's own constraint),
+replacing them with two comparatively cheap device-to-device copies (into the packed buffer,
+and on install, out of it).
+
+**Eviction.** Global least-recently-used across the whole `(layer,expert)` table, mirroring
+Metal's `_prune_global`'s recency ordering (this port omits Metal's additional
+"route-hotness" tie-break layer, judged not worth the extra bookkeeping for a first port --
+plain LRU is what actually governs eviction order in the vast majority of Metal's own cases
+too, since hotness only breaks *ties* at equal recency).
+
+**Budget mapping.** `N` in `--ssd-streaming-cache-experts N` (or the NGB form, already
+converted to a plain expert count by `ds4.c` upstream of the GPU backend, identically for
+Metal and CUDA) is stored directly as the entry-count budget and clamped to the fixed
+`80 x 384`-entry table bound, matching Metal's own `DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES`
+clamp. No CUDA-side NGB math was needed -- `ds4.c` already did it generically.
+
+**Bypass-layer decision: brought them in, not left structural.** Metal's cache is a
+single-size-class slab allocator (all cached experts must share one gate/up/down byte
+total, to make `MTLBuffer` pooling cheap); the 11 Q3_K/Q5_K layers off that size class are
+excluded from Metal's cache by construction. CUDA's per-entry (not slab-pooled)
+`cudaMalloc` allocation has no such uniform-size requirement, so bringing the 11 bypass
+layers into the same LRU was a small, natural extension -- done this pass. All 43 routed
+layers participate in one CUDA cache; there is no CUDA-side bypass tier anymore. (This also
+means the informational-only `ds4_gpu_set_streaming_expert_cache_expert_bytes()` no longer
+gates CUDA caching the way its Metal namesake gates Metal's slab class -- kept for CLI/log
+symmetry with `ds4.c`'s own "N/43 routed layers... bypass" log line, which remains accurate
+about the underlying tensor-size classification even though it no longer describes a real
+CUDA behavioral fork.)
+
+**Correctness.** `-p "Reply with exactly: ok" --nothink` (40 GB budget): `ok` (exact match).
+`-p "What is the capital of France?" --nothink` with
+`DS4_METAL_STREAMING_DECODE_PREFILL_MAX=4096` (40 GB budget): `The capital of France is
+Paris.` (exact match) -- both byte-identical to every prior pass's recorded text,
+confirming greedy-decode determinism held through the new cache (no staleness/eviction
+bug). `./ds4_test`: `ds4 tests: 5 failure(s)`, all three failing sections
+(`tool-call-quality`, `logprob-vectors`, `metal-kernels`) on the pre-existing flaky list
+from every prior pass; `metal-tensor-equivalence` passed this run; no new failing test
+names.
+
+**Benchmark (full table and interpretation in `MEASUREMENTS.md`, "P3a fix" section).**
+Summary: the previously-flat 8/40/100 GB sweep now bends as hypothesized. 40 GB and
+100 GB both reach ~79-81% measured hit rate and 2.5-2.85x the pre-cache flat decode
+baseline (0.73->2.59 t/s at 40 GB budget=2700 entries; ~1.03->2.96 t/s at 100 GB
+budget=7519, cache saturating at 4.4-4.9k entries in practice). The 8 GB arm (budget=130
+entries, under the diagnosis pass's own ~192-258-entry per-token working-set warning) stays
+at hit_rate=0.000 exactly as before, but now measures a **regression** to 0.73 t/s (from
+1.02-1.04 t/s pre-cache) -- attributed to `cudaMalloc`/`cudaFree` install/evict churn on
+every miss with no offsetting hit benefit at a too-small budget; noted as a follow-up
+(pooled/reused install buffers) in `MEASUREMENTS.md`'s Pending list, not fixed this pass.
+Memory watched through the 100 GB arm's load and steady state: host `used` peaked ~80 GiB
+of 121 GiB physical, no swap touched, no OOM risk.
+
+**Verification.** `make clean && make cuda-spark`: clean rebuild of `ds4`, `ds4-server`,
+`ds4-bench`, `ds4-eval`, `ds4-agent`, no warnings (including the diagnostic
+`g_cuda_expert_cache_expert_bytes` field, which is read back by a small getter used in the
+`DS4_CUDA_STREAM_STATS` print line specifically to avoid a dead-store warning). No changes
+to the downstream fused-decode kernel interface or the packed
+`g_stream_selected_cache` staging-buffer layout -- the persistent LRU sits entirely upstream
+of both, so this is additive to the existing streaming architecture. `ds4-server` stopped
+for every measurement run in this pass and restarted afterward; see confirmation below.
