@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
@@ -29447,10 +29448,110 @@ extern "C" int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
     return cuda_ok(cudaDeviceSynchronize(), "selected readback signal");
 }
 
+/*
+ * Routing trace (research/gb10 locality study, DS4_ROUTING_TRACE=<path>):
+ * per generated/prefilled token, per layer, the raw selected-expert ids
+ * from the SAME 'selected' table cuda_stream_selected_cache_begin_load()
+ * consumes to drive the streaming expert LRU below. Hooked at the two
+ * extern "C" entry points ds4.c calls into (decode: exactly one token's
+ * worth of ids per call; prefill: a whole batch's ids per call, n_tokens
+ * known explicitly) rather than inside cuda_stream_selected_cache_begin_load
+ * itself, so phase and true token-batch size are never inferred/guessed.
+ * Disabled (env unset): one getenv() + one mutex lock/unlock per call,
+ * no I/O -- negligible next to a streamed-MoE decode/prefill step.
+ * Enabled: buffered fwrite (no per-record fsync); binary format, see
+ * research/gb10/traces/README (or the simulator script) for the exact
+ * record layout.
+ */
+static pthread_mutex_t g_routing_trace_mutex = PTHREAD_MUTEX_INITIALIZER;
+static bool             g_routing_trace_checked = false;
+static FILE            *g_routing_trace_fp = NULL;
+static uint32_t         g_routing_trace_seq = 0;
+static uint32_t         g_routing_trace_decode_token = 0;
+static int32_t          g_routing_trace_decode_last_layer = -1;
+static uint32_t         g_routing_trace_prefill_base = 0;
+static uint32_t         g_routing_trace_prefill_last_n_tokens = 0;
+static int32_t          g_routing_trace_prefill_last_layer = -1;
+
+/* record: u32 seq, u32 token_index, u8 phase(0=prefill,1=decode), u8 layer,
+ * u8 n_selected, u8 pad, then n_selected * i16 expert ids. */
+static void routing_trace_write_locked(uint8_t phase, uint32_t token_index,
+        uint8_t layer, const int32_t *ids, uint32_t n_ids) {
+    if (!g_routing_trace_checked) {
+        g_routing_trace_checked = true;
+        const char *path = getenv("DS4_ROUTING_TRACE");
+        if (path && path[0]) {
+            g_routing_trace_fp = fopen(path, "wb");
+            if (!g_routing_trace_fp) {
+                fprintf(stderr, "ds4: DS4_ROUTING_TRACE: failed to open %s: %s\n",
+                        path, strerror(errno));
+            } else {
+                setvbuf(g_routing_trace_fp, NULL, _IOFBF, 1 << 20);
+            }
+        }
+    }
+    if (!g_routing_trace_fp) return;
+    const uint32_t seq = g_routing_trace_seq++;
+    const uint8_t n8 = (uint8_t)(n_ids > 255u ? 255u : n_ids);
+    const uint8_t pad = 0;
+    fwrite(&seq, sizeof(seq), 1, g_routing_trace_fp);
+    fwrite(&token_index, sizeof(token_index), 1, g_routing_trace_fp);
+    fwrite(&phase, sizeof(phase), 1, g_routing_trace_fp);
+    fwrite(&layer, sizeof(layer), 1, g_routing_trace_fp);
+    fwrite(&n8, sizeof(n8), 1, g_routing_trace_fp);
+    fwrite(&pad, sizeof(pad), 1, g_routing_trace_fp);
+    for (uint32_t i = 0; i < n8; i++) {
+        const int16_t v = (int16_t)ids[i];
+        fwrite(&v, sizeof(v), 1, g_routing_trace_fp);
+    }
+}
+
+/* Decode: one call == one generated token's selection for `layer`. Layers
+ * are visited in increasing order per token (0..n_layer-1); a non-increasing
+ * layer number signals the start of a new decode step. */
+static void routing_trace_decode(uint32_t layer, const int32_t *ids, uint32_t n_ids) {
+    if (!getenv("DS4_ROUTING_TRACE")) return;
+    pthread_mutex_lock(&g_routing_trace_mutex);
+    if (g_routing_trace_decode_last_layer >= 0 &&
+        (int32_t)layer <= g_routing_trace_decode_last_layer) {
+        g_routing_trace_decode_token++;
+    }
+    g_routing_trace_decode_last_layer = (int32_t)layer;
+    routing_trace_write_locked(1, g_routing_trace_decode_token,
+            (uint8_t)(layer > 255u ? 255u : layer), ids, n_ids);
+    pthread_mutex_unlock(&g_routing_trace_mutex);
+}
+
+/* Prefill: one call == a whole layer's selection for n_tokens tokens packed
+ * as ids[token * n_selected + slot]. Same non-increasing-layer heuristic
+ * advances the token base by the PREVIOUS call's n_tokens once a new
+ * layer-sweep begins (handles chunked prefill: each chunk is its own
+ * layer-0..layer-N sweep with its own token count). */
+static void routing_trace_prefill(uint32_t layer, uint32_t n_tokens,
+        const int32_t *ids, uint32_t n_selected) {
+    if (!getenv("DS4_ROUTING_TRACE")) return;
+    pthread_mutex_lock(&g_routing_trace_mutex);
+    if (g_routing_trace_prefill_last_layer >= 0 &&
+        (int32_t)layer <= g_routing_trace_prefill_last_layer) {
+        g_routing_trace_prefill_base += g_routing_trace_prefill_last_n_tokens;
+    }
+    g_routing_trace_prefill_last_layer = (int32_t)layer;
+    g_routing_trace_prefill_last_n_tokens = n_tokens;
+    const uint8_t layer8 = (uint8_t)(layer > 255u ? 255u : layer);
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        routing_trace_write_locked(0, g_routing_trace_prefill_base + t,
+                layer8, ids + (uint64_t)t * n_selected, n_selected);
+    }
+    pthread_mutex_unlock(&g_routing_trace_mutex);
+}
+
 extern "C" int ds4_gpu_stream_expert_cache_begin_selected_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
         uint32_t                           n_selected) {
+    if (table && selected_ids && n_selected > 0) {
+        routing_trace_decode(table->layer, selected_ids, n_selected);
+    }
     return cuda_stream_selected_cache_begin_load(table, selected_ids,
                                                  n_selected);
 }
@@ -29644,6 +29745,9 @@ extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
     if (n_tokens == 0 || n_selected == 0 ||
         (uint64_t)n_tokens * n_selected > UINT32_MAX) {
         return 0;
+    }
+    if (table && selected_ids) {
+        routing_trace_prefill(table->layer, n_tokens, selected_ids, n_selected);
     }
     return cuda_stream_selected_cache_begin_load(
             table, selected_ids, n_tokens * n_selected);

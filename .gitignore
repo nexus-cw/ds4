@@ -33,3 +33,7 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+# routing traces (DS4_ROUTING_TRACE captures, research/gb10 locality study):
+# gitignore only the raw traces that exceed 10MB (currently eval12.bin); smaller
+# captures are committed directly, plus a small curated sample of eval12.bin.
+research/gb10/traces/eval12.bin

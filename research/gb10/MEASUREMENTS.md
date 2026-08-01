@@ -1019,3 +1019,25 @@ verified further this pass): this SSD-streaming workload's prefill time is likel
 NVMe/mapped-view expert fetch rather than GEMM compute, so a faster GEMM kernel doesn't move the
 end-to-end number much here -- worth confirming with a profiler once the MoE-integration bug is
 fixed and the gate is re-earned.
+
+## Prefetch/locality research unit 1: routing-trace capture + offline policy study (2026-08-02)
+
+Trace capture + offline policy study only, no ds4 policy change. Full writeup:
+`research/gb10/LOCALITY_STUDY.md`. Summary: new `DS4_ROUTING_TRACE` env-gated instrumentation
+(`ds4_cuda.cu`) captures per-token, per-layer selected expert ids at the same two entry points
+the CUDA streaming expert cache consumes; validated against real `DS4_CUDA_STREAM_STATS=1`
+counters (LRU simulator hit_rate 0.8092 vs. real 0.809, matched to 3 decimals). Central new
+finding: the oft-quoted "81% hit rate" figure is a **100-token-benchmark artifact** -- real
+longer/mixed sessions (a 1000-token essay, a 6-turn chat, the full 12-item ds4-eval subset)
+all converge to 96-98% hit rate at the same 100GB budget once past the compulsory-miss
+ramp-up. At the 8GB budget (the arm P3a/P3b flagged as thrashing to 0% hit), a Belady-oracle
+upper bound shows real headroom (+51-53% t/s over plain LRU is achievable) but this ticket's
+own literally-specified last-token-same-layer prefetch policy is a **net wall-clock loser**
+under the real 3.7GB/s bandwidth ceiling (too much wasted speculative fetch); a smarter
+eviction/admission policy (heat-pinning + reuse-distance-aware eviction) is the recommended
+next step, not literal prefetch. Also measured: cross-layer adjacent-expert overlap (2.3%) is
+statistically indistinguishable from chance (6/256=2.34%) on this architecture -- the
+literature's ~70% cross-layer predictability figure does not transfer here; cross-token
+same-layer overlap (35.2%) is the real, ~15x-above-chance locality signal. Simulator:
+`research/gb10/locality_sim.py`. Traces: `research/gb10/traces/` (raw traces gitignored
+above 10MB, small sample committed).
