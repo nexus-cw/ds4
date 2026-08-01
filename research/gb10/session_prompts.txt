@@ -1,0 +1,9 @@
+Explain in detail how photosynthesis works, covering both the light-dependent reactions and the light-independent (Calvin cycle) reactions.
+Now compare C3, C4, and CAM photosynthesis pathways, and explain the evolutionary pressures that led plants to develop C4 and CAM variants.
+Switching topics entirely: explain how the TCP three-way handshake works and why it is necessary for reliable connection establishment.
+Follow up on that: how does TCP congestion control work, and what are the practical tradeoffs between algorithms like Reno, Cubic, and BBR?
+Now explain red-black trees: state their core invariants and explain why those invariants guarantee O(log n) worst-case operations.
+Compare red-black trees to AVL trees in terms of insertion and deletion cost versus lookup speed, and explain when you would prefer one over the other.
+Switching topics again: explain the history and design tradeoffs of distributed consensus algorithms, focusing on Paxos and Raft.
+Finally, write a closing summary that draws an extended analogy between load balancing in distributed computer systems and how ant colonies allocate foraging effort among workers.
+/quit

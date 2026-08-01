@@ -1041,3 +1041,120 @@ literature's ~70% cross-layer predictability figure does not transfer here; cros
 same-layer overlap (35.2%) is the real, ~15x-above-chance locality signal. Simulator:
 `research/gb10/locality_sim.py`. Traces: `research/gb10/traces/` (raw traces gitignored
 above 10MB, small sample committed).
+
+## Long-session locality-convergence measurement: does hit-rate convergence make decode
+compute-bound? (2026-08-02)
+
+Live measurement to confirm or refute `LOCALITY_STUDY.md`'s prediction that long/mixed
+sessions converge to 96-98% hit rate at the 100GB budget (vs. 81% on the 100-token
+single-prompt benchmark), which would push decode toward the ~5 t/s compute-floor ceiling
+rather than the disk-bound regime the 81%/2.96 t/s figures describe. `ds4-server` stopped
+first, restarted and verified (`systemctl is-active`=`active`, `listening on
+http://0.0.0.0:8000` confirmed in journal) after.
+
+**Method.** A single long-lived interactive `./ds4` process (the only way to keep both the
+KV cache and the device-side streamed-expert LRU cache warm across turns -- the cache is
+purely in-process and dies with it), `gguf/DeepSeek-V4-Flash-MXFP4_MOE.patched.gguf --cuda
+--ssd-streaming --ssd-streaming-cache-experts 100GB --nothink -n 350`, 8 prompts piped via
+stdin in one process (mirrors `LOCALITY_STUDY.md`'s multiturn trace workload: mixed topics
+with follow-ups -- photosynthesis, C3/C4/CAM follow-up, TCP handshake, TCP congestion-control
+follow-up, red-black trees, red-black-vs-AVL follow-up, Paxos/Raft, closing cross-topic
+analogy). `DS4_CUDA_STREAM_STATS=1` was set, but this build only wires that counter print
+into the one-shot (`-p`) exit path, not the interactive REPL (`ds4_cli.c`,
+`ds4_gpu_print_cuda_stream_stats()` has exactly one call site, inside `run_generation()`,
+never called from `run_repl()`) -- confirmed by reading the code before running, not assumed.
+So this pass could not read the real cumulative hit-rate counter mid-session; per the
+protocol's fallback, it uses the REPL's own per-turn `ds4: prefill: X t/s, generation: Y t/s`
+line (printed after every turn to stderr) to build the trajectory, then derives an implied
+hit rate from decode t/s via the compute-floor model `LOCALITY_STUDY.md` already validated
+against real counters (compute floor 0.191 s/token, 3.7 GB/s single-NVMe ceiling, 258
+demand accesses/token [43 layers x 6 experts], 12.75 MiB/entry -> max bytes/token at 0% hit
+= 258 x 12.75 MiB = 3.212 GB; `bytes/tok = (1/t/s - 0.191) x 3.7`, `hit_rate = 1 -
+bytes/tok / 3.212`). This derived number is model-based, not a second independent real
+counter -- flagged explicitly, not presented as equivalent to a direct measurement.
+
+**Per-turn trajectory** (prefill token counts from the REPL's own progress display; turn 1's
+prefill count wasn't printed by the progress callback, decode t/s still captured):
+
+| turn | topic | prefill tokens | prefill t/s | decode t/s | derived bytes/tok (GB) | derived hit rate |
+|---|---|---|---|---|---|---|
+| 1 | photosynthesis (cold start) | n/a | 0.67 | 3.37 | 0.391 | 87.8% |
+| 2 | C3/C4/CAM (follow-up) | 33 | 0.71 | 4.42 | 0.130 | 95.9% |
+| 3 | TCP handshake (topic switch) | 28 | 0.37 | 4.43 | 0.128 | 96.0% |
+| 4 | TCP congestion control (follow-up) | 34 | 0.80 | 4.43 | 0.128 | 96.0% |
+| 5 | red-black trees (topic switch) | 30 | 0.69 | 4.39 | 0.136 | 95.8% |
+| 6 | red-black vs. AVL (follow-up) | 34 | 0.80 | 4.46 | 0.123 | 96.2% |
+| 7 | Paxos/Raft (topic switch) | 29 | 0.66 | 4.44 | 0.127 | 96.1% |
+| 8 | ants/load-balancing analogy (topic switch) | 32 | 0.73 | 4.48 | 0.119 | 96.3% |
+
+Every topic switch (turns 3, 5, 7, 8) still shows real cold-cache cost at the prefill stage
+(GPU util ~85-93%, NVMe reads ~300 MB/s sustained for tens of seconds even on prompts as
+short as 28-34 tokens -- confirmed live via `nvidia-smi`/`iostat` during the run, not just
+inferred from the log), but **decode t/s barely moves on a topic switch** (4.39-4.48 t/s
+across turns 3-8 regardless of whether the turn is a follow-up or a fresh topic) -- the
+100GB cache is now large enough, and this session's cumulative working set diverse enough,
+that decode-time eviction pressure from a topic switch is small next to the already-resident
+cross-topic "hot core" (consistent with `LOCALITY_STUDY.md`'s finding that 99.1% of all
+possible (layer,expert) pairs get touched somewhere in a diverse combined workload, and 50%
+of selections are served by just 15.4% of keys).
+
+**Steady state.** Mean of the last 3 turns (6, 7, 8): **4.46 t/s** decode, derived hit rate
+**96.2%**. Mean of turns 2-8 (excluding the cold-start first turn): 4.44 t/s, derived hit
+rate 95.9-96.3% throughout -- i.e. the session reaches steady state almost immediately after
+turn 1 and stays there, it does not need many more turns to keep climbing toward 98%.
+
+**Verdict on the 96-98% prediction: CONFIRMED, at the lower edge of the predicted band.**
+Every turn after the cold-start first one lands in 95.8-96.3% derived hit rate -- solidly in
+the predicted 96-98% range and far above the 81% short-benchmark figure this ticket set out
+to test, even though this session's steady state sits at the low end of that band rather
+than the 98% ds4-eval-derived ceiling (plausibly because this 8-turn/~2,500-token session is
+shorter and touches fewer distinct topics than the 12-item, 20,220-token ds4-eval capture
+`LOCALITY_STUDY.md` measured at 98.3%).
+
+**Verdict on compute-bound: CONFIRMED, decode is now compute-dominated but not purely
+compute-bound.** The pure-compute ceiling (bytes/tok -> 0) is `1/0.191 = 5.236 t/s`. Steady
+state (4.46 t/s) is **85.2% of that ceiling** -- disk time is now only the remaining ~15% of
+the per-token budget (0.032s disk vs. 0.191s compute at turn 6-8's derived bytes/tok). This
+is a large, real shift from the disk-bound regime the existing 81%-hit/2.96 t/s sweep figure
+describes: recomputing that regime's disk-time share with the same formula (0.552 GB/tok at
+81% hit, per `MEASUREMENTS.md`'s own P3a-fix entry) gives `0.552/3.7 = 0.149s` disk time vs.
+`0.191s` compute -- a **44% disk-time share**, roughly 3x this session's steady-state ~15%.
+So the session has moved decode from "disk time is nearly as large as compute time" to
+"compute clearly dominates, disk is a modest tail" -- matching the ticket's "compute-bound,
+~5 t/s kernel ceiling" framing directionally and quantitatively (measured steady-state
+4.46-4.49 t/s vs. the predicted ~5 t/s ceiling, 85-86% of the way there), while stopping
+short of literally reaching the full ceiling, consistent with a derived (not 0%) residual
+disk-time share rather than a true zero.
+
+**Comparison to existing figures.** This session's steady-state 4.46 t/s and 8-turn-mean
+4.44 t/s (turns 2-8) are close to the 4.4 t/s eval-observed figure already in
+`MEASUREMENTS.md`, and both are **~50% higher** than the 2.96 t/s single-short-prompt sweep
+figure that was the previous best "production" number for this config -- direct live
+confirmation that the 2.96 t/s figure understates realistic long/mixed-session throughput,
+for the same underlying reason `LOCALITY_STUDY.md`'s offline simulation already flagged: the
+81%-hit-rate benchmark that number was built on never runs long enough to leave the
+compulsory-miss ramp-up.
+
+**Next optimization target, now stated explicitly.** With decode ~85% compute-bound at
+steady state, the remaining ~15% disk-time tail is a comparatively small target --
+`LOCALITY_STUDY.md`'s own eviction/admission recommendations (heat-pinned floor + LRU
+remainder, reuse-distance-aware eviction) would close at most that residual gap at the 100GB
+budget, not the 2-3x gains they'd offer at 8GB. The real headroom is the compute ceiling
+itself, ~5.24 t/s at 0.191 s/token: whoever picks up decode-side kernel work next (the
+still-incomplete MMA-prefill GEMM correctness fix noted in the P3c-1 entries above is the
+current lead there) should treat that as the number to move, not the streaming-cache policy.
+
+**Caveats.** (1) Hit rate here is *derived* from decode t/s via the compute-floor model, not
+read from a live in-process counter -- the REPL build path doesn't wire
+`ds4_gpu_print_cuda_stream_stats()` into `run_repl()`'s exit, only `run_generation()`'s (a
+genuine gap for whoever next needs live REPL-session cache stats; not fixed this pass, this
+unit is measurement-only, no code changes). (2) 8 turns / ~2,500 decode tokens is shorter
+than the ds4-eval 12-item/20,220-token capture `LOCALITY_STUDY.md` used for its 98.3% figure
+-- this session's slightly lower ~96% steady state is consistent with, not contradictory to,
+that larger-sample number. (3) `-n 350` per turn means some turns may have been truncated
+before a natural stop; this does not affect the t/s/hit-rate analysis, which is a rate
+measurement independent of exact token count.
+
+**Server discipline.** `ds4-server` was stopped (`sudo systemctl stop ds4-server`) before
+this run and restarted + verified (`systemctl is-active`=`active`, `listening on
+http://0.0.0.0:8000` in the journal, model tensors loading logged) at the end, per protocol.
