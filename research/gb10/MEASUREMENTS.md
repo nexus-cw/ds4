@@ -1319,3 +1319,150 @@ Evaluate whether a better-matched drafter (vs. this community artifact) or a low
 MTP (non-DSpark) under `--ssd-streaming` remains refused (per the scoped gate above) and
 would need its own `g->ssd_streaming` guard around `metal_graph_eval_mtp_draft_from_hc`
 before it could be safely enabled the same way.
+
+## ds4#605 transport eval: CUDA streaming upload pipelining + plain-copy default, independently ported onto our LRU -- adapted, build/tests verified, live A/B blocked by concurrent exclusive-lock process (2026-08-02)
+
+**Goal.** Independently test the *transport* half of upstream PR #605 (iCreil,
+"CUDA: resident expert cache and faster selected-expert uploads for
+--ssd-streaming decode", claims 2.3->29-32 t/s on RTX PRO 6000) against our
+GB10 + MXFP4 + expert-LRU stack (per-(layer,expert) CUDA LRU, P3a-fix +
+P3b pooled allocator), fold what proves better, and produce an honest
+verdict on whether PR#605's PCIe-discrete-card wins transfer to GB10's
+unified memory.
+
+**Classification of the 4 PR#605 commits.**
+
+| commit | title | classification | rationale |
+|---|---|---|---|
+| `10ba298` | restore resident expert cache | (a) duplicates our LRU, not ported | Adds ~1100 lines implementing a brand-new class/slot-keyed resident VRAM cache (`cuda_stream_expert_cache_prepare/_release_class/...`) from scratch. Our tree already has a functionally equivalent, structurally different persistent per-(layer,expert) LRU (`cuda_stream_expert_cache_peek/_install/_prune_global`, from P3a-fix). Porting this commit would either be dead code sitting beside our own cache or require ripping ours out and replacing it wholesale -- both out of this unit's transport-only scope. |
+| `9167d12` | skip per-load VRAM query once cache has settled | (a) duplicates our LRU, not ported | Entirely an optimization *of* the resident-cache structures `10ba298` just added (`g_stream_expert_settled_caps[]`, `cuda_stream_expert_cache_prepare()`'s fast path). Since `10ba298` was not ported, this commit has no target in our tree -- not applicable, not a separate transport concern. |
+| `1c055bb` | pipeline the streamed expert upload path | (b) transport, ported | Targets `cuda_model_copy_to_device_streamed()` -- a function that exists **verbatim by name** in our tree too (pre-PR#605 common ancestor), and is the exact function our LRU's miss path already calls three times per miss (gate/up/down). Directly portable. |
+| `5930a3f` | default streamed expert uploads to plain copy without O_DIRECT | (b) transport, ported | Same function (`cuda_model_copy_to_device_streamed_ex` after `1c055bb`). Directly portable; this is also the commit most likely to behave differently on GB10's unified memory (see verdict below). |
+
+Confirmed before porting (read, not assumed): our LRU already serves cache
+hits with a device-to-device `cudaMemcpy` straight into the packed staging
+buffer (`cuda_stream_selected_cache_begin_load()`, hit branch) -- zero
+change there. Only the miss branch calls `cuda_model_copy_to_device_streamed()`,
+so PR#605's transport pipelining applies exactly where the ticket predicted:
+the miss-path upload, not the (already fast) hit path.
+
+**Adaptation, not cherry-pick.** `git cherry-pick` on `1c055bb`/`5930a3f`
+did not apply cleanly (our tree's surrounding code -- staging-pool alloc,
+comments, chunk-size plumbing -- has diverged from PR#605's base enough
+that the hunks don't match context, even though the target function is
+name-identical). Hand-adapted onto `research/gb10` HEAD `5d032d7` instead,
+preserving iCreil's design and measured rationale, committed as nexus-cw
+with `Co-Authored-By: iCreil <catalano.mirko@gmail.com>` and an explicit
+"Adapted from antirez/ds4#605 by iCreil" trail in both the commit message
+and inline code comments at each adapted site. Branch: `eval/605-transport`
+(pushed), commit `b4816a3`, one file (`ds4_cuda.cu`), +97/-24 lines.
+
+Changes: (1) `cuda_model_copy_to_device_streamed()` -> `_ex()` with a
+`flush` parameter and a persistent 4-buffer ring cursor shared across
+calls (was reset to 0 every call) so back-to-back grouped copies pipeline
+host reads with device uploads across tensor boundaries, not just within
+one tensor's own chunks; a separate `_flush()` does the
+`cudaStreamSynchronize` only when the caller asks for it. (2) Miss-path
+upload defaults to a plain `cudaMemcpy` from the pageable model map
+instead of the staged-pread-then-async-upload path when there is no
+active O_DIRECT fd (`g_model_direct_fd < 0`), matching `5930a3f`'s
+rationale that the driver's own pageable-transfer path beats the
+pread-bounce when reads are already coming from page cache/tmpfs;
+`DS4_CUDA_STREAM_MISS_PLAIN_COPY=1/0` still forces either way. (3) The one
+real integration point: `cuda_stream_selected_cache_begin_load()`'s miss
+branch now issues its three tensor uploads (gate/up/down) as one async
+group (`flush=0,0,1`) instead of three independently-synced calls.
+
+**Build.** `make cuda-spark`: clean, zero warnings, on `eval/605-transport`
+(commit `b4816a3`) and on a fresh `research/gb10` worktree baseline
+(`/tmp/ds4-baseline`, HEAD `5d032d7`) side by side.
+
+**Tests.** `test_mxfp4_dequant`: PASS (131424 checks, 0 mismatches) --
+unaffected by this diff by construction (dequant-only, no streaming code).
+`test_mixed_moe`: PASS, all cases -- also unaffected by construction (its
+own file-level comment states it is "deliberately independent of
+ds4.c/ds4_cuda.cu internals beyond" the public GPU API, which this diff
+does not touch). `test_mxfp4_moe`: **inconclusive, environmental** -- hit
+`ds4: CUDA init set device failed: out of memory` at CUDA-device-init time,
+before any of this unit's code runs at all. Root cause confirmed
+environmental, not a regression: at the time of the run, `free -h` showed
+1.6-2.2 GiB free / 5-18 GiB available system-wide on this 121 GiB unified-
+memory box, driven by a co-running interference-test `ds4-server` (see
+below) plus other resident load; this failure mode is identical to what
+the unpatched baseline would also hit under the same memory pressure (the
+OOM is at `cudaSetDevice`, upstream of any code this unit touched). Not
+rerun once the interference process cleared because it did not clear
+within this unit's time budget (see below).
+
+**Live A/B measurement: BLOCKED, not completed this unit.** ds4 enforces
+a single-instance exclusive lock on the GPU/model (confirmed live:
+`ds4: another ds4 process is already running (pid 1148291); refusing to
+start`). PID 1148291 is another unit's own manually-launched
+`ds4-server --port 8001 --ssd-streaming-cache-experts 90GB` interference
+test, running continuously (11h40m+ elapsed at time of check, actively
+cycling chat turns roughly once a minute per its own log) with no
+indication of finishing soon. Per this unit's protocol ("WAIT (bounded
+poll) for ds4 processes you don't own, never kill them"), the interference
+server's PID was left untouched; a bounded poll (3 checks, 30s apart) found
+it still active and its log showed ongoing turn cycling, not a wind-down.
+Given the process's long, sustained, and apparently open-ended runtime
+(it is itself a deliberate multi-user-interference experiment, not a
+transient job), waiting it out was not feasible within this unit's time
+budget. The systemd `ds4-server` service was already `inactive`
+throughout (confirmed via `systemctl is-active`) and required no action.
+
+No warm multi-turn decode, cold-start turn-1 decode, or prefill-timing
+comparison numbers were collected for either branch this unit -- reporting
+that gap directly rather than presenting the earlier build/test results as
+a substitute for the requested A/B tables.
+
+**Fold decision: NOT FOLDED, pending measurement.** Per protocol ("fold if
+any arm shows a real (beyond noise) win with no regression elsewhere"),
+folding requires measured evidence; none was obtainable this unit. The
+adapted, build-clean, non-destructively-tested code is left on
+`eval/605-transport` (pushed, commit `b4816a3`) for the next unit (or a
+rerun of this one) to measure once the box is free of the port-8001
+interference load. `research/gb10` itself is unchanged.
+
+**GB10 unified-memory verdict: not yet determined -- explicitly deferred,
+not defaulted to "no effect."** This is the one open question this unit
+set out to answer and could not, given the blocker above. The mechanism
+PR#605's `5930a3f` exploits (pageable driver-managed transfer beating a
+pread-into-pinned-buffer bounce) is plausible on both discrete-PCIe and
+GB10-unified hardware for different reasons -- on a discrete card it avoids
+a redundant host-side copy before the PCIe DMA; on GB10, where "host" and
+"device" share the same physical DRAM over NVLink-C2C, the mechanism by
+which either path moves bytes is different enough (there is no PCIe DMA
+to bypass) that PR#605's own ~3x number cannot be assumed to transfer, but
+it cannot be assumed to vanish either without measurement -- both are
+live hypotheses. Flagging this explicitly as the next unit's first
+priority: rerun the A/B protocol in `MEASUREMENTS.md`'s existing long-
+session/cold-start/prefill format once port 8001's interference server has
+exited, using `eval/605-transport` vs `research/gb10`, before any fold-vs-
+no-fold call is finalized either way.
+
+**Next steps (explicit, for whoever picks this back up).** (1) Confirm
+`ds4-server` (PID 1148291, port 8001) has exited (`pgrep -f 'ds4-server.*
+port 8001'`); do not kill it. (2) Run this unit's full protocol: warm
+multi-turn (6+ turns, steady-state of last 3) research/gb10 vs
+eval/605-transport; cold-start turn-1 at both a 100GB and an 8GB cache
+budget (the latter specifically to stress the miss path this unit's patch
+targets); ~300-token prefill (`research/gb10/prose_prompt.txt` is already
+in place for this). (3) Byte-identity gate between branches at `--temp 0`
+-- note the pre-existing, branch-independent `--ssd-streaming` decode
+non-determinism documented in the "Drafter-streaming compatibility" entry
+above (two identical baseline reruns diverging at the same spot) before
+treating any observed divergence as a regression; rerun 2-3x per arm to
+separate real divergence from that known noise floor. (4) If a real win is
+found on any arm with no regression elsewhere, merge `eval/605-transport`
+into `research/gb10` and update this file + `FP4_PORT_SCOPE.md` with the
+numbers and the GB10-vs-discrete-card analysis; if GB10 unified memory
+nullifies or reverses PR#605's gains, that is itself the valuable
+deliverable -- document it with the same rigor (it also tells upstream
+their PR's value may be discrete-card-specific).
+
+**Server discipline.** `ds4-server` (systemd) was `inactive` before and
+after this unit's work (confirmed via `systemctl is-active`); no restart
+was needed since it was never started. The port-8001 interference server
+(another unit's own process, not systemd-managed) was left running
+throughout, untouched, per protocol.
