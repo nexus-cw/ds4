@@ -865,3 +865,87 @@ succeeded, so no run, no A/B numbers, no `make cuda-spark` build of this feature
 model-server activity (server was never touched this pass). P3b's grouped
 dequant+cuBLAS prefill path (~4.6-4.64 t/s on the ~300-token prompt, see the P3b item 2
 entry above) remains the current-best prefill path.
+
+## DSpark drafter measurement spike: gated by `--ssd-streaming` / `--mtp` mutual exclusion (2026-08-01)
+
+**Motivation.** Streamed MXFP4 decode (`gguf/DeepSeek-V4-Flash-MXFP4_MOE.patched.gguf`,
+150GB, via `--ssd-streaming --ssd-streaming-cache-experts 100GB`, ~81% expert-LRU hit rate
+per prior measurements) runs at ~4 t/s. `ds4` supports a DSpark speculative-decode drafter
+(`--mtp FILE --dspark[-confidence F|-strict]`); this unit set out to measure decode t/s
+with vs. without a drafter attached, using the community drafter artifact
+`hf.co/sakamakismile/DeepSeek-V4-Flash-DSpark-support-ds4-GGUF` paired against our MXFP4
+streamed main model.
+
+**Drafter mechanism (`./ds4 --help runtime`, cross-checked against `ds4.c`).** The
+drafter is a *separate* small GGUF, attached via `--mtp FILE` (support-model path, shared
+option with the older legacy-MTP mechanism) plus `--dspark` to actually enable DSpark
+decode (`--dspark-confidence F` sets a 0..1 pruning threshold, default 0.9;
+`--dspark-strict` loads the support GGUF but keeps target-only decode, i.e. load-and-verify
+without using it for speculation). `ds4.c`'s `ds4_engine_open()` opens the `--mtp` file as
+a second `ds4_model` (`e->mtp_model`), auto-detects its kind via `support_model_detect()`
+against `deepseek4.dspark.*` GGUF metadata keys (block_size, markov_rank, noise_token_id,
+target_layer_ids) and tensor-name/type/shape validation
+(`dspark_validate_tensor_layout()`/`dspark_weights_validate_metadata()`) -- no main-model
+hash or identity check, purely structural validation of the support GGUF's own tensors/
+metadata. Verify/acceptance semantics (per `ds4: DSpark spec accept
+drafted=%d accepted=%d` / `ds4: DSpark spec partial drafted=%d verified=%d accepted=%d`
+log lines, `ds4.c:61978`/`62108`, and the aggregate `accepted_draft=... accept_rate=%.2f%%
+avg_accept=%.3f ... draft_len_hist=... accepted_len_hist=...` summary at `ds4.c:57601-57628`):
+per step the drafter proposes up to `--mtp-draft N` (default 1) autoregressive tokens, the
+target model verifies them in one batched forward pass, and a full/partial/miss outcome is
+recorded per draft window -- standard greedy-verify speculative decode, output-identical to
+non-speculative decode by construction when both run greedy (temp 0, our test prompt uses
+`--nothink` but not an explicit `--temp 0`; default sampling per `--help sampling` was not
+overridden for this spike since the run never got past the compat gate below).
+
+**Pairing/compatibility check -- HARD GATE HIT, before any DSpark-specific validation
+even ran.** `ds4.c:56770-56773`, inside `ds4_engine_open()`, unconditionally:
+```
+if (opt->mtp_path && opt->mtp_path[0] && opt->distributed.role == DS4_DISTRIBUTED_NONE) {
+    if (e->ssd_streaming) {
+        fprintf(stderr, "ds4: --ssd-streaming is not compatible with --mtp yet\n");
+        ds4_engine_close(e); *out = NULL; return 1;
+    }
+    ...
+```
+`--mtp` (required for `--dspark`) and `--ssd-streaming` are mutually exclusive in this
+`ds4` build (branch `research/gb10`, HEAD `ac01189`) -- the check fires purely on the two
+flags both being set, before the support GGUF is even opened (`model_open(&e->mtp_model,
+...)` is the very next statement, unreached). Live-reproduced on robo-dog (`ds4-server`
+stopped first, per protocol):
+```
+./ds4 --cuda -m gguf/DeepSeek-V4-Flash-MXFP4_MOE.patched.gguf \
+  --mtp gguf/DeepSeek-V4-Flash-DSpark-support.gguf --dspark \
+  --ssd-streaming --ssd-streaming-cache-experts 100GB --nothink \
+  -p "Explain in a few sentences how photosynthesis works." -n 100
+```
+loads and dialect-compat-converts the main model's tensor families normally, then exits
+immediately on the gate above with exit status 1 and no generation. This is not a
+DSpark/main-model tensor- or hash-mismatch rejection -- the DSpark-specific compatibility
+path (`support_model_detect()`, `dspark_validate_tensor_layout()`,
+`dspark_weights_validate_metadata()`) never runs at all, because the SSD-streaming check
+gates first. Since the main model (150GB) does not fit in robo-dog's 121GB unified memory
+(`free -h`: 121Gi total), `--ssd-streaming` is not optional for this main model on this
+hardware -- there is currently no way to attach a DSpark drafter to the streamed MXFP4
+model on robo-dog at all. **Pairing accepted: NO -- gated by the `--ssd-streaming`/`--mtp`
+mutual-exclusion check, independent of the drafter/main-model weight-format or
+vocab/tokenizer compatibility question this unit set out to test (that question was never
+reached).**
+
+**No with/without decode-t/s comparison was possible as a result** -- the "with drafter"
+arm cannot be constructed on this model/hardware combination until `--mtp` gains
+SSD-streaming support (out of this unit's scope; flagged as the natural follow-up). No
+output-coherence or acceptance-rate data was collected for the same reason.
+
+**Drafter artifact.** Downloaded to `~/src/ds4/gguf/DeepSeek-V4-Flash-DSpark-support.gguf`
+via the HF resolve URL for `sakamakismile/DeepSeek-V4-Flash-DSpark-support-ds4-GGUF`
+(exact filename found via the HF API model-info endpoint, single GGUF sibling besides
+`.gitattributes`/`README.md`). Size verified: `5989114272` bytes (~5.58 GiB), matching the
+HF API's reported `totalFileSize` exactly. `sha256sum:
+8b3adf5942bec22ae2ea867cd7079cf13530ba83ffcffaf00f5de48664a1a34e`. NVMe had ~284GB free
+before the download; file left in place for any future follow-up once `--mtp` +
+`--ssd-streaming` compose.
+
+**Server restored.** `ds4-server` stopped before the reproduction run, restarted after;
+`systemctl is-active` = `active`, confirmed loading its usual model
+(`DeepSeek-V4-Flash-IQ2XXS-...imatrix.gguf`) normally in the post-restart journal.
