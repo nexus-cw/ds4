@@ -1487,3 +1487,31 @@ to the downstream fused-decode kernel interface or the packed
 `g_stream_selected_cache` staging-buffer layout -- the persistent LRU sits entirely upstream
 of both, so this is additive to the existing streaming architecture. `ds4-server` stopped
 for every measurement run in this pass and restarted afterward; see confirmation below.
+
+## P3b item 1: layer-major streaming prefill fixed -- `pread()` past real EOF into the
+BF16/Q6_K dense-conversion mmap extension (2026-08-01)
+
+Root-caused and fixed the `cuda prefill failed` crash on realistic (~25-140-word) prompts
+under `--ssd-streaming` that every prior pass worked around with
+`DS4_METAL_STREAMING_DECODE_PREFILL_MAX=4096`. Confirmed hypothesis: prompts past the
+18/64-token decode-style-prefill cap (`metal_graph_streaming_decode_prefill_max_tokens()`)
+route into `metal_graph_prefill_layer_major()`'s streaming page-in branch, whose default
+mechanism (`metal_graph_stream_pread_range()`, layer-pread, enabled by default under
+`--ssd-streaming`) issues `pread(model->fd, ..., offset)` bounded only by `model->size` --
+which `model_convert_dense_bf16_q6k()` (`3106c3c`) grows past the real on-disk file to hold
+converted dense-tensor bytes (`attn_q_a`/`attn_q_b`/`attn_output_a`/`attn_output_b`/
+`indexer.attn_q_b`, all present in every layer's decode span set). Any layer-prepare span
+touching a converted tensor's offset issues a `pread()` past real EOF, fails, and the whole
+prefill call fails with no diagnostic -- deterministic given a specific span, but
+apparently-intermittent across prompts/reruns because which spans a given prompt's expert
+routing touches varies. Fix: new `ds4_model.file_size` (real on-disk length, captured once
+in `model_open()` before any growth) plus a clamp in `metal_graph_stream_pread_range()` that
+only `pread()`s the on-disk portion of a range and directly touches the
+already-correct-and-resident mmap extension for the rest, mirroring the CUDA-side
+`cuda_model_range_ptr_from_fd()` fix for the same underlying mmap-growth invariant.
+
+Full root-cause narrative, fix detail, and before/after verification (France + a 118-word
+prose prompt + a 158-word GPQA-style prompt, all without the env-var workaround, all
+repeated including immediately after an explicit page-cache drop) in `MEASUREMENTS.md`'s
+"P3b item 1" section. `make clean && make cuda-spark`: clean, no warnings.
+`test_mxfp4_moe`/`test_mixed_moe`/`test_mxfp4_dequant`: all pass.

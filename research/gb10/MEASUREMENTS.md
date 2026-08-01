@@ -622,3 +622,95 @@ scope); no `make`/`ds4_test` run needed since nothing was touched.
       MXFP4-specific quality gap identified at this sample size (N=12); a larger question
       set would be needed to distinguish "identical failure modes" from "coincidentally
       identical at N=12".
+
+## P3b item 1: root-caused and fixed the layer-major streaming prefill crash
+(`cuda prefill failed` on prompts past the 18/64-token decode-style prefill cap) (2026-08-01)
+
+**Context.** `metal_graph_streaming_decode_prefill_max_tokens()` caps the decode-style
+per-token streaming prefill path at 18 tokens (64 if layer 0 is Q4_K; the real MXFP4
+artifact's layer 0 is MXFP4, so 18 applies) before diverting into
+`metal_graph_prefill_layer_major()`'s streaming page-in/readahead/pread/madvise branch.
+That branch had a real, reproducible-but-page-cache-state-dependent bug on
+`DeepSeek-V4-Flash-MXFP4_MOE.patched.gguf`: prompts in roughly the 25-140-word range would
+fail prefill with a bare `ds4: prompt processing failed: cuda prefill failed` and no other
+diagnostic. Workaround in every prior pass: `DS4_METAL_STREAMING_DECODE_PREFILL_MAX=4096`
+(forces the decode-style path unconditionally, bypassing layer-major prefill entirely).
+
+**Root cause, confirmed by reading the code (not guessed):** `model_convert_dense_bf16_q6k()`
+(landed in `3106c3c`, load-time BF16/Q6_K -> F16 dialect-compat conversion for dense
+per-layer tensors -- `attn_q_a`/`attn_q_b`/`attn_output_a`/`attn_output_b`/
+`indexer.attn_q_b`, all included in every layer's decode span set via
+`model_map_span_vec_include_layer_decode_static()`) grows `ds4_model.map`/`.size` past the
+real on-disk file by reserving an anonymous address range, remapping the file at the front,
+and mapping a writable anonymous extension right after it for the converted F16 bytes --
+`m->size` is then reassigned to the new, larger `total_len` (file bytes + extension bytes).
+Every downstream bound check that validates a range against `model->size` therefore
+considers the converted-tensor offsets "in range" -- correct for anything that touches the
+mapping directly, but **wrong for `metal_graph_stream_pread_range()`**, the default-enabled
+layer-major streaming-prefill mechanism (`layer_pread`, enabled whenever
+`--ssd-streaming` is set unless explicitly disabled, ahead of `layer_readahead`/`layer_pagein`
+which both require an explicit opt-in env var and were not in play here). That function
+issues `pread(model->fd, ..., offset)` -- a real read against the *actual* file descriptor,
+which only has the original, pre-growth file length. For any span that includes a converted
+tensor (which, per the layer decode-span inventory above, is every single layer, every
+single prefill call), the `pread()` targets an offset past real EOF, returns 0
+(`nread <= 0`), and the whole layer-prepare job fails -- exactly the observed
+"cuda prefill failed" with no further diagnostic (the function has no `fprintf` on this
+path). This exactly matches the ticket's own suspicion and the CUDA-side precedent: the
+same class of bug was already found and fixed in `ds4_cuda.cu`'s
+`cuda_model_range_ptr_from_fd()` (an earlier pass, `g_model_file_size` short-circuit) for a
+different (device-side direct-read) consumer of the same grown mapping; `ds4.c`'s
+layer-major CPU-side `pread_range()` had never received the equivalent fix, since no prior
+pass had exercised a real prompt long enough to route through it (every pass before this one
+either used short/decode-style prompts, or the `DS4_METAL_STREAMING_DECODE_PREFILL_MAX=4096`
+workaround, which bypasses this function's caller entirely).
+
+**Why intermittent:** whether `pread()` at an offset past `model->file_size` returns
+`0` (clean EOF, `nread<=0`, deterministic failure) or something else depends only on the
+kernel's own EOF semantics for the real file -- which are deterministic per se, but which
+of a prompt's tokens' selected experts happen to fall in a layer/tensor combination that
+triggers this particular span (vs. one entirely inside the real file, which succeeds) is a
+function of the specific expert routing for that prompt/cache state, explaining why some
+prompts/reruns "happened" not to hit it while structurally identical-length prompts did.
+
+**Fix** (`ds4.c`):
+1. New `ds4_model.file_size` field: the real on-disk length, captured once via `fstat()` in
+   `model_open()` before `model_convert_dense_bf16_q6k()` (if it runs) grows `map`/`size`.
+   Never mutated afterward -- `size` remains the correct bound for anything that only
+   touches/madvises the mapping (the extension is validly mapped memory); `file_size` is the
+   correct bound for anything that issues real disk I/O against `fd`.
+2. `metal_graph_stream_pread_range()`: clamp the actual `pread()` span to
+   `[offset, min(offset+size, file_size))`. Any remainder at or past `file_size` (the
+   conversion extension) is already correct, resident data in `model->map` -- touched
+   directly (for the existing XOR-checksum "did we actually read this" bookkeeping) instead
+   of issuing a doomed `pread()`. Mirrors the CUDA-side fix's own rationale
+   (`cuda_model_range_ptr_from_fd()`, `ds4_cuda.cu`) but implemented independently since
+   this is the CPU-side, different-signature function.
+
+**Verification.** `make clean && make cuda-spark`: clean rebuild, no warnings.
+`research/gb10/test_mxfp4_moe`, `test_mixed_moe`, `test_mxfp4_dequant`: all pass (rebuilt
+against the new `ds4_cuda.o`; these tests don't touch the changed code path directly, run
+as the ticket's correctness gate). Real 150GB artifact
+(`gguf/DeepSeek-V4-Flash-MXFP4_MOE.patched.gguf`, `--cuda --ssd-streaming
+--ssd-streaming-cache-experts 40GB --nothink`), foreground with timeouts, polled,
+`ds4-server` stopped throughout:
+
+- `-p "Reply with exactly: ok"` (no env var): `ok` (exact match). `prefill: 1.24 t/s,
+  generation: 2.04 t/s`.
+- `-p "What is the capital of France?"` (no env var, page cache dropped
+  (`echo 3 > /proc/sys/vm/drop_caches`) immediately beforehand): `The capital of France is
+  Paris.` (exact match, coherent). `prefill: 1.27 t/s, generation: 2.09 t/s`.
+- 118-word photosynthesis-explanation prose prompt (no env var, page cache dropped
+  immediately beforehand): prefilled and generated successfully, no `cuda prefill failed`.
+  `prefill: 1.58 t/s, generation: 1.85 t/s`. Repeated twice more back-to-back on warm cache:
+  both succeeded (`prefill: 1.47/1.56 t/s`).
+- 158-word GPQA-style astronomy multiple-choice prompt (no env var, page cache dropped
+  immediately beforehand): prefilled and generated successfully, no `cuda prefill failed`.
+  `prefill: 1.70 t/s, generation: 1.82 t/s`.
+
+All prompts in the previously-failing ~25-140-word range now prefill successfully without
+`DS4_METAL_STREAMING_DECODE_PREFILL_MAX`, repeatably, including immediately after an
+explicit page-cache drop -- the acceptance bar this unit was scoped to. The previously
+undocumented `--ssd-streaming` decode-style-vs-layer-major prefill split (governed by
+`metal_graph_streaming_decode_prefill_max_tokens()`'s 18/64-token cap) is now exercised by
+these >18-token runs, confirming the fix, not just the workaround's continued effectiveness.

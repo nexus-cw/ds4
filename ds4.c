@@ -2107,6 +2107,15 @@ typedef struct {
     int fd;
     const uint8_t *map;
     uint64_t size;
+    /* Real on-disk file length, captured once via fstat() in model_open()
+     * before model_convert_dense_bf16_q6k() (if it runs) grows `map`/`size`
+     * past it with a writable anonymous extension for converted dense
+     * tensors. Unlike `size`, this never changes after model_open() -- it's
+     * the boundary any *disk* I/O (pread/fcntl-readahead) against `fd` must
+     * respect; `map`/`size` remain the right bound for anything that just
+     * touches/madvises the mapping itself, since the extension is validly
+     * mapped memory even though it has no backing file range. */
+    uint64_t file_size;
 
     uint32_t version;
     uint64_t n_kv;
@@ -2502,6 +2511,7 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     m->fd = fd;
     m->map = map;
     m->size = (uint64_t)st.st_size;
+    m->file_size = (uint64_t)st.st_size;
 
     ds4_cursor c = cursor_at(m, 0);
     uint32_t magic;
@@ -19148,10 +19158,32 @@ static bool metal_graph_stream_pread_range(
     }
     if (offset > (uint64_t)LLONG_MAX) return false;
 
+    /* ds4.c's load-time BF16/Q6_K -> F16 dense-tensor conversion
+     * (model_convert_dense_bf16_q6k) grows model->map/model->size past the
+     * real on-disk file (model->file_size, captured once in model_open()
+     * before that growth) to hold converted tensor bytes that never
+     * existed as such on disk. Any portion of [offset, offset+size) at or
+     * beyond model->file_size has nothing to fetch via pread(fd, ...) --
+     * attempting it reads past real EOF and fails (intermittently masked
+     * by page-cache state, since the mapped bytes there are already
+     * correct regardless of whether the OS happens to have them cached).
+     * Clamp the actual pread() to the on-disk prefix, if any, and just
+     * touch the already-resident conversion-extension bytes directly from
+     * the mapping for the remainder -- mirrors the CUDA-side fix in
+     * ds4_cuda.cu's cuda_model_range_ptr_from_fd(). */
+    uint64_t pread_size = size;
+    if (model->file_size != 0) {
+        if (offset >= model->file_size) {
+            pread_size = 0;
+        } else if (size > model->file_size - offset) {
+            pread_size = model->file_size - offset;
+        }
+    }
+
     const size_t chunk = 1024u * 1024u;
     uint8_t *buf = xmalloc(chunk);
     uint64_t pos = offset;
-    uint64_t rem = size;
+    uint64_t rem = pread_size;
     uint8_t s = sink ? *sink : 0;
     bool ok = true;
     while (rem != 0) {
@@ -19173,8 +19205,18 @@ static bool metal_graph_stream_pread_range(
                 UINT64_MAX : *read_bytes + (uint64_t)nread;
         }
     }
-    if (sink) *sink = s;
     free(buf);
+    if (ok && pread_size < size && model->map) {
+        const uint8_t *ext = (const uint8_t *)model->map + pos;
+        const uint64_t ext_size = size - pread_size;
+        s ^= ext[0];
+        s ^= ext[ext_size - 1u];
+        if (read_bytes) {
+            *read_bytes = *read_bytes > UINT64_MAX - ext_size ?
+                UINT64_MAX : *read_bytes + ext_size;
+        }
+    }
+    if (sink) *sink = s;
     return ok;
 }
 
