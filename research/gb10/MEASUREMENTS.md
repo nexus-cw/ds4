@@ -407,3 +407,113 @@ confirmation below.
 - [ ] Expert reordering within a blob by co-activation affinity
 - [ ] Session working-set size from routing traces (gates the locality-training thesis, and
       now also gates how much benefit a real CUDA expert cache would realistically deliver)
+
+## MXFP4-streaming quality eval attempt: BLOCKED by a reproducible CUDA prefill crash (2026-08-01)
+
+**Goal (recorded before running):** re-run the exact 12-item `ds4-eval` subset used for the
+IQ2XXS baseline (`/tmp/ds4_eval.log`, 2026-07-31, `10/12 passed, runtime 00h:22m`, `-n 4000`
+generation cap), unchanged except for `-m`, against
+`gguf/DeepSeek-V4-Flash-MXFP4_MOE.patched.gguf --cuda --ssd-streaming
+--ssd-streaming-cache-experts 100GB` (the P3a-fix pass's measured-best config, ~2.96 t/s
+decode, ~81% hit rate), to get a comparable pass-rate/quality read at FP4 precision.
+
+**Baseline invocation reconstructed** from `/tmp/ds4_eval.log` (mtime 2026-07-31 17:02) and
+`/tmp/_eval_inner.sh` (the wrapper that produced it; not previously recorded in this file):
+
+```
+timeout 7200 ./ds4-eval -m gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
+  --cuda --ctx 16384 --questions 12 -n 4000 --trace /tmp/ds4_eval_trace.txt
+```
+
+Baseline result summary (for reference, not re-measured this pass):
+`10/12 passed, 2 failed, runtime 00h:22m`. The two failures: case 4 (GPQA Diamond, conductor
+cavity electrostatics) failed on reasoning (`got A expected C`, 313+4000=4313 tok, did **not**
+hit the token cap) and case 9 (AIME2025-02) failed at the 4000-token cap mid-derivation
+(`got 840 expected 588`, 633+4000=4633 tok, truncated).
+
+**MXFP4 invocation attempted** (same flags, `-m` swapped, streaming flags added, generous
+21600s outer timeout given the ~1/6th expected decode rate):
+
+```
+timeout 21600 ./ds4-eval -m gguf/DeepSeek-V4-Flash-MXFP4_MOE.patched.gguf \
+  --cuda --ssd-streaming --ssd-streaming-cache-experts 100GB \
+  --ctx 16384 --questions 12 -n 4000 --trace /tmp/ds4_eval_mxfp4_trace.txt
+```
+Launched via `nohup` after `sudo systemctl stop ds4-server` (confirmed stopped, `free -g`
+showed 117 GiB available before launch). `--ssd-streaming`/`--ssd-streaming-cache-experts`
+were accepted without complaint by `ds4-eval --help` — no flag conflict.
+
+**Result: every attempt failed prefill on item 1** (`GPQA Diamond/recNu3MXkvWUzHZr9`, 201
+prompt tokens) with `ds4-eval: prefill failed for recNu3MXkvWUzHZr9: cuda prefill failed` —
+no further diagnostic text, exit code 0 (eval harness itself exits cleanly after marking the
+run 0/N passed and the rest `PENDING`). This was caught within ~15s of the model finishing
+its (near-instant, streaming-mode) load — well inside the "watch the first 2 items" window
+this ticket asked for, so the full multi-hour run was not attempted.
+
+**Diagnosis (measurement/repro only, no code changed):** re-ran `./ds4-eval` with
+`--questions 1` — reproduced identically on a clean process (ruling out a one-off launch
+race). Dropped to the plain `./ds4` one-shot CLI (same `--cuda --ssd-streaming
+--ssd-streaming-cache-experts {40,100}GB`, with and without `--ctx 16384`, with and without
+`--nothink`, with and without `DS4_METAL_STREAMING_DECODE_PREFILL_MAX=4096`) to isolate the
+trigger:
+
+| prompt | words | result |
+|---|---|---|
+| `"What is the capital of France?"` | 5 | **OK** (`prefill: 1.20 t/s, generation: 2.19 t/s`) |
+| `"Explain in a few sentences how photosynthesis works."` | 8 | **OK**, with or without the `DS4_METAL_STREAMING_DECODE_PREFILL_MAX` env var (that var is Metal-named; harmless/no-op here either way) |
+| `"word "` repeated 5/15/30/60x | 5-60 (repetitive) | **OK** at every length tested (model correctly flags the input as truncated/degenerate — response quality aside, prefill itself did not fail) |
+| GPQA case-1 full prompt (astronaut/LMC, incl. choices) | ~140 | **FAIL** `cuda prefill failed` |
+| Same prompt, truncated to first sentence only | ~25 | **FAIL**, same error |
+| SuperGPQA case-2 full prompt (grass-pellets, no numbers/LaTeX) | ~25 | **FAIL**, same error |
+| Coffee-history essay prompt (benign, no domain jargon) | ~50 | **FAIL**, same error |
+| Photosynthesis prompt expanded to ~35 words of real prose | ~35 | **FAIL**, same error |
+
+Reproduced at both `--ssd-streaming-cache-experts 40GB` and `100GB` (cache size is not the
+variable), with and without an explicit `--ctx` (default ctx=32768 also fails), with and
+without `--nothink` (thinking mode is not the variable). The one clean discriminator found:
+**short (~5-10 word) or purely repetitive prompts prefill successfully; realistic prose
+prompts in the ~25-140 word range fail every time**, regardless of topic (physics, agronomy,
+history all fail equally — this is not a content/vocabulary issue, e.g. not specific to
+numbers or LaTeX-style notation). This looks like a fixed-size buffer or capacity assumption
+in the CUDA SSD-streaming prefill path (`cuda_stream_selected_cache_begin_load` /
+`cuda_stream_selected_ranges_valid` in `ds4_cuda.cu`, the same LRU-cache code path added by
+the P3a-fix pass above) being exceeded once a single prefill call has to route enough
+distinct tokens to pull in more distinct experts than whatever it was sized for — but the
+failure path taken here prints none of that function's own diagnostic `fprintf`s (e.g. "CUDA
+streaming expert id %d is outside 0..%u"), so the exact failing check was not pinned down
+further; that would require adding instrumentation, which is out of scope for a
+measurement-only unit.
+
+**Consequence: the requested 12-item MXFP4-streaming eval could not be run.** All 12 subset
+questions are realistic multi-sentence prose (the shortest, case 2, is ~25 words) and would
+be expected to hit this failure on prefill of item 1, as directly confirmed above using that
+exact prompt. No pass/fail table, no per-item timing, and no truncation-behavior comparison
+for the two baseline-failed items (GPQA case 4, AIME2025-02) are available this pass.
+
+**Scope discipline:** no source files were modified to investigate or attempt a fix — this
+is a real bug in `ds4_cuda.cu`'s SSD-streaming prefill path on the MXFP4 artifact, not a
+measurement artifact, and fixing it is a distinct, correctly-scoped follow-up unit (starting
+point: instrument or step through `cuda_stream_selected_cache_begin_load` and
+`cuda_stream_selected_ranges_valid` for the ~25-140-word prompt range, and check whether the
+same failure reproduces on the *unpatched* `DeepSeek-V4-Flash-MXFP4_MOE.gguf`, which was not
+tested this pass, to determine whether it is specific to the `.patched.gguf` dialect-compat
+conversion or general to CUDA SSD streaming on this model architecture).
+
+**Server discipline:** `ds4-server` (serving the IQ2XXS baseline model) was stopped before
+this investigation began and restarted at the end: `systemctl is-active` → `active`,
+`curl http://localhost:8000/v1/models` → `200` with the expected `deepseek-v4-flash` entry,
+confirmed after restart. No stray `ds4`/`ds4-eval` processes were left running (checked via
+`ps aux` — none found post-investigation).
+
+## Pending (updated again)
+
+- [ ] **New, blocking**: CUDA SSD-streaming prefill (`cuda_stream_selected_cache_begin_load`
+      path in `ds4_cuda.cu`) fails with a bare `cuda prefill failed` on
+      `DeepSeek-V4-Flash-MXFP4_MOE.patched.gguf` for any realistic prose prompt roughly
+      25-140 words long, at both 40GB and 100GB cache budgets, independent of `--ctx` and
+      `--nothink` — reproduced 7/7 on real-content prompts, 0/7 false-positive on short or
+      repetitive prompts (see table above). Blocks the MXFP4-streaming quality-eval subset
+      entirely (all 12 questions are in the failing length range). Needs root-causing
+      (candidate: a fixed-size buffer/capacity check in the P3a-fix LRU-cache prefill path
+      that a wider expert-routing fanout from more prefill tokens can exceed) before any
+      MXFP4-streaming eval can be attempted again.
