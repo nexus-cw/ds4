@@ -2039,3 +2039,156 @@ coherently post-restart.
    worth either committing to keeping it (with a permanent-API comment, as take 2 already
    flagged) or actually removing it once the isolation tests are no longer needed for
    active debugging.
+
+## P3c-1 take 4: test-harness bug root-caused, isolation test now 7/7 -- but a *second*, distinct MoE-integration bug found when attempting the earned default-ON flip; gate stays DEFAULT OFF (2026-08-01)
+
+Follow-on to take 3's own explicit next step ("bisect [`in=512,out=256,group=4` (passes) vs.
+`group=5` (fails)] by shrinking further ... apply the same single-lane `printf` register-dump
+technique"). Started that bisection but found the actual answer before needing device-side
+printf: re-examined `ds4_debug_mxfp4_mma_gemm()`'s own host-side code first (per the "reference-
+side issue" possibility take 3's writeup already flagged but didn't rule out) and found it.
+
+### Root cause of take 3's remaining 4/7 failures: the isolation test's CPU reference, not the kernel
+
+`ds4_debug_mxfp4_mma_gemm()` (`ds4_cuda.cu`) converts its `x_host` (float) argument to `__half`
+before the kernel ever sees it (`xh_host[i] = __float2half(x_host[i])`) -- deliberately, since
+this matches `dqg_group_gemm_mxfp4_mma`'s real `xh_group` parameter, which is always `__half` in
+production (`dqg_group_gemm`'s own signature). But `test_mxfp4_mma_gemm.c`'s `ref_row()` was
+quantizing the *un-rounded* `float` activations passed into `run_case()`, not the fp16-rounded
+values the kernel actually consumes. On small/sparse cases (`in=64,out=16`) this fp16 rounding
+essentially never crossed an E2M1 LUT bucket boundary, so the mismatch stayed invisible; on
+larger/denser random cases it increasingly did, for exactly the scattered-mismatch signature take
+3 observed (12-70% of positions, magnitudes proportional to one weight*activation LUT step) and
+its scaling with problem size (more elements => more chances of a boundary crossing).
+
+Confirmed by writing a scratch copy of the test that round-trips `x[]` through IEEE-754 binary16
+(round-to-nearest-even, implemented in plain C to avoid a `cuda_fp16.h` host-linkage dependency
+in a `.c` translation unit) before calling `ref_row()`: all 7 cases, including the two largest
+(`in=4096,out=2048,group=3` and `in=2048,out=4096,group=7`, ~6K and ~29K output elements), match
+the kernel's output *exactly*, 0 mismatches. Take 3's own two ruled-out theories (`--use_fast_math`,
+host/device `log2f` rounding) were both real dead ends -- this was a third, independent cause the
+"reference-side issue" aside in take 3's writeup had already speculated about but not chased down.
+
+### Fix: round activations through fp16 in the test's own reference
+
+`research/gb10/test_mxfp4_mma_gemm.c`: added a plain-C `float_to_half_to_float()` (manual
+IEEE-754 binary16 round-trip, RNE, no `cuda_fp16.h` dependency) and call it on `x[]` right after
+generation, before `ref_row()` -- so the reference quantizes the same activation values the
+kernel actually receives. No kernel-side code changed. `test_mxfp4_mma_gemm`: **7/7 cases pass
+exactly, 0 mismatches**, up from take 3's 3/7. `test_mxfp4_mma_diag` (kernel-side, unaffected by
+this test-only fix): still 16/16.
+
+### Attempted the earned default-ON flip -- found a second, distinct MoE-integration bug, reverted
+
+With the unit-level correctness gate now met, attempted this pass's next earned step: flipped
+`dqg_group_gemm`'s dispatch condition from opt-in (`DS4_CUDA_ENABLE_MMA_PREFILL_EXPERIMENTAL=1`
+required) to opt-out (`DS4_CUDA_DISABLE_MMA_PREFILL=1` forces the cuBLAS fallback; default ON),
+per the ticket's own instruction for the naming/polarity of the earned-gate flip. Existing tests
+(`test_mxfp4_moe`, `test_mixed_moe`, `test_mxfp4_dequant`) were re-verified passing *before* the
+flip (unaffected, gate was off). After the flip and a clean rebuild (`make clean && make
+cuda-spark`, zero warnings), re-ran the same three tests: `test_mixed_moe` and `test_mxfp4_dequant`
+still passed, but **`test_mxfp4_moe`'s second case (`n_tokens=5, n_expert=3, in=512, mid=256,
+out=256`) now failed** -- the last token's last several output columns (`out[1275..1279]` of a
+5*256=1280-element output) came back exactly `0.0` instead of the correct (large-magnitude)
+reference values, while every other element matched.
+
+This is a **different bug from the one take 3 fixed**, not a recurrence of it: the standalone
+`test_mxfp4_mma_gemm.c` harness -- which bypasses the real routed-MoE grouping/scatter machinery
+entirely via `ds4_debug_mxfp4_mma_gemm()`, calling `dqg_group_gemm_mxfp4_mma()` directly with a
+`group_size` that's just a plain token count over a contiguous `x` buffer -- kept passing 7/7 on
+the *exact same* rebuilt `ds4_cuda.o`. Toggling `DS4_CUDA_DISABLE_MMA_PREFILL=1` on/off with
+nothing else changed cleanly isolates the cause to the MMA dispatch specifically: `test_mxfp4_moe`
+passes with the off-switch set (forcing cuBLAS) and fails without it. So the kernel itself (proven
+correct at the unit level, 7/7 + 16/16) is not implicated directly -- the bug lives somewhere in
+how `dqg_group_gemm_mxfp4_mma`'s output composes with the real MoE per-expert grouping (built from
+scattered `(token, expert)`-pair rows via `pair_idx`, not test_mxfp4_mma_gemm.c's contiguous
+`0..group_size-1` token range), the multi-expert accumulate, or the down-projection scatter
+(`dqg_scatter_down_rows_kernel`) -- not yet isolated further this pass. Given the ticket's own
+explicit criterion ("existing tests pass" as a hard requirement for the default flip, "visible
+[...] degradation -> default stays OFF, report"), **reverted the flip immediately**: gate is back
+to `DS4_CUDA_ENABLE_MMA_PREFILL_EXPERIMENTAL=1` opt-in, default off. Re-verified after revert +
+another clean rebuild: `test_mxfp4_moe` passes by default (env var unset); re-running it with the
+opt-in flag set reproduces the exact same failure (`out[1275..1279]` zero) on demand, confirming
+the revert is clean and the bug is real, reproducible, and gated off.
+
+### End-to-end checks performed during the (reverted) default-ON window
+
+Before discovering the `test_mxfp4_moe` regression, ran the ticket's other earned-gate checks
+against the real 150GB artifact (`gguf/DeepSeek-V4-Flash-MXFP4_MOE.patched.gguf`,
+`--ssd-streaming --ssd-streaming-cache-experts 100GB`, `ds4-server` stopped first per protocol),
+with `DS4_CUDA_ENABLE_MMA_PREFILL_EXPERIMENTAL=1` set and `DS4_DEBUG_MMA_PREFILL=1` confirming the
+MMA kernel actually dispatched (9352 `mma-prefill` launches logged for the ~230-token prose
+prompt below, prefill token count well above the `group_size>1` threshold):
+
+- `-p "What is the capital of France?" --nothink`: `The capital of France is **Paris**.` (correct,
+  coherent). `prefill: 1.27 t/s, generation: 2.08 t/s`.
+- ~230-token prose prompt ("Write a detailed explanation of how photosynthesis works...",
+  covering light-dependent/independent reactions, C3/C4/CAM pathways, biotech applications),
+  `-n 300`: coherent, well-structured, technically accurate response under the MMA path
+  (`prefill: 3.65 t/s, generation: 1.32 t/s`) and, run again with the flag unset (cuBLAS path,
+  `prefill: 3.67 t/s, generation: 2.40 t/s`), also coherent and technically accurate -- both
+  outputs on-topic and correct, no visible quality degradation between paths (exact token-for-
+  token match not expected or checked, since default sampling is non-greedy, temp=1.0).
+- **Prefill t/s, 3 reps each, same prompt/config, MMA vs cuBLAS** (`-n 20`, isolating prefill
+  from most of the decode-time noise): MMA `3.68, 3.64, 3.67` t/s (mean 3.663); cuBLAS `3.65,
+  3.60, 3.64` t/s (mean 3.63). **Honest numeric delta: ~1% apart, within run-to-run noise --no
+  meaningful prefill speedup from the tensor-core path in this configuration.** Plausible
+  explanation (not verified further this pass): this SSD-streaming workload's prefill time is
+  dominated by NVMe/mapped-view expert fetch, not GEMM compute, so a faster GEMM kernel doesn't
+  move the end-to-end number much here.
+
+These numbers are recorded for the follow-up's benefit but should **not** be read as "the MMA
+path is validated to be quality-neutral and speed-neutral in production" -- they were collected
+before the `test_mxfp4_moe` regression was found, under a since-reverted default-ON state, and
+the France/prose prompts used happened not to trigger whatever group-construction shape triggers
+the `test_mxfp4_moe` bug. They remain useful context for whoever fixes the MoE-integration bug
+next, but the gate is not earned until `test_mxfp4_moe` (not just `test_mxfp4_mma_gemm`) passes
+with the flag on.
+
+### Gate: stays DEFAULT OFF, but for a new reason
+
+Per the ticket's own instruction ("if it degrades / not proven correct, leave the toggle default
+off"): unlike takes 2 and 3 (kernel-level correctness not yet proven), take 4 proves kernel-level
+correctness (7/7 + 16/16) but finds the *MoE-dispatch integration* is not proven correct
+(`test_mxfp4_moe` fails with the path enabled). The gate is unchanged in net effect
+(`DS4_CUDA_ENABLE_MMA_PREFILL_EXPERIMENTAL=1` opt-in required, default off), though the specific
+bug blocking it has moved from the GEMM kernel itself to its integration with the real routed-MoE
+grouping/scatter pipeline.
+
+### Tests / build
+
+`make clean && make cuda-spark`: clean, zero warnings, ~57s wall, both before and after the
+flip-and-revert (three total clean rebuilds this pass). `test_mxfp4_mma_gemm`: **7/7 cases pass
+exactly** (was 3/7). `test_mxfp4_mma_diag`: 16/16 (unchanged). `test_mxfp4_moe`: passes by default
+(flag unset); **fails reproducibly with the opt-in flag set** (`out[1275..1279]` zero, case
+`n_tokens=5,n_expert=3,in=512,mid=256,out=256`) -- this is the new finding, not a regression in
+the shipped default state. `test_mixed_moe`, `test_mxfp4_dequant`: pass in both states. `ds4-server`
+stopped before `./ds4_test` (built fresh against the final, reverted `ds4_cuda.o`); full run: `ds4
+tests: 6 failure(s)` across `logprob-vectors` and `metal-tensor-equivalence` -- both on the
+pre-existing flaky list documented by every prior pass on this hardware (take 3's own run saw 7
+failures across a 3-section subset of the same list); no new failing test names or sections.
+`ds4-server` restarted after; confirmed `active`, loaded its usual `DeepSeek-V4-Flash-IQ2XXS-
+...imatrix.gguf` normally, and answered a live France-capital chat-completion prompt correctly
+and coherently post-restart.
+
+### Follow-up (for whoever picks this up next)
+
+1. Build a **new** isolation test that goes through the real `dqg_group_gemm()` call path (or a
+   deliberately `pair_idx`-scattered synthetic group matching the real MoE dispatch's group
+   construction) instead of `ds4_debug_mxfp4_mma_gemm()`'s direct/contiguous harness, specifically
+   targeting the `test_mxfp4_moe` case-2 shape (`n_tokens=5,n_expert=3,in=512,mid=256,out=256`,
+   `n_total_expert=16`) to reproduce the `out[1275..1279]` zero-output bug independently of the
+   full `ds4_gpu_routed_moe_batch_tensor()` stack, then bisect it the same way take 3 bisected the
+   B-operand transpose (one-hot-style narrowing, then single-lane printf register dumps once a
+   small hand-traceable case is found).
+2. Once that's fixed and `test_mxfp4_moe` (plus `test_mixed_moe`, `test_mxfp4_dequant`,
+   `test_mxfp4_mma_gemm`, `test_mxfp4_mma_diag`) all pass with
+   `DS4_CUDA_ENABLE_MMA_PREFILL_EXPERIMENTAL=1` set, redo the default-ON flip (same
+   `DS4_CUDA_DISABLE_MMA_PREFILL=1` off-switch polarity already wired up and documented at the
+   `dqg_group_gemm_mxfp4_mma` call site in `ds4_cuda.cu`, ready to go) and re-collect the
+   end-to-end France/prose A/B and prefill t/s numbers under a now-actually-earned gate (this
+   pass's numbers above are a reasonable starting expectation -- near-parity with cuBLAS on this
+   SSD-streaming-bound workload -- but should be re-measured, not assumed, once the fix lands).
+3. `ds4_debug_mxfp4_mma_gemm` (the temporary isolation entry point) still carries a "TEMPORARY
+   ... to be removed before final commit" comment three passes running now -- same open question
+   take 2/3 already flagged (keep as a permanent debug API, or remove once no longer needed).

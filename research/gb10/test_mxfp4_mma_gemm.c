@@ -1,10 +1,23 @@
 /*
- * STATUS (2026-08-01): CURRENTLY FAILING on every case. Kept in-repo as
- * the reproducer for the known dsv4_mxfp4_mma_gemm_kernel numeric bug --
- * see FP4_PORT_SCOPE.md's P3c-1 take 2 section and test_mxfp4_mma_diag.c
- * for the isolating diagnostic. The MMA prefill path itself is gated
- * off by default (DS4_CUDA_ENABLE_MMA_PREFILL_EXPERIMENTAL opt-in only)
- * specifically because of this.
+ * STATUS (2026-08-01, P3c-1 take 4): PASSES 7/7. Root cause of take 3's
+ * remaining 4/7 failures was this test's own CPU reference, not the
+ * kernel: ds4_debug_mxfp4_mma_gemm() converts the float activations to
+ * __half before the kernel ever sees them (matching production's
+ * xh_group buffer, which is always __half -- see dqg_group_gemm_mxfp4_
+ * mma's `const __half *xh_group` parameter), but ref_row() below was
+ * quantizing the *un-rounded* float activations. On small/sparse cases
+ * this fp16 rounding rarely crossed an E2M1 LUT bucket boundary, so the
+ * mismatch stayed invisible; on larger/denser random cases it
+ * increasingly did, producing exactly the scattered-mismatch signature
+ * take 3 saw (a handful of elements per row, magnitudes proportional to
+ * one weight*activation LUT step). Confirmed by round-tripping the test's
+ * own x[] through fp16 before calling ref_row(): all 7 cases (including
+ * the two largest, in=4096/out=2048/group=3 and in=2048/out=4096/
+ * group=7) match exactly, 0 mismatches. Fixed here by rounding x through
+ * fp16 up front, so the reference quantizes the same activation values
+ * the kernel actually receives. See FP4_PORT_SCOPE.md's P3c-1 take 4
+ * section.
+ *
  * Standalone isolation test for dsv4_mxfp4_mma_gemm_kernel (P3c-1 take 2),
  * bypassing the routed-MoE grouping machinery entirely via the TEMPORARY
  * ds4_debug_mxfp4_mma_gemm() entry point in ds4_cuda.cu.
@@ -25,6 +38,68 @@
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
+
+/* Plain-C IEEE-754 binary16 round-to-nearest-even round-trip (float ->
+ * half -> float), used to make the CPU reference quantize the same
+ * activation values the kernel actually receives (see STATUS comment
+ * above). Avoids a cuda_fp16.h host-linkage dependency in this .c file. */
+static float float_to_half_to_float(float f) {
+    uint32_t x; memcpy(&x, &f, sizeof(x));
+    uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t exp = (int32_t)((x >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = x & 0x7FFFFFu;
+    uint16_t h;
+    if (((x >> 23) & 0xFF) == 0xFF) {
+        h = (uint16_t)(sign | 0x7C00u | (mant ? 0x200u : 0u)); /* inf/nan */
+    } else if (exp >= 0x1F) {
+        h = (uint16_t)(sign | 0x7C00u); /* overflow -> inf */
+    } else if (exp <= 0) {
+        if (exp < -10) {
+            h = (uint16_t)sign; /* underflow -> zero */
+        } else {
+            mant |= 0x800000u;
+            int shift = 14 - exp;
+            uint32_t rounded = mant >> shift;
+            uint32_t rem = mant & ((1u << shift) - 1u);
+            uint32_t halfbit = 1u << (shift - 1);
+            if (rem > halfbit || (rem == halfbit && (rounded & 1u))) rounded++;
+            h = (uint16_t)(sign | rounded);
+        }
+    } else {
+        uint32_t rounded_mant = mant >> 13;
+        uint32_t rem = mant & 0x1FFFu;
+        if (rem > 0x1000u || (rem == 0x1000u && (rounded_mant & 1u))) {
+            rounded_mant++;
+            if (rounded_mant == 0x400u) { rounded_mant = 0; exp++; }
+        }
+        if (exp >= 0x1F) { h = (uint16_t)(sign | 0x7C00u); }
+        else { h = (uint16_t)(sign | ((uint32_t)exp << 10) | rounded_mant); }
+    }
+    uint32_t hs = (h >> 15) & 1u;
+    uint32_t he = (h >> 10) & 0x1Fu;
+    uint32_t hm = h & 0x3FFu;
+    uint32_t fbits;
+    if (he == 0) {
+        if (hm == 0) { fbits = hs << 31; }
+        else {
+            int e = -1;
+            uint32_t m = hm;
+            while (!(m & 0x400u)) { m <<= 1; e--; }
+            m &= 0x3FFu;
+            uint32_t fe = (uint32_t)(127 - 15 + 1 + e);
+            fbits = (hs << 31) | (fe << 23) | (m << 13);
+        }
+    } else if (he == 0x1Fu) {
+        fbits = (hs << 31) | 0x7F800000u | (hm << 13);
+    } else {
+        uint32_t fe = he - 15 + 127;
+        fbits = (hs << 31) | (fe << 23) | (hm << 13);
+    }
+    float r; memcpy(&r, &fbits, sizeof(r)); return r;
+}
+static void round_trip_half(float *x, uint64_t n) {
+    for (uint64_t i = 0; i < n; i++) x[i] = float_to_half_to_float(x[i]);
+}
 
 #define QK_MXFP4 32
 
@@ -150,6 +225,11 @@ static int run_case(uint32_t in_dim, uint32_t out_dim, uint32_t group_size) {
     }
     float *x = (float *)malloc((size_t)group_size * in_dim * sizeof(float));
     for (uint64_t i = 0; i < (uint64_t)group_size * in_dim; i++) x[i] = rng_unit();
+    /* ds4_debug_mxfp4_mma_gemm converts x to __half before the kernel
+     * sees it (matching production's xh_group buffer) -- round-trip here
+     * so the reference quantizes the same values the kernel actually
+     * receives. See STATUS comment at the top of this file. */
+    round_trip_half(x, (uint64_t)group_size * in_dim);
 
     float *ref_out = (float *)calloc((size_t)group_size * out_dim, sizeof(float));
     ref_row(ref_out, w, in_dim, out_dim, x, group_size, out_dim);

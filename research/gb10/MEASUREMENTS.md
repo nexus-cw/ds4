@@ -993,3 +993,29 @@ remaining 4/7 randomized cases still fail; root cause not yet isolated (fast-mat
 host/device `log2f` non-determinism theories were tested and ruled out). The P3b grouped
 dequant+cuBLAS path (~4.6-4.64 t/s prefill, entry above) remains the production path,
 unchanged by this pass.
+
+## P3c-1 take 4: MMA-vs-cuBLAS prefill A/B, ~230-token prose prompt (2026-08-01)
+
+Collected while `DS4_CUDA_ENABLE_MMA_PREFILL_EXPERIMENTAL`'s default was briefly flipped ON for
+testing this pass (since reverted -- see FP4_PORT_SCOPE.md's P3c-1 take 4 section for why:
+`test_mxfp4_moe` regressed, a MoE-integration bug distinct from the now-fixed GEMM kernel bug).
+Recorded here as reference data for whoever picks up the follow-up, not as a validated production
+number. Model: `gguf/DeepSeek-V4-Flash-MXFP4_MOE.patched.gguf` (150GB), `--cuda --ssd-streaming
+--ssd-streaming-cache-experts 100GB --nothink`, `ds4-server` stopped first. Prompt: ~230-token
+prose prompt asking for a detailed photosynthesis explanation (light/dark reactions, C3/C4/CAM
+pathways, biotech applications), `-n 20` (isolating prefill from most decode-time noise), 3 reps
+each, same warm NVMe/page-cache state, back-to-back:
+
+| Path | rep 1 | rep 2 | rep 3 | mean |
+|---|---|---|---|---|
+| MMA (`DS4_CUDA_ENABLE_MMA_PREFILL_EXPERIMENTAL=1`, confirmed dispatching via `DS4_DEBUG_MMA_PREFILL=1`, 9352 `mma-prefill` launches logged) | 3.68 t/s | 3.64 t/s | 3.67 t/s | 3.663 t/s |
+| cuBLAS (flag unset, existing production path) | 3.65 t/s | 3.60 t/s | 3.64 t/s | 3.63 t/s |
+
+**~1% apart, within run-to-run noise -- no meaningful prefill speedup from the tensor-core MMA
+path in this configuration.** Both paths also produced coherent, technically accurate, on-topic
+`-n 300` completions on the same prompt (not byte-identical, since default sampling is non-greedy
+temp=1.0, but no visible quality difference). Plausible explanation for the lack of speedup (not
+verified further this pass): this SSD-streaming workload's prefill time is likely dominated by
+NVMe/mapped-view expert fetch rather than GEMM compute, so a faster GEMM kernel doesn't move the
+end-to-end number much here -- worth confirming with a profiler once the MoE-integration bug is
+fixed and the gate is re-earned.

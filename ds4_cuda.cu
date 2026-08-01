@@ -21821,9 +21821,12 @@ __global__ static void dqg_scatter_down_rows_kernel(
  * Gated by DSV4_MXFP4_MMA_AVAILABLE (compile-time __CUDA_ARCH__ 1200..1300,
  * mirroring llama.cpp's BLACKWELL_MMA_AVAILABLE convention -- see
  * ggml-cuda/common.cuh @5f55650) and, at the call site, by a runtime
- * sm_121-only capability check plus the DS4_CUDA_DISABLE_MMA_PREFILL escape
- * hatch. Falls back to the existing dequant+cuBLAS path
- * (dqg_group_gemm's tail below) whenever unsupported/disabled/failed.
+ * sm_121-only capability check plus the DS4_CUDA_ENABLE_MMA_PREFILL_
+ * EXPERIMENTAL opt-in (default off -- see the KNOWN BROKEN AT THE
+ * MOE-INTEGRATION LEVEL comment on dqg_group_gemm_mxfp4_mma's call site
+ * below for why, current as of P3c-1 take 4). Falls back to the existing
+ * dequant+cuBLAS path (dqg_group_gemm's tail below) whenever unsupported/
+ * disabled/failed.
  *
  * Ported primitives (MIT, llama.cpp @5f55650, see research/gb10/
  * FP4_PORT_SCOPE.md's P3c-1 sections for the full derivation this is based
@@ -22169,39 +22172,59 @@ static int dqg_group_gemm(
         int logical_tier) {
     if (!out_group || !w || !xh_group || !wh_scratch || !g_cublas_ready) return 0;
 
-    /* P3c-1 take 2: native MXFP4 tensor-core MMA path, sm_121a only.
+    /* P3c-1 take 2-4: native MXFP4 tensor-core MMA path, sm_121a only.
      *
-     * KNOWN BROKEN, DEFAULT OFF -- do not flip the default without fixing
-     * the bug documented below and re-running research/gb10/
-     * test_mxfp4_mma_diag.c / test_mxfp4_mma_gemm.c as the correctness
-     * gate. The probe (mxf4_probe.cu) confirms the raw PTX
-     * mma.sync...kind::mxf4.block_scale instruction itself compiles and
-     * executes correctly on this hardware/toolchain (D==64.0 exactly).
-     * dsv4_mxfp4_mma_gemm_kernel (above) builds on that with ported
-     * tile<>/load_ldmatrix/load_generic layout primitives from
-     * llama.cpp's mma.cuh (MIT, @5f55650) plus an independently-derived
-     * activation (B-operand) quantize+pack matching
-     * quantize_mmq_mxfp4's output byte layout -- it compiles clean and
-     * produces plausible (GEMM-shaped, right order of magnitude)
-     * output, but is numerically WRONG: a one-hot diagnostic
-     * (research/gb10/test_mxfp4_mma_diag.c -- weight row r has a single
-     * nonzero element at k=r, distinct per-k activation values) shows
-     * only 2 of 16 output rows (a fixed, lane-correlated pair) come out
-     * correct; the rest are silently zero. This narrows the bug to the
-     * A-operand (weight) ldmatrix addressing or the tile_C write-back
-     * lane mapping -- ported directly from llama.cpp's own formulas, so
-     * either the port has a transcription error not yet found, or (less
-     * likely, since the probe's own D==64 check exercises a superset of
-     * the same asm operands) there's a subtlety in how those formulas
-     * compose when used outside the donor's full templated MMQ
-     * scheduling context (e.g. an implicit assumption about nwarps>1 or
-     * SRAM tile width that a single-warp, single-k64-chunk-at-a-time
-     * specialization violates). Follow-up should bisect A vs C
-     * independently (e.g. force B to an all-ones constant with a known
-     * scale, or dump A.x[]/C.x[] via device printf for a single lane)
-     * before trusting this path's numbers again. See
-     * research/gb10/FP4_PORT_SCOPE.md's P3c-1 take 2 section for the
-     * full writeup.
+     * KNOWN BROKEN AT THE MOE-INTEGRATION LEVEL, DEFAULT OFF -- do not
+     * flip the default again without first fixing the bug documented
+     * below and adding a regression case to research/gb10/
+     * test_mxfp4_moe.c for it.
+     *
+     * Kernel-level correctness IS proven: research/gb10/
+     * test_mxfp4_mma_diag.c (one-hot, 16/16) and test_mxfp4_mma_gemm.c
+     * (randomized, 7/7 -- in=64..4096, out=16..4096, group=1..7) both
+     * pass exactly as of take 4 (see FP4_PORT_SCOPE.md's P3c-1 take 4
+     * section: take 3's remaining 4/7 randomized failures turned out to
+     * be the isolation test's own CPU reference not accounting for the
+     * float->__half rounding ds4_debug_mxfp4_mma_gemm() applies before
+     * the kernel ever sees the activations -- fixed in the test, not the
+     * kernel).
+     *
+     * But take 4 also *tried* flipping this gate's default to ON (same
+     * DS4_CUDA_DISABLE_MMA_PREFILL=1 off-switch design as originally
+     * planned) and that broke research/gb10/test_mxfp4_moe.c's second
+     * case (n_tokens=5, n_expert=3, in=512, mid=256, out=256): the last
+     * token's last two output columns (out[1278], out[1279] of a
+     * 5*256=1280-element output) came back exactly 0.0 instead of the
+     * correct (large) reference value, while test_mxfp4_mma_gemm.c's own
+     * standalone GEMM harness -- which bypasses the real routed-MoE
+     * grouping/scatter machinery entirely, going straight from a
+     * (in_dim, out_dim, group_size) triple to
+     * dsv4_mxfp4_mma_gemm_kernel -- keeps passing 7/7 on the exact same
+     * kernel binary. Confirmed by toggling DS4_CUDA_DISABLE_MMA_PREFILL=1
+     * on/off with nothing else changed: test_mxfp4_moe passes with it
+     * set (forcing the cuBLAS path), fails without it (MMA path). This
+     * means there's a second, distinct bug somewhere in how
+     * dqg_group_gemm_mxfp4_mma's output composes with the real MoE
+     * per-expert grouping/pair_idx-scatter/multi-expert-accumulate
+     * pipeline (dqg_group_gemm's callers, dqg_scatter_down_rows_kernel,
+     * or the routing group construction upstream) -- not yet isolated;
+     * the standalone GEMM test's own group_size parameter, while it
+     * covers a wide range of values (1..7), is NOT equivalent to a real
+     * MoE dispatch's per-expert group (built from scattered (token,
+     * expert)-pair rows via pair_idx, not a contiguous 0..group_size-1
+     * token range), so it doesn't exercise whatever this bug actually
+     * is. Follow-up should build a *new* isolation test that goes
+     * through the real dqg_group_gemm() call path (or a deliberately
+     * pair_idx-scattered synthetic group) instead of
+     * ds4_debug_mxfp4_mma_gemm()'s direct/contiguous harness, to
+     * reproduce and bisect this independently of the full
+     * ds4_gpu_routed_moe_batch_tensor() stack.
+     *
+     * Ported primitives (MIT, llama.cpp @5f55650, see research/gb10/
+     * FP4_PORT_SCOPE.md's P3c-1 sections for the full derivation this is
+     * based on): the tile<16,8,int>/tile<8,8,int>/tile<16,8,float>
+     * physical register layouts, load_ldmatrix, and mma_block_scaled_fp4
+     * wrapper.
      *
      * Requires explicit opt-in (DS4_CUDA_ENABLE_MMA_PREFILL_EXPERIMENTAL=1)
      * specifically so no default build path can silently compute wrong
