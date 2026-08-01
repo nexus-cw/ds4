@@ -1625,3 +1625,109 @@ sm_121 gating specifics; if no such toolkit is obtainable in this sovereignty-co
 environment, P3c-1's native-tensor-core-MXFP4-prefill goal is blocked until one is, and the
 existing P3b grouped-dequant+cuBLAS path (~4.6-4.64 t/s prefill) remains the fastest
 available prefill path for MXFP4 experts.
+
+## P3c-1 correction: prior "toolkit-vintage gap" verdict was WRONG -- probe invocation bug, not a real gap (2026-08-01)
+
+**Discriminator: does llama.cpp's own CUDA backend compile its MXFP4 tensor-core (block-scaled
+mma) path with this box's CUDA 13.0 toolkit for arch 121?** Built `~/src/llama.cpp` @`5f55650`
+CUDA backend from scratch (`cmake -B build-cuda -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=121
+-DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc`, `cmake --build build-cuda --target
+ggml-cuda -j 20`, ~7 min wall). **Verdict: (a) COMPILES WITH REAL MMA SASS.** Both
+`ggml/src/ggml-cuda/template-instances/mmq-instance-mxfp4.cu.o` and `mmq-instance-nvfp4.cu.o`
+compiled clean (no errors/warnings on those files), and `cuobjdump -sass` on the objects shows
+genuine block-scaled tensor-core instructions, not a scalar/fallback path:
+
+```
+mmq-instance-mxfp4.cu.o:  OMMA.SF.16864.F32.E2M1.E2M1.E8        R124, R92, R156, RZ, R42, R86, URZ ;
+mmq-instance-nvfp4.cu.o:  OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X  R56, R56, R60, RZ, R20, R24, URZ ;
+```
+
+(`cuobjdump -elf` confirms `arch = sm_121a`.) `cuobjdump -ptx` on the mxfp4 object shows the
+exact PTX idiom that lowered to that SASS -- identical instruction text to our standalone
+probe's inline asm:
+
+```
+mma.sync.aligned.kind::mxf4.block_scale.scale_vec::2X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0
+    {%f27, %f28, %f29, %f30}, {%r487, %r488, %r489, %r490}, {%r507, %r508},
+    {%f27, %f28, %f29, %f30}, %r509, {0, 0}, %r510, {0, 0};
+```
+
+**Root cause of the earlier probe's blanket failure, found and reproduced**: it was an `nvcc`
+*invocation* bug in the probe, not a toolkit/hardware gap. `nvcc -arch=sm_121a` (the bare
+shorthand -- one of the 14 spellings the prior pass tried) is **not** equivalent to requesting
+only the `sm_121a` target. `nvcc --dryrun` shows it silently expands to build **two** device
+images: (1) a forward-compatible virtual-PTX image compiled for the *base, non-"a"* virtual
+arch `compute_121` (`cicc -arch compute_121 ...`, then `ptxas -arch=compute_121 ...`) -- meant
+to let the fatbinary JIT onto future non-family-specific hardware -- **and** (2) the real
+`compute_121a`/`sm_121a` cubin (`cicc -arch compute_121a ...` then `ptxas -arch=sm_121a ... -o
+....sm_121a.cubin`). Block-scaled MXFP4 MMA is a **family-specific** ("a"-suffixed-only) ISA
+extension, absent from the base `compute_121`/`sm_121` target -- so step (1)'s `ptxas
+-arch=compute_121` invocation is the one that hits the "not supported on target sm_121" wall
+(reproduced verbatim: `error: Instruction 'mma with block scale' not supported on .target
+'sm_121'` etc.), and `nvcc` treats that failure as fatal for the whole compile, aborting before
+step (2) -- the cubin that would have succeeded -- is ever reported. This masked the real
+result for every one of the 14 `-arch=X` spellings tried previously (all of them route through
+the same bare-shorthand expansion). Reproduced live on robo-dog:
+
+```
+$ nvcc -arch=sm_121a -o /tmp/probe_121a mxf4_probe.cu
+ptxas .../mxf4_probe.compute_121.ptx, line 31; error: Instruction 'mma with block scale' not supported on .target 'sm_121'
+  [... same 4 errors as the original probe report, exit via fatal ptxas on the base-PTX image ...]
+
+$ nvcc --generate-code=arch=compute_121a,code=[compute_121a,sm_121a] -std=c++17 -o /tmp/probe_gencode mxf4_probe.cu
+[compiles clean, no ptxas errors]
+```
+
+**Fix for anyone re-running the probe or any standalone `.cu` targeting a family-specific SM**:
+use `-gencode`/`--generate-code=arch=compute_121a,code=[compute_121a,sm_121a]` explicitly (no
+bare `compute_121`/`sm_121` fallback image requested) -- exactly the invocation
+`ggml/CMakeLists.txt`'s CUDA-arch machinery already produces for `-DCMAKE_CUDA_ARCHITECTURES=121`
+(CMake logs `Replacing 121 in CMAKE_CUDA_ARCHITECTURES with 121a` and never asks for a bare
+`compute_121`/`sm_121` companion image). Never use the bare `-arch=sm_121a` (or any bare
+`-arch=` family-suffixed) shorthand for this instruction class.
+
+**No `CUDART_VERSION` gate is in play here for CUDA 13.0** -- `BLACKWELL_MMA_AVAILABLE` in
+`ggml/src/ggml-cuda/common.cuh:286-288` is purely an `__CUDA_ARCH__` device-code macro:
+```
+#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL && __CUDA_ARCH__ < GGML_CUDA_CC_RUBIN
+#    define BLACKWELL_MMA_AVAILABLE
+#endif
+```
+with `GGML_CUDA_CC_BLACKWELL=1200`, `GGML_CUDA_CC_DGX_SPARK=1210` (robo-dog's sm_121a, folded
+into the same bucket), `GGML_CUDA_CC_RUBIN=1300` -- unconditional on toolkit version. The only
+`CUDART_VERSION >= 12080` gates in the CUDA backend (`common.cuh:822`, `quantize.cu` x5,
+`vendors/cuda.h:18`) guard unrelated host-side `nv_bfloat16`/`__nv_fp8_e4m3` E8M0/E4M3
+scalar-conversion helpers, not the `mma.sync...block_scale` instruction itself; they're
+satisfied trivially by CUDA 13.0 (>= 12080) regardless. The ticket's premise that llama.cpp
+"gates FP4 paths at CUDART_VERSION >= 12080" refers to those scalar-conversion helpers, not to
+whether the tensor-core MMA path itself compiles for a given SM -- that's controlled solely by
+which `-arch`/`-gencode` spelling is used, per the invocation-bug finding above.
+
+**Bonus/non-blocking finding, not required by the ticket**: running the correctly-recompiled
+standalone probe (`--generate-code=arch=compute_121a,code=[compute_121a,sm_121a]`) executes
+without error but returns numerically wrong output -- `D == 32.0` in all 128 output floats,
+not the expected `64.0`. This is consistent with the probe's simplistic register-layout
+assumption being wrong specifically for `scale_vec::2X`: `k64` is split into two `k32`
+sub-blocks each needing its own E8M0 scale byte packed into the `a_scale`/`b_scale` registers,
+and the probe only populates byte 0 (leaving the second sub-block's scale byte 0x00 ->
+~2^-127, i.e. that half's contribution collapses to ~0, halving the sum from 64 to 32). This is
+a probe-numerics bug to fix in a follow-up pass, not a toolchain/hardware blocker -- the
+tensor-core path itself compiles and executes (produces nonzero, deterministic output); getting
+the per-lane/per-subblock operand layout exactly right is the next step before any ds4 kernel
+port, and llama.cpp's own `tile<>`/`load_ldmatrix` fragment-loading code (which this pass did
+not need to reverse-engineer to answer the discriminator question) is the reference to copy the
+layout from rather than re-deriving it.
+
+**Verdict for the ds4 kernel-design question**: **(a)** -- this toolkit and this hardware
+(CUDA 13.0.88, sm_121a) both fully support the block-scaled MXFP4/NVFP4 tensor-core MMA path;
+nothing blocks porting it into ds4's grouped-prefill kernel at the toolchain level. The
+remaining work is strictly the operand/register-layout correctness (per the bonus finding
+above), to be derived from llama.cpp's `tile<>` fragment-loading code in `mma.cuh`, not a
+toolchain workaround. P3b's grouped-dequant+cuBLAS path (~4.6-4.64 t/s prefill) remains the
+current production path until that layout work lands.
+
+No ds4-server activity was needed or performed this pass (compile-only investigation against a
+scratch `~/src/llama.cpp` build tree, never committed). Bonus benchmark step (llama-cli FP4-MMA
+prefill on `DeepSeek-V4-Flash-MXFP4_MOE.patched.gguf`) was skipped per the ticket's own
+guidance: full `-ngl 99` offload doesn't fit (150GB model > 121GB unified memory) and a partial
+offload wasn't attempted as it wasn't required and risked OOM.

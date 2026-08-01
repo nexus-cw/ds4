@@ -866,6 +866,24 @@ model-server activity (server was never touched this pass). P3b's grouped
 dequant+cuBLAS prefill path (~4.6-4.64 t/s on the ~300-token prompt, see the P3b item 2
 entry above) remains the current-best prefill path.
 
+**CORRECTION (2026-08-01, same day, follow-up pass)**: the above "fails to assemble on every
+target" verdict was a probe-invocation bug, not a real toolkit/hardware gap. Building
+llama.cpp's own CUDA backend (`ggml-cuda` target, arch 121) against this same
+`/usr/local/cuda-13.0` toolkit compiles the identical `mma.sync...block_scale` instruction
+into real `OMMA.SF.16864.F32.E2M1.E2M1.E8`/`...UE4M3.4X` tensor-core SASS with no errors. Root
+cause: bare `-arch=sm_121a` (and all 14 spellings tried previously) implicitly requests a
+second, forward-compatible PTX image for the *non*-"a" base target (`compute_121`), and that
+companion image is what `ptxas` rejects -- masking that the real `sm_121a` cubin would have
+built fine. Fix: use `--generate-code=arch=compute_121a,code=[compute_121a,sm_121a]` (what
+CMake already does for `-DCMAKE_CUDA_ARCHITECTURES=121`), never the bare `-arch=` shorthand,
+for family-specific ("a"-suffixed) instructions. Verdict is now **(a) COMPILES WITH REAL MMA
+SASS** -- see the "P3c-1 correction" section in `FP4_PORT_SCOPE.md` for full evidence
+(SASS/PTX dumps, dryrun repro, macro-chain audit). No toolkit/hardware blocker remains for
+porting this into ds4; a probe-numerics bug (missing second E8M0 scale byte for
+`scale_vec::2X`'s two k32 sub-blocks, giving D==32.0 instead of 64.0) is the next thing to fix
+before layout work starts, not a compiler gate. P3b's grouped dequant+cuBLAS path remains the
+current production prefill path pending that layout work.
+
 ## DSpark drafter measurement spike: gated by `--ssd-streaming` / `--mtp` mutual exclusion (2026-08-01)
 
 **Motivation.** Streamed MXFP4 decode (`gguf/DeepSeek-V4-Flash-MXFP4_MOE.patched.gguf`,
