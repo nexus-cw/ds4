@@ -1558,3 +1558,70 @@ removes the allocator cost but not the memcpy work, 100% wasted at a 0%-hit-rate
 essentially every call at this budget -- flagged as next steps in `MEASUREMENTS.md`'s "P3b
 item 3" section, which has the full numbers and analysis. `make clean && make cuda-spark`:
 clean, no warnings. `test_mxfp4_moe`/`test_mixed_moe`/`test_mxfp4_dequant`: all pass.
+
+## P3c-1: sm_121 mxf4 tensor-core probe -- BLOCKED at toolchain level (2026-08-01)
+
+Scope: replace the dequant-to-f16 + cuBLAS step inside the grouped-prefill path
+(`routed_moe_dequant_gemm_dispatch_prefill_grouped`, the P3b item 2 target above) with
+direct MXFP4 tensor-core GEMM kernels consuming the 17-byte blocks natively, via donor
+`mma.sync.aligned.kind::mxf4.block_scale...m16n8k64` from llama.cpp `mma.cuh` (gated there
+on `__CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL(1200)`, which includes `GGML_CUDA_CC_DGX_SPARK
+= 1210` i.e. our sm_121).
+
+**Per the ticket's own instruction, a 20-line standalone probe was written and run FIRST,
+before any integration work.** Probe (`research/gb10/mxf4_probe.cu`, kept in-repo as
+evidence): one warp, one `mma.sync.aligned.kind::mxf4.block_scale.scale_vec::2X.m16n8k64.
+row.col.f32.e2m1.e2m1.f32.ue8m0` call with uniform operands -- every A/B nibble set to
+E2M1 table index 2 (value 1.0 after the kvalues_mxfp4 `*0.5` convention), every E8M0 scale
+byte set to 127 (2^0 = 1.0) -- so the expected D is exactly 64.0f in all 128 output floats
+(sum of 64 k-products of 1*1, scale 1*1) **regardless of the per-lane element permutation**,
+making it a layout-independent correctness check without needing to reverse-engineer the
+donor's `tile<>`/`load_ldmatrix` thread-mapping first.
+
+**Result: PROBE FAILS TO COMPILE on every target this toolkit's `ptxas` accepts** -- not
+merely on sm_121. Compiled with `nvcc -arch=<X>` for X in {`sm_121`, `sm_121a`, `sm_121f`,
+`compute_121a`, `compute_121f`, `sm_120`, `sm_120a`, `sm_120f`, `compute_120a`,
+`compute_120f`, `sm_100`, `sm_100a`, `sm_103a`, `sm_110a`} (i.e. GB10 itself, every
+Blackwell/DGX-Spark-family and "a"/"f" variant spelling, and datacenter Blackwell sm_100/103
+for comparison), identical `ptxas` errors on all of them:
+
+```
+ptxas ..., line 31; error   : Instruction 'mma with block scale' not supported on .target 'sm_121'
+ptxas ..., line 31; error   : Feature '.kind::mxf4' not supported on .target 'sm_121'
+ptxas ..., line 31; error   : Feature '.block_scale' not supported on .target 'sm_121'
+ptxas ..., line 31; error   : Feature '.scale_vec::2X' not supported on .target 'sm_121'
+ptxas fatal   : Ptx assembly aborted due to errors
+```
+
+(target name in the message tracks whichever `-arch` was passed; error set identical across
+all 14 targets tried). Also re-tried with the `mxf4nvf4`/`scale_vec::4X`/`ue4m3` (NVFP4)
+variant of the same instruction on the "a" targets -- same rejection.
+
+Toolchain: `/usr/local/cuda-13.0` (`nvcc`/`ptxas` release 13.0.88, Aug 2025 build; the only
+CUDA install present on robo-dog -- `/usr/local/cuda-13`/`/usr/local/cuda` both symlink to
+it, no alternate/older toolkit to fall back to). `nvcc --list-gpu-arch` on this install caps
+out at `compute_121` with no `f`/`a`-suffixed entries listed at all (the `f`/`a` suffixes
+were accepted syntactically by `nvcc` but produced byte-identical `ptx`/errors to the
+unsuffixed target, i.e. this `ptxas` build doesn't distinguish family/arch-conditional
+variants for these SMs). `ptxas` itself parses `.kind::mxf4`/`.block_scale`/`.scale_vec::2X`
+as recognized PTX tokens (the errors are "not supported on this target", not "unknown
+directive") -- so the PTX ISA grammar exists in this `ptxas`, but its SASS-generation
+backend has no codegen for it on any target it will assemble for, including sm_100/103
+(datacenter Blackwell, not just consumer/DGX-Spark). This reads as a toolkit-vintage gap
+(this instruction class may need a CUDA 12.8/12.9-era `ptxas` per NVIDIA's original Blackwell
+block-scaled-MMA rollout, and something about the 13.0 release on this box's sbsa-linux
+target either regressed or never carried the codegen) rather than an sm_121-specific
+hardware/gating gap -- but that is inference from the evidence above, not confirmed against
+an NVIDIA changelog (none found locally; no internet access from this pass).
+
+**Per the ticket's explicit instruction ("if the toolchain rejects mxf4 for this arch, STOP
+and report the exact error -- do not fight the compiler for hours"), this pass stops here.**
+No kernel-design or integration work was attempted (constraints #2/#3/#4 in the ticket are
+moot until the probe passes on some toolchain). No model server activity was needed or
+performed this pass (server left running throughout, never touched). Concrete next step for
+whoever picks this up: try an older/newer CUDA toolkit install on robo-dog specifically for
+its `ptxas` block-scaled-MMA codegen support (12.8/12.9 first) before spending more time on
+sm_121 gating specifics; if no such toolkit is obtainable in this sovereignty-constrained
+environment, P3c-1's native-tensor-core-MXFP4-prefill goal is blocked until one is, and the
+existing P3b grouped-dequant+cuBLAS path (~4.6-4.64 t/s prefill) remains the fastest
+available prefill path for MXFP4 experts.

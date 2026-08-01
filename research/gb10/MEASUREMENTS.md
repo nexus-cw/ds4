@@ -848,3 +848,20 @@ entry's numbers measure).
 
 **Verification.** `make clean && make cuda-spark`: clean rebuild, no warnings.
 `test_mxfp4_moe`/`test_mixed_moe`/`test_mxfp4_dequant`: all pass.
+
+## P3c-1: sm_121 mxf4 tensor-core prefill probe (2026-08-01)
+
+Standalone probe only -- no kernel/integration measurements this pass, blocked at the
+compiler-acceptance gate before reaching any runnable code. See `FP4_PORT_SCOPE.md`'s
+"P3c-1" section for the full writeup; short version: `research/gb10/mxf4_probe.cu`
+(`mma.sync.aligned.kind::mxf4.block_scale.scale_vec::2X.m16n8k64...`, layout-independent
+uniform-1.0-operand self-check expecting D==64.0f everywhere) fails to assemble under
+`/usr/local/cuda-13.0`'s `ptxas` for every target tried -- `sm_121`/`sm_121a`/`sm_121f`
+(GB10 itself), `sm_120`/`sm_120a`/`sm_120f`, `compute_120a`/`compute_120f`,
+`compute_121a`/`compute_121f`, and `sm_100`/`sm_100a`/`sm_103a`/`sm_110a` (datacenter
+Blackwell, for comparison) -- with identical `Feature '...' not supported on .target '...'`
+errors across the board, both for the mxf4/ue8m0 and mxf4nvf4/ue4m3 variants. No compile
+succeeded, so no run, no A/B numbers, no `make cuda-spark` build of this feature, and no
+model-server activity (server was never touched this pass). P3b's grouped
+dequant+cuBLAS prefill path (~4.6-4.64 t/s on the ~300-token prompt, see the P3b item 2
+entry above) remains the current-best prefill path.
