@@ -844,6 +844,13 @@ static void *g_stream_selected_stage[4];
 static cudaEvent_t g_stream_selected_stage_event[4];
 static uint64_t g_stream_selected_stage_bytes;
 static cudaStream_t g_stream_selected_upload_stream;
+/* Staging-buffer cursor shared across grouped async copies (adapted from
+ * antirez/ds4#605 by iCreil): buffer reuse is fenced by the per-buffer
+ * events, so back-to-back async copies (e.g. the three tensors of one
+ * streamed expert) pipeline the host read of one tensor with the device
+ * upload of the previous one instead of fully synchronizing after each
+ * tensor. */
+static uint64_t g_stream_selected_stage_cursor;
 
 static int cuda_ok(cudaError_t err, const char *what);
 static const char *cuda_model_range_ptr_from_fd(
@@ -2082,22 +2089,67 @@ static int cuda_stream_selected_stage_pool_alloc(uint64_t bytes) {
         }
     }
     g_stream_selected_stage_bytes = bytes;
+    g_stream_selected_stage_cursor = 0;
     return 1;
 }
 
-static int cuda_model_copy_to_device_streamed(
+/* Adapted from antirez/ds4#605 by iCreil ("CUDA streaming: pipeline the
+ * streamed expert upload path" + "...default streamed expert uploads to
+ * plain copy without O_DIRECT"). Flushing (cudaStreamSynchronize) is
+ * pulled out of the per-tensor copy into a separate function so callers
+ * that issue several related async copies back to back (gate/up/down of
+ * one expert) can group them into a single async batch with one flush at
+ * the end -- the ring-buffer cursor above is shared across the whole
+ * group instead of restarting at 0 for each tensor, so the host read of
+ * tensor N+1 overlaps the device upload of tensor N. */
+static int cuda_model_copy_to_device_streamed_flush(const char *what) {
+    if (!g_stream_selected_upload_stream) return 1;
+    const cudaError_t err =
+        cudaStreamSynchronize(g_stream_selected_upload_stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA streaming selected upload sync failed for %s: %s\n",
+                what ? what : "expert", cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return 1;
+}
+
+static int cuda_model_copy_to_device_streamed_ex(
         char *dst,
         const void *model_map,
         uint64_t model_size,
         uint64_t offset,
         uint64_t bytes,
-        const char *what) {
+        const char *what,
+        int flush) {
     if (!dst || !model_map || offset > model_size ||
         bytes > model_size - offset) {
         return 0;
     }
     if (bytes == 0) return 1;
-    if (g_model_fd < 0 ||
+    /* Adapted from antirez/ds4#605 by iCreil ("...default streamed expert
+     * uploads to plain copy without O_DIRECT"): our LRU miss path (the only
+     * caller of this function) always has a real O_DIRECT fd when
+     * --ssd-streaming is reading from the actual backing SSD
+     * (g_model_direct_fd >= 0), so the staged pread+pipelined-upload path
+     * below stays the default there. When there is no O_DIRECT read path
+     * (tmpfs/page-cache-backed maps, or the fd-less cudaMemcpy branch just
+     * below), upload straight from the pageable model map and let the CUDA
+     * driver stage internally -- avoids the pread bounce entirely.
+     * DS4_CUDA_STREAM_MISS_PLAIN_COPY=1/0 forces either way regardless of
+     * the O_DIRECT state, for measurement. */
+    static int plain_copy = -1;
+    if (plain_copy < 0) {
+        const char *env = getenv("DS4_CUDA_STREAM_MISS_PLAIN_COPY");
+        if (env && env[0]) {
+            plain_copy = strcmp(env, "0") != 0;
+        } else {
+            plain_copy = g_model_direct_fd < 0 ? 1 : 0;
+        }
+    }
+    if (g_model_fd < 0 || plain_copy ||
         (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base)) {
         return cuda_ok(cudaMemcpy(dst,
                                   (const char *)model_map + offset,
@@ -2106,18 +2158,36 @@ static int cuda_model_copy_to_device_streamed(
                        what ? what : "stream selected expert copy");
     }
 
-    const uint64_t chunk = cuda_model_copy_chunk_bytes();
+    /* Adapted from antirez/ds4#605 by iCreil ("...pipeline the streamed
+     * expert upload path"): small chunks (2 MiB default, overridable via
+     * DS4_CUDA_STREAM_COPY_CHUNK_MB) let the host read of chunk i+1 overlap
+     * the device upload of chunk i through the 4-buffer ring -- the model-
+     * load default chunk size (64 MiB) would otherwise serialize each
+     * ~4-14 MiB expert tensor into a single read-then-upload pass with no
+     * overlap opportunity at all. */
+    static uint64_t stream_chunk;
+    if (stream_chunk == 0) {
+        uint64_t mb = 2;
+        const char *env = getenv("DS4_CUDA_STREAM_COPY_CHUNK_MB");
+        if (env && env[0]) {
+            char *end = NULL;
+            unsigned long long v = strtoull(env, &end, 10);
+            if (end != env && v > 0) mb = (uint64_t)v;
+        }
+        stream_chunk = mb * 1048576ull;
+    }
+    uint64_t chunk = cuda_model_copy_chunk_bytes();
+    if (chunk > stream_chunk) chunk = stream_chunk;
     const uint64_t stage_bytes =
         chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
     if (!cuda_stream_selected_stage_pool_alloc(stage_bytes)) return 0;
 
     uint64_t copied = 0;
-    uint64_t chunk_idx = 0;
     while (copied < bytes) {
         const uint64_t n = bytes - copied < chunk ? bytes - copied : chunk;
-        const uint64_t bi = chunk_idx % 4u;
+        const uint64_t bi = g_stream_selected_stage_cursor % 4u;
         cudaError_t err;
-        if (chunk_idx >= 4u) {
+        if (g_stream_selected_stage_cursor >= 4u) {
             err = cudaEventSynchronize(g_stream_selected_stage_event[bi]);
             if (err != cudaSuccess) {
                 fprintf(stderr,
@@ -2161,19 +2231,11 @@ static int cuda_model_copy_to_device_streamed(
         cuda_model_discard_source_pages(model_map, model_size,
                                         offset + copied, n);
         copied += n;
-        chunk_idx++;
+        g_stream_selected_stage_cursor++;
     }
 
-    const cudaError_t err =
-        cudaStreamSynchronize(g_stream_selected_upload_stream);
-    if (err != cudaSuccess) {
-        fprintf(stderr,
-                "ds4: CUDA streaming selected upload sync failed for %s: %s\n",
-                what ? what : "expert", cudaGetErrorString(err));
-        (void)cudaGetLastError();
-        return 0;
-    }
-    return 1;
+    if (!flush) return 1;
+    return cuda_model_copy_to_device_streamed_flush(what);
 }
 
 static uint64_t cuda_model_cache_limit_bytes(void) {
@@ -25216,21 +25278,32 @@ static int cuda_stream_selected_cache_begin_load(
             g_cuda_stream_stats_bytes_from_cache +=
                 table->gate_expert_bytes * 2ull + table->down_expert_bytes;
         } else {
-            if (!cuda_model_copy_to_device_streamed(
+            /* Adapted from antirez/ds4#605 by iCreil: group the three
+             * tensor uploads of one missed expert as a single async batch
+             * (flush only after the last one) so the pipelined ring buffer
+             * above overlaps the host read of tensor N+1 with the device
+             * upload of tensor N across gate/up/down too, not just within
+             * one tensor's own chunks. */
+            if (!cuda_model_copy_to_device_streamed_ex(
                         g_stream_selected_cache.gate_ptr + gate_dst,
                         table->model_map, table->model_size,
                         gate_abs, table->gate_expert_bytes,
-                        "stream gate expert copy") ||
-                !cuda_model_copy_to_device_streamed(
+                        "stream gate expert copy", 0) ||
+                !cuda_model_copy_to_device_streamed_ex(
                         g_stream_selected_cache.up_ptr + gate_dst,
                         table->model_map, table->model_size,
                         up_abs, table->gate_expert_bytes,
-                        "stream up expert copy") ||
-                !cuda_model_copy_to_device_streamed(
+                        "stream up expert copy", 0) ||
+                !cuda_model_copy_to_device_streamed_ex(
                         g_stream_selected_cache.down_ptr + down_dst,
                         table->model_map, table->model_size,
                         down_abs, table->down_expert_bytes,
-                        "stream down expert copy")) {
+                        "stream down expert copy", 0)) {
+                (void)cuda_model_copy_to_device_streamed_flush("stream expert copy group");
+                cuda_stream_selected_cache_invalidate();
+                return 0;
+            }
+            if (!cuda_model_copy_to_device_streamed_flush("stream expert copy group")) {
                 cuda_stream_selected_cache_invalidate();
                 return 0;
             }
