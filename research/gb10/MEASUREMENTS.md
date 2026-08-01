@@ -1158,3 +1158,164 @@ measurement independent of exact token count.
 **Server discipline.** `ds4-server` was stopped (`sudo systemctl stop ds4-server`) before
 this run and restarted + verified (`systemctl is-active`=`active`, `listening on
 http://0.0.0.0:8000` in the journal, model tensors loading logged) at the end, per protocol.
+
+## Drafter-streaming compatibility: gate removed, real structural fix identified and applied (2026-08-02)
+
+**Goal.** The prior DSpark drafter spike (entry above, "DSpark drafter measurement spike")
+found `--ssd-streaming` and `--mtp` hard-gated as mutually exclusive at `ds4.c:56770-56773`
+("not compatible yet") with no with/without decode-t/s comparison possible. This unit's
+brief: read the code paths `--mtp` activates, determine whether the gate is wiring-class or
+structural, and implement if wiring-class.
+
+**Phase 1 finding: wiring-class, but with a real latent bug behind the placeholder gate, not
+just a missing check.** Tracing the DSpark verify path (`ds4_session_eval_dspark_speculative_argmax`
+-> `metal_graph_verify_suffix_tops` -> `metal_graph_encode_layer_batch` /
+`_ffn_batch`) showed it already funnels routed-expert fetches through the *same*
+`ds4_gpu_stream_expert_cache_prepare_selected_batch()` / `cuda_stream_selected_cache_begin_load()`
+selected-cache+LRU protocol that real streamed prefill (n_tokens>1, P3b/P3a-fix) and decode
+(n_tokens==1, b15cc29-equivalent) already use and that the CUDA per-`(layer,expert)` LRU
+(`cuda_stream_expert_cache_*`) already serves generically -- so the *target* model's own
+verify/replay under streaming needed no new plumbing. Draft-token replay
+(`metal_graph_eval_token_raw_swa` -> `..._streaming` when `g->ssd_streaming`) was already
+streaming-aware too. KV rollback on a verify miss (`spec_frontier_snapshot`/`_restore`)
+operates on the raw SWA cache, which is always fully resident regardless of
+`--ssd-streaming` (only routed-expert *weights* stream) -- no streaming-specific KV handling
+was ever needed there either.
+
+The actual, reproducible blocker was in the **DSpark support/drafter model's own forward
+pass** (`metal_graph_eval_dspark_stage_block`, the batched stage-block forward that computes
+`s->dspark_draft_tokens`). That function already knew it needed to avoid the CUDA streaming
+selected-cache for its own (always fully-resident, never-streamed) FFN weights -- it
+temporarily sets `g->ssd_streaming = false` around its call into the shared
+`metal_graph_encode_layer_ffn_batch()`. But that guard was defeated two layers down:
+`ds4_gpu_routed_moe_batch_tensor()` (`ds4_cuda.cu`) took a `force_resident` parameter and
+threw it away (`(void)force_resident;`, always `allow_streaming=1`) even though its
+`n_tokens==1` sibling `ds4_gpu_routed_moe_one_tensor()` already respected the equivalent
+flag; and `metal_graph_encode_layer_ffn_batch()`'s own call site in `ds4.c` hardcoded
+`force_resident=false` regardless of `g->ssd_streaming`. Net effect: the drafter's batch FFN
+always attempted the CUDA streaming selected-cache, which was never prepared for (and is not
+even correctly fetchable for -- the streamed-fetch fallback reads via a single
+process-global fd bound to the *target* model's file, `ds4_cuda.cu`'s `g_model_fd`) the
+drafter's own tensors, so `routed_moe_launch()`'s internal validity check failed every call
+("`ds4: CUDA streaming selected experts are unavailable for layer 0`"), the drafter's own
+FFN never produced valid hidden states, and `s->dspark_draft_valid` stayed `false` forever
+-- draft proposal silently no-opped on *every* cycle, live-reproduced via
+`DS4_DSPARK_SPEC_LOG=1` (`valid=0 len=0` / "skip no-draft" on every single cycle, confirmed
+before the fix).
+
+This means the original spike's optimistic read ("standard greedy-verify speculative
+decode, output-identical to non-speculative decode by construction when both run greedy")
+was correct about the *target*-model verify machinery but never actually exercised the
+*drafter*-model forward pass under streaming at all -- the gate hid a real, separate wiring
+gap one level deeper than the gate comment suggested.
+
+**Fix (wiring-class, 3 changes, `research/gb10` branch, applied on top of `f7a54e2`).**
+1. `ds4.c`: scoped gate removal at the `--mtp`/`--ssd-streaming` check -- refuses only when
+   `--mtp` is passed **without** `--dspark` (legacy MTP's single-token draft path,
+   `metal_graph_eval_mtp_draft_from_hc`, has no equivalent `g->ssd_streaming` save/restore
+   guard and was never exercised under streaming in this unit; left refused rather than risk
+   it silently reading the wrong model's tensors through the same global-fd landmine).
+   `DS4_DISABLE_STREAMING_MTP=1` restores the old blanket refusal even with `--dspark`.
+2. `ds4_cuda.cu`: `ds4_gpu_routed_moe_batch_tensor()` now respects `force_resident` (mirrors
+   the `_one_tensor` sibling) instead of discarding it.
+3. `ds4.c`: `metal_graph_encode_layer_ffn_batch()`'s call into
+   `ds4_gpu_routed_moe_batch_tensor()` now passes `!g->ssd_streaming` instead of a hardcoded
+   `false`, so the drafter stage-block forward's existing `g->ssd_streaming=false` save/
+   restore trick actually reaches the routed-MoE dispatch decision it was always meant to
+   gate. Zero effect on the streamed target model's own real prefill/verify calls (those run
+   with `g->ssd_streaming` genuinely `true`, so `!g->ssd_streaming` evaluates `false` --
+   byte-identical to the prior hardcoded value there).
+
+**Verification the fix is real, not just quieter.** Before the fix: `DS4_DSPARK_SPEC_LOG=1`
+showed `valid=0 len=0` and the "unavailable for layer 0" warning on every cycle (France
+prompt, `--dspark` default confidence 0.9 *and* `--dspark-confidence 0.0`). After the fix:
+warning gone; with `--dspark-confidence 0.0` (force-accept, to guarantee real verify
+activity for this check) France now shows `valid=1 len=5`, real `drafted=5 verified=1
+accepted=2`-style partial-accept cycles, and the CUDA `DS4_CUDA_STREAM_STATS` fetch/hit
+counters move during verify batches -- the drafter proposal -> target verify -> accept/roll-
+back loop is genuinely exercised end-to-end under `--ssd-streaming` for the first time.
+
+**Correctness testing and an important, honest caveat.** Ran France (`-n 60`), the
+~300-word TCP-handshake prose prompt (`-n 80`, testing a real multi-hundred-token prefill),
+and a `-n 500` short-prompt long generation, all `--temp 0` (greedy), comparing DSpark-
+enabled vs. no-drafter streaming decode:
+- France: byte-identical at both `--dspark-confidence 0.0` and default 0.9.
+- 500-token long generation (default confidence, `--dspark`): completed to a coherent,
+  on-topic short story with no crash, no repetition/garbage loop, no vocab corruption (some
+  drafting activity did occur -- `accepted_total=2` logged mid-run -- so this is not a
+  "drafter never engaged" no-op run).
+- Prose prompt (`-n 80`): **diverged from the no-drafter baseline** at both
+  `--dspark-confidence 0.5` and the **default** 0.9 ("It ensures that both endpoints are
+  ready to communicate" vs. "It ensures both parties are ready to communicate" -- a
+  near-tied paraphrase-level flip, not garbage). Investigated further: **two independent,
+  identical-command, no-`--mtp`-at-all reruns of the plain streaming baseline (rebuilt
+  binary, zero DSpark code in the call path) also diverged from each other** at the same
+  spot, under `--temp 0`. This is a **pre-existing, general `--ssd-streaming` decode
+  non-determinism** (most likely `-ffast-math`/`--use_fast_math` FP-reduction-order
+  sensitivity interacting with cache hit/miss timing, which can vary run to run even at
+  temp 0) -- **not introduced by, and not specific to, this unit's DSpark work**: it
+  reproduces with zero drafter code touched. It does mean strict byte-for-byte "output-
+  identical to non-speculative decode" could not be established as a clean baseline on this
+  build/hardware (the *baseline itself* isn't perfectly run-to-run reproducible under
+  streaming) -- flagged here as a real, separate, out-of-scope finding for a future unit,
+  not swept under the rug. DSpark's own accept-gate remains self-consistent by construction
+  regardless (`sample_argmax(s->logits,...) == drafts[0]` / per-row `row_tops[i-1] ==
+  drafts[i]` checked against the *same* batch-computed logits the verify pass produces, so
+  acceptance is never based on stale/mismatched data even though that data's absolute
+  reproducibility across process runs isn't guaranteed by this build).
+
+**Throughput: does NOT presently exceed the compute ceiling -- explains where the time
+goes.** With the default `--dspark-confidence 0.9` (the shipping default) against the
+community drafter `hf.co/sakamakismile/DeepSeek-V4-Flash-DSpark-support-ds4-GGUF`: draft
+proposal ran every cycle (confirmed via `DS4_DSPARK_SPEC_LOG=1`, confidence values logged in
+the -0.4..1.2 range) but was almost always rejected by the 0.9 confidence-pruning threshold
+("skip no-draft" on nearly every cycle across France/prose/the 500-token run), so decode
+paid the drafter's own propose+confidence-probe compute on most steps with almost none of
+the speedup: the -n 500 run averaged **~0.57 t/s** (511 tokens in ~900s before the process's
+own timeout), well *below* both the no-drafter streaming baseline (2.69 t/s single-prompt,
+this doc's own 4.46 t/s long-session steady state) and the 5.24 t/s compute ceiling. Lowering
+`--dspark-confidence` to 0.0 (force-accept every draft) *does* produce real accepted
+speculative windows (`drafted=5 verified=1 accepted=2`-style, ~40% per-block accept rate on
+France) but did not net out ahead of baseline in the short, cold-cache single-prompt tests
+run here either (decode dropped to ~0.18-0.22 t/s) -- consistent with this ticket's own
+prediction that batch verify touches more experts per step than n=1 decode (union of the
+draft window's routed experts, up to 5x a single decode step's 6-expert selection) and needs
+a **warm, long session** (96%+ hit rate, per the long-session unit above) for the LRU to
+absorb that before it can pay off; the tests run in this unit were short/cold and could not
+reach that regime within the time budget. **Where the time goes, concretely:** (1) the
+drafter's own stage-block forward (propose) and confidence probe run on every decode step
+regardless of outcome -- pure overhead when rejected; (2) at low/zero confidence, verify's
+batch window touches proportionally more distinct experts per step than plain n=1 decode,
+which is a real added disk-miss cost until the LRU is warm. Neither of these is a
+correctness bug; both are real, measured costs this unit's fix makes newly *observable*
+(rather than a hard refusal), which is the intended outcome of a wiring-class unit -- the
+economic question of whether *this specific* community drafter is a good match for the
+target model, and whether a warm long session recovers the net win the ticket predicted, is
+a distinct follow-up (**a full multi-turn warm-session with/without-drafter trajectory,
+matching this doc's own long-session protocol, was not completed within this unit's time
+budget** -- flagged explicitly as unfinished, not glossed over).
+
+**Tests.** `make cuda-spark`: clean, zero warnings. `./ds4_test`: `ds4 tests: 6 failure(s)`
+across `logprob-vectors` (on the documented pre-existing flaky list, `tests/ds4_test.c:5285`)
+and `metal-tensor-equivalence` (not on the strict 3-item flaky list but this file's own
+P3c-1-take-4 entry already recorded it fluctuating pass/fail across passes, e.g. "take 3's
+own run saw 7 failures across a 3-section subset of the same list" -- consistent with, not a
+new regression from, this unit's diff, which is scoped to CUDA-only DSpark/mtp-batch-encode
+code plus the gate; unrelated to the Metal-vs-CUDA/reference numerical-tolerance comparison
+`metal-tensor-equivalence` performs). `tool-call-quality` and `metal-kernels` (the other two
+items on the documented flaky list) both passed this run. No new failing test names.
+
+**Server discipline.** `ds4-server` stopped before every run above and restarted +
+verified (`systemctl is-active`=`active`, `curl http://localhost:8000/v1/models` responding)
+at the end.
+
+**Pending (new, for a follow-up unit).** (1) The full with/without warm multi-turn
+throughput trajectory (this unit's own biggest unfinished item). (2) The general
+`--ssd-streaming` run-to-run non-determinism at `--temp 0` found above, independent of
+DSpark -- worth a dedicated diagnostic pass (candidate first step: bisect
+`-ffast-math`/`--use_fast_math` vs. cache-hit-path-vs-miss-path FP differences). (3)
+Evaluate whether a better-matched drafter (vs. this community artifact) or a lower default
+`--dspark-confidence` recovers a real net win once measured in a warm session. (4) Legacy
+MTP (non-DSpark) under `--ssd-streaming` remains refused (per the scoped gate above) and
+would need its own `g->ssd_streaming` guard around `metal_graph_eval_mtp_draft_from_hc`
+before it could be safely enabled the same way.

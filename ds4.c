@@ -29896,7 +29896,35 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                il,
                                                n_tokens,
                                                &g->batch_routed_mid_is_f16,
-                                               false) != 0;
+                                               /*
+                                                * force_resident = !g->ssd_streaming, not a
+                                                * literal false: this one shared FFN-batch
+                                                * encode function serves both the streamed
+                                                * target model's real batch prefill/verify
+                                                * (g->ssd_streaming true -> force_resident
+                                                * false, streaming allowed, unchanged from
+                                                * before) and the resident DSpark support
+                                                * model's own stage-block forward, which
+                                                * already temporarily sets
+                                                * g->ssd_streaming = false around this exact
+                                                * call (metal_graph_eval_dspark_stage_block)
+                                                * specifically so its FFN never attempts the
+                                                * CUDA streaming selected-cache (that cache
+                                                * is only ever prepared for the target
+                                                * model's own tensors, and the streamed
+                                                * fetch path reads from a single
+                                                * process-global fd registered to the target
+                                                * model). A hardcoded false here silently
+                                                * defeated that guard (routed_moe_launch's
+                                                * own allow_streaming/g_ssd_streaming_mode
+                                                * check doesn't otherwise know this call is
+                                                * for a different, always-resident model),
+                                                * which is the root cause of the "CUDA
+                                                * streaming selected experts are unavailable"
+                                                * failures observed on the drafter's stage
+                                                * forward under --ssd-streaming --dspark.
+                                                */
+                                               !g->ssd_streaming) != 0;
     }
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", metal_graph_batch_routed_gate(g),
@@ -56769,12 +56797,61 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     if (opt->mtp_path && opt->mtp_path[0] &&
         opt->distributed.role == DS4_DISTRIBUTED_NONE) {
-        if (e->ssd_streaming) {
-            fprintf(stderr, "ds4: --ssd-streaming is not compatible with --mtp yet\n");
+        if (e->ssd_streaming &&
+            (!opt->dspark || getenv("DS4_DISABLE_STREAMING_MTP") != NULL)) {
+            /*
+             * Scoped to --dspark only: the wiring fix below (force_resident
+             * threaded through ds4_gpu_routed_moe_batch_tensor /
+             * metal_graph_encode_layer_ffn_batch) makes the DSpark support
+             * model's own batch stage-block forward
+             * (metal_graph_eval_dspark_stage_block, which already saves and
+             * clears g->ssd_streaming around that call) correctly bypass
+             * the CUDA streaming selected-cache. Legacy MTP's single-token
+             * draft path (metal_graph_eval_mtp_draft_from_hc) has no
+             * equivalent g->ssd_streaming guard and was never exercised
+             * under streaming, so bare --mtp (without --dspark) stays
+             * refused here rather than risk it silently reading through
+             * the streamed target model's process-global fd/cache state
+             * for the wrong model's tensors.
+             */
+            fprintf(stderr,
+                    opt->dspark ?
+                        "ds4: --ssd-streaming + --mtp --dspark disabled via "
+                        "DS4_DISABLE_STREAMING_MTP\n" :
+                        "ds4: --ssd-streaming is not compatible with --mtp "
+                        "yet unless --dspark is also set (legacy MTP's "
+                        "single-token draft path is not streaming-safe)\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
         }
+        /*
+         * Historically --ssd-streaming and --mtp were mutually exclusive
+         * ("not compatible yet"). Root cause (gb10 DSpark-drafter-streaming
+         * unit): the batch verify pass (metal_graph_verify_suffix_tops ->
+         * metal_graph_encode_layer_batch -> ..._ffn_batch) already routes
+         * routed-expert fetches through the SAME
+         * ds4_gpu_stream_expert_cache_prepare_selected_batch() /
+         * cuda_stream_selected_cache_begin_load() selected-cache+LRU
+         * protocol that real streamed prefill (n_tokens > 1) already uses
+         * and that decode (n_tokens == 1) uses via
+         * ds4_gpu_stream_expert_cache_begin_selected_load() -- both funnel
+         * into the one persistent per-(layer,expert) LRU
+         * (cuda_stream_expert_cache_*), so verify's small batch (draft_n
+         * tokens) is not a new code path, just a smaller n_tokens call into
+         * the existing one. Draft-token replay after a partial accept
+         * (metal_graph_eval_token_raw_swa) already dispatches to
+         * metal_graph_eval_token_raw_swa_streaming() when g->ssd_streaming,
+         * i.e. the single-token decode path. KV rollback on a verify miss
+         * (spec_frontier_snapshot/_restore) operates on the raw SWA cache,
+         * which is always fully resident regardless of --ssd-streaming (only
+         * routed-expert weights are streamed) -- no streaming-specific KV
+         * handling was needed. The support/drafter model (--mtp FILE) is a
+         * separate small resident model loaded via the normal (non-streaming)
+         * path below and does not share the CUDA expert-cache budget pool.
+         * This was therefore a wiring-class gate, not a structural gap; see
+         * research/gb10/MEASUREMENTS.md's drafter-streaming-compat unit.
+         */
         model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
         ds4_dspark_summary dspark = {0};
         e->support_kind =

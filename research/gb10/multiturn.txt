@@ -1,0 +1,8 @@
+Explain in a few sentences how photosynthesis works.
+Now contrast C3, C4, and CAM photosynthesis pathways briefly.
+Explain the TCP three-way handshake.
+Now explain TCP congestion control briefly.
+Explain how red-black trees maintain balance.
+Contrast red-black trees with AVL trees briefly.
+Explain the Paxos and Raft consensus protocols briefly.
+Draw a brief analogy between ant colony foraging and network load balancing.

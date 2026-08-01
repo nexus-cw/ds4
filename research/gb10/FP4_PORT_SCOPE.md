@@ -2192,3 +2192,47 @@ and coherently post-restart.
 3. `ds4_debug_mxfp4_mma_gemm` (the temporary isolation entry point) still carries a "TEMPORARY
    ... to be removed before final commit" comment three passes running now -- same open question
    take 2/3 already flagged (keep as a permanent debug API, or remove once no longer needed).
+
+## DSpark drafter x `--ssd-streaming` compatibility: gate lifted, structural fix in the CUDA routed-MoE batch dispatch (2026-08-02)
+
+The `--ssd-streaming` / `--mtp` mutual-exclusion gate at `ds4.c:56770-56773` ("not compatible
+yet") is now scoped to `--mtp` **without** `--dspark` only. Full root-cause, fix, and
+correctness/throughput measurement writeup lives in `MEASUREMENTS.md`'s "Drafter-streaming
+compatibility" unit; summary for anyone touching this code next:
+
+- The target model's own DSpark verify path was **already** streaming-compatible before this
+  unit (it reuses the same selected-cache/LRU protocol as real streamed prefill/decode) --
+  contrary to what the gate's placeholder comment implied.
+- The actual bug: `ds4_gpu_routed_moe_batch_tensor()` (`ds4_cuda.cu`) silently discarded its
+  own `force_resident` parameter (`(void)force_resident;`, always `allow_streaming=1`),
+  unlike its `n_tokens==1` sibling `ds4_gpu_routed_moe_one_tensor()`, which already respected
+  the equivalent flag. Combined with `metal_graph_encode_layer_ffn_batch()`'s call site in
+  `ds4.c` hardcoding `force_resident=false`, the DSpark support/drafter model's own batch
+  stage-block forward (`metal_graph_eval_dspark_stage_block`, which already temporarily sets
+  `g->ssd_streaming=false` around exactly this call, anticipating the need) never actually
+  got routed away from the CUDA streaming selected-cache -- a cache/fetch path that is keyed
+  to, and whose disk-miss fallback reads via a process-global fd bound to, the *streamed
+  target* model only. Draft proposal failed on every cycle as a result (silent, not a crash:
+  `s->dspark_draft_valid` just never became true), so the previous mutual-exclusion gate was
+  hiding a second, deeper wiring gap than its own comment suggested.
+- Fix: `ds4_gpu_routed_moe_batch_tensor()` now respects `force_resident`;
+  `metal_graph_encode_layer_ffn_batch()`'s call site now passes `!g->ssd_streaming` instead
+  of a hardcoded `false` (a no-op for the streamed target model's own real calls, where
+  `g->ssd_streaming` is genuinely true).
+- Correctness: byte-identical to the no-drafter baseline on the France prompt at both
+  confidence 0.0 and the shipping-default 0.9; a 500-token generation completed coherently
+  with no crash/garbage. **One real caveat found and documented, not specific to DSpark**:
+  `--ssd-streaming` decode at `--temp 0` is not perfectly run-to-run reproducible on this
+  build even with zero drafter code involved (two identical no-`--mtp` reruns diverged at
+  the same spot on a longer prose prompt) -- most likely an `-ffast-math`/`--use_fast_math`
+  FP-reduction-order sensitivity, flagged as a separate follow-up, not fixed here.
+- Throughput with the shipping default (`--dspark-confidence 0.9`) against the community
+  drafter used for this unit does **not** presently beat the no-drafter baseline (~0.57 t/s
+  vs. 2.69-4.46 t/s) because the confidence gate rejects nearly every draft while still
+  paying the drafter's own per-step propose+confidence-probe compute; forcing acceptance
+  (`--dspark-confidence 0.0`) does produce real accepted speculative windows but was measured
+  only in short/cold-cache single-prompt tests, which is exactly the regime this ticket
+  itself predicted would *not* show the win (needs the ~96%+ hit-rate warm-session regime
+  from the long-session unit in `MEASUREMENTS.md` to amortize the extra per-step expert
+  fetch). **A full warm multi-turn with/without-drafter trajectory was not completed within
+  this unit's time budget** -- the natural next step for whoever picks this up.

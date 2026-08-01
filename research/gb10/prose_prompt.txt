@@ -1,0 +1,1 @@
+Write a detailed explanation of how the TCP three-way handshake establishes a connection between a client and a server, covering the SYN, SYN-ACK, and ACK segments, sequence number synchronization, what happens if a segment is lost, and how this relates to TCP's reliability guarantees. Also briefly contrast this with how a connection is torn down.
