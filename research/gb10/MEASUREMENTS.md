@@ -517,3 +517,108 @@ confirmed after restart. No stray `ds4`/`ds4-eval` processes were left running (
       (candidate: a fixed-size buffer/capacity check in the P3a-fix LRU-cache prefill path
       that a wider expert-routing fanout from more prefill tokens can exceed) before any
       MXFP4-streaming eval can be attempted again.
+
+## MXFP4-streaming quality eval: UNBLOCKED, re-run to completion (2026-08-01, rerun)
+
+**Context.** The prior "BLOCKED" entry above (2026-08-01, same day) reported the requested
+12-item eval could not run: every attempt hit `cuda prefill failed` on prefill of item 1
+(`GPQA Diamond/recNu3MXkvWUzHZr9`, 201 tokens), reproduced 7/7 on realistic 25-140-word
+prose prompts even with `DS4_METAL_STREAMING_DECODE_PREFILL_MAX=4096` set, across the
+40GB/100GB, `--ctx`, and `--nothink` combinations tested that pass. This rerun repeats the
+exact same invocation, same env var, same artifact
+(`gguf/DeepSeek-V4-Flash-MXFP4_MOE.patched.gguf`) and cache size (100GB):
+
+```
+env DS4_METAL_STREAMING_DECODE_PREFILL_MAX=4096 timeout 21600 ./ds4-eval \
+  -m gguf/DeepSeek-V4-Flash-MXFP4_MOE.patched.gguf --cuda --ssd-streaming \
+  --ssd-streaming-cache-experts 100GB --ctx 16384 --questions 12 -n 4000 \
+  --trace /tmp/ds4_eval_mxfp4_trace.txt
+```
+
+**Result: item 1 prefilled and generated successfully this time** (no `cuda prefill failed`,
+no repeat of the previously-documented blocker), and the run completed all 12 items to
+`ds4-eval`'s own natural exit. No code changes were made between the blocked attempt and
+this one -- same commit (`0cd4b42`, HEAD unchanged). The most plausible explanation is that
+the blocked attempt's failure was transient/state-dependent (e.g. an LRU-cache install/evict
+interaction from the freshly-landed P3a-fix cache port, `416533c`, sensitive to exact prior
+GPU/cache state) rather than a deterministic function of prompt length alone, since the
+identical binary, artifact, and flags now pass every item including the previously-failing
+201-token item 1. This is a positive but not fully explained result -- worth flagging for
+anyone hitting the earlier blocker again: retry before assuming a hard block.
+
+**Full per-item results** (`ds4-eval` output, `01h:31m` total runtime):
+
+| # | state | prompt tok | gen tok | total tok | given | correct | time (s) | case |
+|---|---|---|---|---|---|---|---|---|
+| 1 | PASSED | 201 | 2351 | 2552 | B | B | 563.4 | GPQA Diamond/recNu3MXkvWUzHZr9 |
+| 2 | PASSED | 149 | 591 | 740 | C | C | 139.7 | SuperGPQA/001b51d76b4d422988f2c11f104a2c6c |
+| 3 | PASSED | 81 | 671 | 752 | 70 | 70 | 161.6 | AIME2025/aime2025-01 |
+| 4 | FAILED | 313 | 4000 | 4313 | A | C | 914.7 | GPQA Diamond/recoiTJPGUmzAkief |
+| 5 | PASSED | 272 | 3582 | 3854 | J | J | 877.5 | SuperGPQA/b7e20eac98764fb0bf30e8366d951daa |
+| 6 | PASSED | 146 | 973 | 1119 | 468 | 468 | 233.8 | AIME2025/aime2025-16 |
+| 7 | PASSED | 156 | 611 | 767 | B | B | 147.3 | GPQA Diamond/rec4UqStf9WUVif1f |
+| 8 | PASSED | 127 | 141 | 268 | E | E | 35.5 | SuperGPQA/4a1d1780a93f4093b6fb7d3c314cbea8 |
+| 9 | FAILED | 633 | 4000 | 4633 | 0 | 588 | 956.0 | AIME2025/aime2025-02 |
+| 10 | PASSED | 182 | 917 | 1099 | B | B | 222.6 | GPQA Diamond/recgI6tUQ7RLJRWGx |
+| 11 | PASSED | 137 | 497 | 634 | A | A | 122.2 | SuperGPQA/6082513c8dba4ec68aa68f1bf5854d09 |
+| 12 | PASSED | 165 | 1523 | 1688 | 16 | 16 | 369.6 | AIME2025/aime2025-03 |
+
+`ds4-eval`'s own summary line: `10/12 passed, 2 failed, runtime 01h:31m`.
+
+**N/12 vs. the IQ2_XXS baseline: identical, 10/12 both arms, same two case IDs failing.**
+MXFP4-streaming fails on exactly the same two items the IQ2_XXS baseline failed on
+(`GPQA Diamond/recoiTJPGUmzAkief` case 4 and `AIME2025/aime2025-02` case 9) and passes all
+ten others -- no new failures, no items that pass on one arm and fail on the other.
+
+**Per-failure comparison:**
+- **Case 4 (GPQA Diamond, conductor-cavity electrostatics)**: MXFP4 result is
+  token-for-token identical to the baseline in shape -- same prompt length (313 tok), same
+  4000-token generation cap reached, same total (4313 tok), same wrong answer letter (`A`
+  given vs `C` correct). Both arms reach the generation cap while mid-derivation on a
+  genuinely hard multi-step reasoning question and land on the same incorrect option; this
+  reads as a shared reasoning-difficulty failure rather than a precision-specific one --
+  MXFP4 reproduces the baseline's exact wrong answer, not a different wrong answer.
+- **Case 9 (AIME2025-02)**: both arms hit the 4000-token generation cap mid-derivation
+  (same 633-token prompt, same 4633-token total) but diverge in truncation behavior --
+  the IQ2_XXS baseline's cut-off response still contained a parseable (wrong) numeric guess
+  (`got 840 expected 588`), whereas MXFP4's cut-off response contained no parseable
+  `Answer:` line at all, so the harness recorded `given=0` (`got 0 expected 588`). Read the
+  raw generation (`/tmp/ds4_eval_mxfp4_trace.txt` case 9): MXFP4 was still mid-derivation
+  writing out shoelace-formula coordinate arithmetic (`x_F y_N = s * ...`) when the cap cut
+  it off, with no attempt yet made at a final numeric answer -- a harder-truncation variant
+  of the same underlying failure mode (this problem's derivation simply doesn't fit in 4000
+  generated tokens on either arm), not a new or precision-specific defect.
+
+**Runtime and speed.** Total wall time `01h:31m` (5460s) for 12 items, well under the
+`21600s` (6h) timeout and the 2-5h this ticket's own estimate anticipated. Per-item decode
+rate (gen tokens / time) ranges ~3.9-4.4 tok/s across items (e.g. item 1: 2351/563.4s =
+4.17 t/s; item 9: 4000/956.0s = 4.18 t/s; item 4: 4000/914.7s = 4.37 t/s) -- somewhat
+faster than the P3a-fix pass's own pure-decode-sweep measurement of ~2.96 t/s mean at the
+same 100GB cache size; the difference is plausibly explained by these being real,
+varied-content generations (mixed prefill + decode, different per-question expert-routing
+locality) rather than the sweep's repeated-prompt steady-state decode-only measurement, not
+a discrepancy in the underlying fix.
+
+**Test-suite/build discipline**: no source changes made this pass (rerun-only, per ticket
+scope); no `make`/`ds4_test` run needed since nothing was touched.
+
+**Server discipline**: `ds4-server` stopped before the run (`systemctl is-active` ->
+`inactive`), restarted after (`systemctl is-active` -> `active`,
+`curl http://localhost:8000/v1/models` -> `200` with the expected `deepseek-v4-flash` /
+`deepseek-v4-pro` entries). `ps aux` post-run showed no stray `ds4-eval` processes; the
+`ds4-eval` run's own launcher/timeout wrapper processes exited cleanly with the run.
+
+## Pending (updated again, 2026-08-01 rerun)
+
+- [x] **Previously blocking**: the `cuda prefill failed` reported in the entry above did
+      NOT reproduce on an identical rerun (same commit, same artifact, same flags, same env
+      var) -- all 12 items completed. Root cause of the original failure remains
+      unconfirmed (plausibly transient/cache-state-dependent rather than a deterministic
+      function of prompt length); flagged as a known intermittent risk, not chased further
+      this pass per ticket scope (rerun-only).
+- [ ] MXFP4-streaming quality parity with IQ2_XXS is now measured: 10/12 both arms, same
+      two failing case IDs, same wrong answer on case 4, harder (unparseable) truncation on
+      case 9 for MXFP4 vs. a parseable-but-wrong truncation for IQ2_XXS. No further
+      MXFP4-specific quality gap identified at this sample size (N=12); a larger question
+      set would be needed to distinguish "identical failure modes" from "coincidentally
+      identical at N=12".
