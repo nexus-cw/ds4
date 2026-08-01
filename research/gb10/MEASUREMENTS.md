@@ -782,3 +782,69 @@ effect.) Generation (decode) t/s is unaffected as expected (before: 1.75-1.82 t/
 **Verification.** `make clean && make cuda-spark`: clean rebuild, no warnings.
 `test_mxfp4_moe`/`test_mixed_moe`/`test_mxfp4_dequant`: all pass, both with the grouped
 path default-enabled and with it disabled via the new env var.
+
+## P3b item 3: pooled allocator for the CUDA expert LRU -- substantially closes, but
+does not fully eliminate, the 8GB-arm regression (2026-08-01)
+
+**Motivation.** P3a-fix's CUDA per-(layer,expert) LRU (`416533c`) does a raw
+`cudaMalloc`/`cudaFree` per install/eviction. At a budget generous enough to reach a
+non-trivial hit rate (40/100GB arms), this is a small fraction of total work. At the 8GB
+arm (130 entries, well under the per-token expert working-set size, measured hit_rate=0.000
+-- every single call is install-then-immediate-evict, forever), that pass documented a
+regression from the pre-cache 1.02-1.04 t/s baseline down to 0.73 t/s, attributed to
+`cudaMalloc`/`cudaFree` churn with zero offsetting hit-rate benefit.
+
+**Fix.** New size-keyed pool (`cuda_stream_expert_pool_class_for`/`_alloc`/`_free`/
+`_release_all`, `ds4_cuda.cu`): `cuda_stream_expert_cache_install()`'s three `cudaMalloc`
+calls (gate/up/down) become pool pops (a fast list-pop when a same-size buffer was
+previously freed back to the pool, `cudaMalloc` only on genuine growth); `_clear_entry()`'s
+three `cudaFree` calls become pool pushes. Every existing `cuda_stream_expert_cache_clear_all()`
+call site (model swap, streaming-mode toggle, budget change -- all rare, whole-cache-reset
+events, never per-token) additionally calls `cuda_stream_expert_pool_release_all()`, so real
+teardown still returns memory to the driver; only the hot miss/eviction path changes.
+
+**Correctness.** `test_mxfp4_moe`/`test_mixed_moe`/`test_mxfp4_dequant`: all pass
+(decode-shaped cases in `test_mxfp4_moe`/`test_mixed_moe` exercise
+`cuda_stream_expert_cache_install`/`_peek` indirectly through the real cache-population
+path). Real 150GB artifact smoke: `-p "Reply with exactly: ok"` -> `ok` (exact match),
+`prefill: 1.20 t/s, generation: 2.08 t/s`, no regression from items 1-2.
+
+**8GB-arm re-measurement** (`--ssd-streaming-cache-experts 8GB --nothink -p "Explain in a
+few sentences how photosynthesis works." -n 100`, `ds4-server` stopped, page cache dropped
+before the run, 4 reps back to back):
+
+| rep | prefill t/s | generation (decode) t/s |
+|---|---|---|
+| 1 | 0.87 | 0.97 |
+| 2 | 0.91 | 0.99 |
+| 3 | 0.91 | 0.98 |
+| 4 | 0.92 | 0.99 |
+
+Mean decode ~0.98 t/s -- a real, substantial improvement over the pre-fix 0.73 t/s
+regression (+34%), but **short of this unit's own acceptance bar** (>= the 1.02-1.04
+no-cache baseline). All four generations stayed coherent (photosynthesis explanations,
+consistent with the P1 correctness fix's baseline quality) -- no correctness regression,
+just an incomplete performance fix.
+
+**Honest gap analysis (not chased further this pass, per the ticket's own stop-and-document
+precedent used throughout this file's history).** The pool removes the `cudaMalloc`/
+`cudaFree` *allocator* churn, but at a 0%-hit-rate budget every single call still pays three
+real device-to-device `cudaMemcpy` calls (gate/up/down) in `cuda_stream_expert_cache_install()`
+to populate an entry that will be evicted before it is ever read again -- at this budget,
+100% of that memcpy work is pure waste, and the pool does nothing to avoid it (it only
+avoids re-doing the *allocation* underneath those memcpys). This is plausibly most of the
+remaining ~0.98-vs-1.02-1.04 t/s gap, plus a smaller, not-yet-measured contribution from
+`cuda_stream_expert_cache_prune_global()`'s global O(`CUDA_STREAM_EXPERT_CACHE_MAX_LAYER *
+CUDA_STREAM_EXPERT_CACHE_MAX_EXPERT`, i.e. 80*384=30720-entry) linear LRU scan run on every
+eviction (i.e. on essentially every call at this budget). Neither hypothesis was
+instrumented/measured directly this pass -- flagged as the concrete next step for whoever
+picks this up: a cheap, targeted fix skipping the install (and thus its memcpys) entirely
+when the configured budget is small enough that the entry is provably about to be evicted
+before any plausible reuse (or, more simply, adding a `DS4_CUDA_STREAM_STATS`-style counter
+for time spent in `cuda_stream_expert_cache_install`'s memcpys vs. `_prune_global`'s scan,
+to confirm which dominates before choosing a fix) -- out of this unit's own scope
+("pooled/slab allocator" specifically, which is what was implemented and is what this
+entry's numbers measure).
+
+**Verification.** `make clean && make cuda-spark`: clean rebuild, no warnings.
+`test_mxfp4_moe`/`test_mixed_moe`/`test_mxfp4_dequant`: all pass.

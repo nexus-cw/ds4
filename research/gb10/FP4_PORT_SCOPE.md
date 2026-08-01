@@ -1537,3 +1537,24 @@ grouped path on and off), and before/after prefill throughput on a ~300-token pr
 (~1.72-1.74 t/s -> ~4.60-4.64 t/s, ~2.65x, 3 reps each, same warm state) in
 `MEASUREMENTS.md`'s "P3b item 2" section. `make clean && make cuda-spark`: clean, no
 warnings.
+
+## P3b item 3: pooled allocator for the CUDA expert LRU -- partial fix for the 8GB-arm
+regression (2026-08-01)
+
+New size-keyed device-buffer pool (`cuda_stream_expert_pool_class_for`/`_alloc`/`_free`/
+`_release_all`, `ds4_cuda.cu`): `cuda_stream_expert_cache_install()`/`_clear_entry()`'s raw
+`cudaMalloc`/`cudaFree` per miss/eviction become pool pop/push (real `cudaMalloc` only on
+genuine growth); the existing whole-cache-reset call sites (`cuda_stream_expert_cache_clear_all()`
+-- model swap, streaming-mode toggle, budget change, all rare/non-per-token) additionally
+release the pool back to the driver, so real teardown is unchanged.
+
+Measured result: 8GB-arm decode improves from the pre-fix 0.73 t/s to ~0.97-0.99 t/s (4
+reps, page cache dropped before each rep) -- a real +34% improvement, but short of this
+unit's own acceptance bar (>= the 1.02-1.04 no-cache baseline). Root-cause of the residual
+gap not chased further this pass (out of "pooled/slab allocator" scope specifically):
+likely candidates are the three real device-to-device `cudaMemcpy`s per install (pooling
+removes the allocator cost but not the memcpy work, 100% wasted at a 0%-hit-rate budget) and/or
+`cuda_stream_expert_cache_prune_global()`'s O(30720)-entry global LRU scan run on
+essentially every call at this budget -- flagged as next steps in `MEASUREMENTS.md`'s "P3b
+item 3" section, which has the full numbers and analysis. `make clean && make cuda-spark`:
+clean, no warnings. `test_mxfp4_moe`/`test_mixed_moe`/`test_mxfp4_dequant`: all pass.
