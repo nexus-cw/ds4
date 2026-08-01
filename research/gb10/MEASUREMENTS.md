@@ -967,3 +967,15 @@ before the download; file left in place for any future follow-up once `--mtp` +
 **Server restored.** `ds4-server` stopped before the reproduction run, restarted after;
 `systemctl is-active` = `active`, confirmed loading its usual model
 (`DeepSeek-V4-Flash-IQ2XXS-...imatrix.gguf`) normally in the post-restart journal.
+
+## P3c-1 take 2: sm_121a MXFP4 tensor-core prefill kernel (2026-08-01)
+
+No prefill t/s or SASS-evidence measurement taken this pass: the kernel
+(`dsv4_mxfp4_mma_gemm_kernel`, `ds4_cuda.cu`) compiles clean and integrates behind an
+opt-in-only gate (`DS4_CUDA_ENABLE_MMA_PREFILL_EXPERIMENTAL`, default off) but is
+demonstrably numerically wrong at the unit level (see FP4_PORT_SCOPE.md's P3c-1 take 2
+section for the full diagnostic writeup and the two new isolation tests,
+research/gb10/test_mxfp4_mma_gemm.c / test_mxfp4_mma_diag.c). Measuring A/B prefill speed
+or SASS evidence against a known-broken kernel would produce numbers that could be
+mistaken for a real result; skipped on that basis. The P3b grouped dequant+cuBLAS path
+(~4.6-4.64 t/s prefill, entry above) remains the production path, unchanged by this pass.

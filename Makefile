@@ -33,6 +33,23 @@ NVCC ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?=
 ifneq ($(strip $(CUDA_ARCH)),)
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
+else
+# make cuda-spark (DGX Spark / GB10, sm_121a) leaves CUDA_ARCH unset by design;
+# default to an explicit --generate-code gencode targeting the "a" (family-
+# specific) sm_121a target. This is REQUIRED (not merely faster) for any
+# family-specific-only PTX ISA extension -- e.g. the block-scaled MXFP4/NVFP4
+# tensor-core `mma.sync...kind::mxf4` instruction used by the P3c-1 MMA
+# prefill kernels only exists on sm_121a, not on the base (non-"a")
+# sm_121/compute_121 virtual arch. Never use the bare `-arch=sm_121a`
+# shorthand for this: it silently also requests a companion base
+# `compute_121`/`sm_121` PTX image (for forward-compat JIT), and ptxas fails
+# that companion image's mxf4 instructions with "not supported on target
+# sm_121" even though the real sm_121a cubin would have compiled fine -- see
+# research/gb10/FP4_PORT_SCOPE.md's "P3c-1 correction" section for the full
+# nvcc --dryrun trace that found this. The explicit
+# --generate-code=arch=compute_121a,code=[compute_121a,sm_121a] form requests
+# ONLY the family-specific image, with no base companion.
+NVCC_ARCH_FLAGS := --generate-code=arch=compute_121a,code=[compute_121a,sm_121a]
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 CORE_OBJS = ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o

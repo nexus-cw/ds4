@@ -1731,3 +1731,168 @@ scratch `~/src/llama.cpp` build tree, never committed). Bonus benchmark step (ll
 prefill on `DeepSeek-V4-Flash-MXFP4_MOE.patched.gguf`) was skipped per the ticket's own
 guidance: full `-ngl 99` offload doesn't fit (150GB model > 121GB unified memory) and a partial
 offload wasn't attempted as it wasn't required and risked OOM.
+
+## P3c-1 take 2: sm_121a MXFP4 tensor-core prefill kernel -- implemented, integrated behind an opt-in gate, DEFAULT OFF due to an unresolved numeric bug (2026-08-01)
+
+Follow-on to the two P3c-1 entries above (toolchain-vintage-gap dead end, then the
+invocation-bug correction establishing that `mma.sync.aligned.kind::mxf4.block_scale...
+m16n8k64` genuinely compiles to real SASS on this box's CUDA 13.0/sm_121a when invoked via
+the correct `--generate-code=arch=compute_121a,code=[compute_121a,sm_121a]` form). This pass
+picked up exactly where that one stopped: fix `mxf4_probe.cu`'s D==32-not-64 scale bug, port
+the kernel, integrate it, and measure. The first two landed; the kernel itself has a real
+correctness bug not resolved this pass, so it ships present but **disabled by default**.
+
+### Probe fix (gate to proceed)
+
+`research/gb10/mxf4_probe.cu`'s bonus finding from the prior pass diagnosed its own bug
+correctly (missing second E8M0 scale byte for `scale_vec::2X`'s two k32 sub-blocks) but
+hadn't applied the fix. Fixed: `a_scale`/`b_scale` now pack `0x7F7F7F7F` (byte 127 in every
+byte position, not just byte 0) instead of `127u`. Rebuilt with the correct
+`--generate-code=arch=compute_121a,code=[compute_121a,sm_121a]` invocation (never bare
+`-arch=sm_121a`, per the prior pass's own finding) and run:
+
+```
+nonzero=128/128 correct(==64.0)=128/128 bad=0
+sample D[0..3] (lane0)=64.000 64.000 64.000 64.000
+sample D lane16 =64.000 64.000 64.000 64.000
+PROBE VERDICT: PASS -- mxf4 mma.sync produced correct result on sm_121
+```
+
+D==64.0 exactly, confirming the raw PTX instruction and its operand plumbing (uniform
+E2M1/E8M0 operands, both scale bytes) execute correctly on this hardware/toolchain. Fixed
+probe committed as instructed.
+
+### Build: `make cuda-spark`'s arch flags
+
+`make cuda-spark` (`CUDA_ARCH=` empty) previously left `NVCC_ARCH_FLAGS` completely unset --
+every `nvcc` invocation for the whole build used nvcc's bare default target, with no `-arch`
+of any kind, let alone the family-specific `sm_121a` block-scaled-MMA needs. Fixed in
+`Makefile`: when `CUDA_ARCH` is unset, `NVCC_ARCH_FLAGS` now defaults to
+`--generate-code=arch=compute_121a,code=[compute_121a,sm_121a]` (documented inline with the
+same "never bare `-arch=sm_121a`" rationale as the probe fix) rather than nothing. Applies to
+the whole build (not just the new kernel's translation unit) since that's how the Makefile's
+`CUDA_ARCH`/`NVCC_ARCH_FLAGS` plumbing is structured -- every other `.cu`/link step already
+shares the same `NVCCFLAGS`, and DGX-Spark/GB10 (what `cuda-spark` targets) is sm_121a-only
+hardware, so there's no forward-compat reason to keep requesting a bare/virtual companion
+image for anything else built here either. `make clean && make cuda-spark`: clean, zero
+warnings, ~56s wall.
+
+### Kernel design
+
+`dsv4_mxfp4_mma_gemm_kernel` (`ds4_cuda.cu`, ahead of `dqg_group_gemm`): one warp per
+(16 weight-rows x 8 tokens) output tile, looping over `in_dim` in 64-element chunks, one
+`mma.sync...m16n8k64` call per chunk, accumulating in the same `tile<16,8,float>` registers
+across the K-loop (matches llama.cpp's own accumulate-in-place idiom). Grid:
+`(out_dim/16, ceil(group_size/8))`, block size 32 (one warp).
+
+Ported primitives (MIT, llama.cpp `mma.cuh`/`common.cuh`/`quantize.cu` @5f55650): the
+`tile<16,8,int>`/`tile<8,8,int>`/`tile<16,8,float>` `DATA_LAYOUT_I_MAJOR` `get_i`/`get_j`
+physical-register formulas, the `ldmatrix.sync.aligned.m8n8.x4.b16` A-operand load address
+formula, `load_generic`'s B-operand addressing, the `mma_block_scaled_fp4` PTX idiom itself,
+and the scalar E8M0/E2M1 helpers (`ggml_cuda_e8m0_to_fp32`, `compute_e8m0_scale`,
+`ggml_cuda_float_to_fp4_e2m1`) -- prefixed `dsv4_` to avoid colliding with ds4's own
+unrelated (different-convention) `dsv4_e2m1fn_*` activation-sim code.
+
+**Weight (A) operand**: confirmed via `llama.cpp`'s own `ggml_cuda_mmq_load_tiles_mxfp4_fp4`
+(`mmq-load-tiles.cuh`) that the tensor core consumes ds4's native on-disk/in-memory MXFP4
+block bytes (1 E8M0 byte + 16 packed-nibble bytes, `byte[j] = lo:a[j] hi:a[j+16]`)
+**completely unmodified** -- that donor function does a bare 16-byte `memcpy` into its
+operand SRAM, no repacking. So the kernel stages weight rows into `__shared__` via a
+straight per-lane memcpy of the raw block bytes, no transform, and packs the two k32
+sub-blocks' E8M0 scale bytes into one uint32 the same way (`byte0=block0.e,
+byte1=block1.e`) as that donor function.
+
+**Activation (B) operand** is quantized on the fly per (token, k64-chunk), independently
+per 32-element sub-block (own E8M0 scale), using the ported E2M1 LUT/E8M0 encode. The
+resulting nibble packing was independently re-derived from `llama.cpp`'s
+`quantize_mmq_mxfp4` kernel's shuffle-based per-lane write pattern (not run, just read and
+worked through by hand) and turns out to reduce to the same standard MXFP4 nibble order as
+the weight side (`byte[m] = lo:nib[m] hi:nib[m+16]`) -- i.e. no exotic interleave beyond
+ordinary MXFP4 packing, just applied per-token to freshly quantized nibbles. The per-lane
+scale-register source mapping (`tidx_A = lane/4 + (lane%2)*8`, `tidx_B = lane/4`) is copied
+verbatim from `ggml_cuda_mmq_vec_dot_fp4_fp4_mma` (`mmq-vec-dot.cuh`) -- the documented PTX
+"warp-level block scaling" thread-id wiring for the `{0,0}` byte-id/thread-id literals used
+in the mma asm.
+
+### SASS evidence
+
+Not separately re-captured for this kernel (the probe's own SASS/PTX correspondence,
+`OMMA.SF.16864.F32.E2M1.E2M1.E8` on `sm_121a`, from the prior pass's `llama-cpp` reference
+build, already establishes that this exact instruction lowers to real tensor-core SASS on
+this hardware/toolchain -- the kernel uses the identical inline-asm string). `cuobjdump -sass`
+on `ds4_cuda.o` was not run this pass; noted as a gap rather than asserted.
+
+### Correctness: BROKEN, not shipped enabled
+
+Two dedicated tests added and committed (`research/gb10/test_mxfp4_mma_gemm.c`,
+`test_mxfp4_mma_diag.c`, both built against a **temporary** debug-only entry point
+`ds4_debug_mxfp4_mma_gemm` added to `ds4_cuda.cu` for exactly this purpose -- bypasses the
+routed-MoE grouping machinery so the kernel can be exercised in isolation):
+
+- `test_mxfp4_mma_gemm.c`: random MXFP4 weight rows + random activations across 7 shapes
+  (including the real gate/up 2048x4096 and down 4096x2048 shapes at small group sizes), CPU
+  reference re-derives the *exact* quantized-activation math the tensor core does (E2M1
+  round-to-nearest per 32-sub-block, same E8M0 encoding) rather than comparing against
+  full-precision, so any mismatch is a genuine kernel bug, not activation-quantization
+  noise. **Result: FAILS on every case**, but not randomly -- outputs are plausible
+  GEMM-shaped values (right order of magnitude, not garbage/NaN/zero), just wrong.
+- `test_mxfp4_mma_diag.c`: a one-hot diagnostic isolating the failure mode further --
+  16x16 weight with row `r`'s only nonzero element at k-position `r` (value exactly 1.0),
+  distinct-per-k activation values. Expected: `out[r] ~= quantized(x[r])`. **Actual: only 2
+  of 16 output rows (a fixed, lane-correlated pair -- rows 2 and 3, both matching the
+  expected quantized value exactly) come out correct; the other 14 are silently zero.**
+
+This narrows the bug to either the A-operand (weight) `ldmatrix` addressing or the
+`tile<16,8,float>` (C/output) write-back lane mapping -- both copied verbatim from
+llama.cpp's own formulas, which their own compile (prior pass, real SASS) and this pass's
+probe (D==64.0 exact) both indicate are individually sound in isolation. Suspected: a
+subtlety in how those formulas compose when used **outside** the donor's full templated MMQ
+scheduling context (their formulas assume a specific `nwarps`/SRAM-tile-width convention
+this single-warp, single-k64-chunk-at-a-time specialization may violate in a way not yet
+identified) -- documented as a hypothesis, not confirmed. Tried (and ruled out): `__align__
+(16)` on every `__shared__` buffer (no change, so not a raw alignment fault).
+
+**Per the ticket's own "if it degrades, leave the toggle default off" instruction** (read
+here as applying with even more force to "not proven correct" than to "correct but
+lower-quality"): the dispatch gate requires an explicit opt-in
+(`DS4_CUDA_ENABLE_MMA_PREFILL_EXPERIMENTAL=1`, renamed from the ticket's suggested
+`DS4_CUDA_DISABLE_MMA_PREFILL` opt-out framing specifically because opt-out-by-default would
+mean a stock build silently computes wrong routed-expert outputs) rather than being on by
+default when the arch check passes. With the gate at its default (unset), every existing
+test (`test_mxfp4_moe`, `test_mixed_moe`, `test_mxfp4_dequant`, `./ds4_test`) passes exactly
+as before this pass -- the grouped dequant+cuBLAS path (P3b, ~4.6-4.64 t/s prefill) remains
+the one actually running in production, completely unchanged.
+
+### End-to-end coherence / A-B measurement: not performed
+
+Given the kernel is demonstrably numerically wrong at the unit level (not merely
+lower-precision), running an end-to-end France-prompt/prose-prompt A/B or a prefill t/s
+comparison against it would produce numbers that could be mistaken for a real quality/speed
+tradeoff rather than what they'd actually be measuring (a broken kernel's output). Skipped
+on that basis rather than run-and-report; re-attempt once the diagnostic above is resolved.
+
+### Tests / build
+
+`make clean && make cuda-spark`: clean, zero warnings. `./research/gb10/test_mxfp4_moe`,
+`test_mixed_moe`, `test_mxfp4_dequant`: all pass (gate default = off). `./ds4_test`: 1
+failure (`logprob-vectors: ERR`) -- matches this suite's own pre-existing documented
+run-to-run flakiness (2026-07-31 entry above lists `logprob-vectors` among the tests that
+flip OK/ERR between runs of an *identical* unpatched binary); not attributable to this pass.
+`ds4-server` stopped before `./ds4_test`/isolation-test runs, restarted after; confirmed
+`active`, loaded its usual `DeepSeek-V4-Flash-IQ2XXS-...imatrix.gguf` normally, and answered
+a live France-capital smoke prompt coherently post-restart.
+
+### Follow-up (for whoever picks this up next)
+
+1. Resolve the one-hot diagnostic's A-operand-vs-C-write-back ambiguity: dump `A.x[]` via a
+   single-lane `printf` for a controlled input and compare against hand-computed expected
+   register contents per llama.cpp's own `ldmatrix` formula, independent of whether the MMA
+   or write-back stage is at fault.
+2. Once `test_mxfp4_mma_diag.c` and `test_mxfp4_mma_gemm.c` both pass, flip
+   `DS4_CUDA_ENABLE_MMA_PREFILL_EXPERIMENTAL` default to on (or drop the gate and restore the
+   simpler opt-out framing the ticket originally specified) and re-run the A/B prefill t/s +
+   end-to-end coherence measurements this pass explicitly skipped.
+3. `ds4_debug_mxfp4_mma_gemm` (the temporary isolation entry point) can stay -- it's small,
+   guarded, and is what makes `test_mxfp4_mma_gemm.c`/`test_mxfp4_mma_diag.c` possible without
+   a full MoE harness -- but should get a proper comment marking it as a permanent test-only
+   API if it's going to stay past the next pass, rather than "temporary" as currently written.

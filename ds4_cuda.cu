@@ -21813,6 +21813,336 @@ __global__ static void dqg_scatter_down_rows_kernel(
     for (uint32_t i = threadIdx.x; i < out_dim; i += blockDim.x) dst[i] = src[i];
 }
 
+/* ===========================================================================
+ * P3c-1 take 2: sm_121a MXFP4 tensor-core (block-scaled mma.sync) prefill
+ * GEMM kernel, replacing dequant-to-f16+cuBLAS for MXFP4-typed routed
+ * experts inside the grouped prefill dispatch (dqg_group_gemm, above/below).
+ *
+ * Gated by DSV4_MXFP4_MMA_AVAILABLE (compile-time __CUDA_ARCH__ 1200..1300,
+ * mirroring llama.cpp's BLACKWELL_MMA_AVAILABLE convention -- see
+ * ggml-cuda/common.cuh @5f55650) and, at the call site, by a runtime
+ * sm_121-only capability check plus the DS4_CUDA_DISABLE_MMA_PREFILL escape
+ * hatch. Falls back to the existing dequant+cuBLAS path
+ * (dqg_group_gemm's tail below) whenever unsupported/disabled/failed.
+ *
+ * Ported primitives (MIT, llama.cpp @5f55650, see research/gb10/
+ * FP4_PORT_SCOPE.md's P3c-1 sections for the full derivation this is based
+ * on): the tile<16,8,int>/tile<8,8,int>/tile<16,8,float> physical register
+ * layouts (mma.cuh get_i/get_j, DATA_LAYOUT_I_MAJOR, non-AMD/non-Volta
+ * branch), load_ldmatrix (m8n8.x4.b16, for the A/weight operand) and
+ * load_generic (for the B/activation operand), mma_block_scaled_fp4's PTX
+ * idiom, and the E8M0/E2M1 scalar helpers (ggml_cuda_e8m0_to_fp32,
+ * compute_e8m0_scale, ggml_cuda_float_to_fp4_e2m1 from common.cuh/
+ * quantize.cu). Prefixed dsv4_ to avoid any collision with ds4's own
+ * unrelated e2m1 activation-sim code (dsv4_e2m1fn_* above, ds4_cuda.cu
+ * ~6547) which uses a different (software, doubled-LUT) convention not
+ * applicable to talking to the tensor core directly.
+ *
+ * Weight (A) operand: ds4's native MXFP4 block bytes (1 E8M0 scale byte +
+ * 16 packed-nibble bytes, byte[j] = lo:a[j] hi:a[j+16], QK_MXFP4=32) are
+ * copied into the A-operand SRAM stage completely unmodified -- confirmed
+ * against llama.cpp's ggml_cuda_mmq_load_tiles_mxfp4_fp4
+ * (mmq-load-tiles.cuh @5f55650), which does exactly the same 16-byte
+ * memcpy with no repacking, i.e. ds4's on-disk/in-memory block layout
+ * already matches what the tensor core's A operand expects. The two
+ * blocks spanning one m16n8k64 tile's k64 range pack their E8M0 bytes as
+ * one uint32 (byte0=block0.e, byte1=block1.e), matching
+ * load_tiles_mxfp4_fp4's own scale packing and the "scale_vec::2X consumes
+ * two E8M0 bytes" fix applied to mxf4_probe.cu earlier in this pass.
+ *
+ * Activation (B) operand is quantized to E2M1+E8M0 on the fly, per
+ * (token, k64-chunk), independently per 32-element sub-block -- same
+ * round-to-nearest E2M1 LUT and E8M0 encoding as llama.cpp's
+ * ggml_cuda_float_to_fp4_e2m1 / compute_e8m0_scale. The resulting 16-byte
+ * per-sub-block nibble packing (byte[m] = lo:nib[m] hi:nib[m+16], m=0..15)
+ * was independently re-derived from llama.cpp's quantize_mmq_mxfp4 kernel
+ * (quantize.cu @5f55650)'s shuffle-based per-lane write pattern
+ * (`yqs2[b*8+group_id] = packed[b]` with group_id=lane/4, base=group_id*2,
+ * elements {base,base+1,base+16,base+17}) and turns out to be the SAME
+ * standard ggml block-mxfp4 nibble order as the weight side -- i.e. no
+ * exotic interleave beyond ordinary MXFP4 packing is actually needed here,
+ * just applied per-token to freshly quantized activation nibbles instead
+ * of on-disk weight nibbles. The per-lane scale-register source mapping
+ * (tidx_A = lane/4 + (lane%2)*8, tidx_B = lane/4) is copied verbatim from
+ * llama.cpp's ggml_cuda_mmq_vec_dot_fp4_fp4_mma (mmq-vec-dot.cuh @5f55650)
+ * -- this is the documented PTX "warp-level block scaling" thread-id
+ * wiring for the {0,0} byte-id/thread-id literals used in the mma asm
+ * below (see PTX ISA docs section on block-scaling), and must match
+ * exactly since it determines which lane's scale register the hardware
+ * actually reads, independent of which lane's data register holds the
+ * corresponding values.
+ */
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200 && __CUDA_ARCH__ < 1300
+#define DSV4_MXFP4_MMA_AVAILABLE 1
+#endif
+
+struct dsv4_tile16x8i { int   x[4]; };
+struct dsv4_tile8x8i  { int   x[2]; };
+struct dsv4_tile16x8f { float x[4]; };
+
+__device__ __forceinline__ uint8_t dsv4_compute_e8m0_scale(float amax) {
+    if (!(amax > 0.0f)) return 0;
+    const float e = log2f(amax);
+    const int e_int = __float2int_rn(e);
+    const int shared_exp = e_int - 2; /* FP4 E2M1: max unbiased exponent is 2 */
+    int biased = shared_exp + 127;
+    biased = biased < 0 ? 0 : biased;
+    biased = biased > 254 ? 254 : biased;
+    return (uint8_t)biased;
+}
+
+__device__ __forceinline__ float dsv4_e8m0_to_fp32(uint8_t x) {
+    uint32_t bits = (x == 0) ? 0x00400000u : ((uint32_t)x << 23);
+    float result;
+    memcpy(&result, &bits, sizeof(float));
+    return result;
+}
+
+__device__ __forceinline__ uint8_t dsv4_float_to_fp4_e2m1(float x, float inv_scale) {
+    const uint8_t sign_bit = (uint8_t)((x < 0.0f) << 3);
+    const float ax = fabsf(x) * inv_scale;
+    static const float pos_lut[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
+    int best_i = 0;
+    float best_err = fabsf(ax - pos_lut[0]);
+    #pragma unroll
+    for (int i = 1; i < 8; i++) {
+        const float err = fabsf(ax - pos_lut[i]);
+        if (err < best_err) { best_err = err; best_i = i; }
+    }
+    return (uint8_t)(best_i | sign_bit);
+}
+
+__device__ __forceinline__ void dsv4_mma_mxfp4(
+        dsv4_tile16x8f &D, const dsv4_tile16x8i &A, const dsv4_tile8x8i &B,
+        uint32_t a_scale, uint32_t b_scale) {
+#if defined(DSV4_MXFP4_MMA_AVAILABLE)
+    float *Dxi = D.x;
+    asm volatile(
+        "mma.sync.aligned.kind::mxf4.block_scale.scale_vec::2X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, "
+        "%10, {0, 0}, %11, {0, 0};"
+        : "+f"(Dxi[0]), "+f"(Dxi[1]), "+f"(Dxi[2]), "+f"(Dxi[3])
+        : "r"(A.x[0]), "r"(A.x[1]), "r"(A.x[2]), "r"(A.x[3]), "r"(B.x[0]), "r"(B.x[1]),
+          "r"(a_scale), "r"(b_scale));
+#else
+    (void)D; (void)A; (void)B; (void)a_scale; (void)b_scale;
+#endif
+}
+
+/* One warp per (16 weight-rows x 8 tokens) output tile; loops over in_dim
+ * in 64-element chunks, one m16n8k64 block-scaled MMA call per chunk.
+ * `x` (activations) is __half (matches dqg_group_gemm's xh_group buffer);
+ * `w` is ds4's native contiguous MXFP4 weight rows (row_bytes =
+ * (in_dim/32)*17). `out` is [group_size x out_dim] row-major (token-major),
+ * matching what dqg_group_silu_mul_kernel / dqg_scatter_down_rows_kernel
+ * downstream already expect from dqg_group_gemm's cuBLAS path. */
+__global__ static void dsv4_mxfp4_mma_gemm_kernel(
+        float * __restrict__ out,
+        const __half * __restrict__ x,
+        const unsigned char * __restrict__ w,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        uint32_t group_size,
+        uint64_t row_bytes) {
+#if defined(DSV4_MXFP4_MMA_AVAILABLE)
+    const uint32_t out_row0 = blockIdx.x * 16u;
+    const uint32_t tok0     = blockIdx.y * 8u;
+    if (out_row0 >= out_dim) return;
+
+    const int lane = threadIdx.x;
+
+    __shared__ __align__(16) int          a_qs[16 * 8];
+    __shared__ __align__(16) uint32_t     a_sc[16];
+    __shared__ __align__(16) unsigned char b_nib[8][64];
+    __shared__ __align__(16) uint32_t     b_sc[8];
+    __shared__ __align__(16) int          b_qs[8 * 8];
+
+    dsv4_tile16x8f C = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+    const uint32_t n_ktiles = in_dim / 64u;
+    for (uint32_t kt = 0; kt < n_ktiles; kt++) {
+        /* ---- stage A: weight rows, raw MXFP4 block bytes, unmodified ---- */
+        {
+            const int row = lane / 2;
+            const int kb_local = lane % 2;
+            const uint32_t out_row = out_row0 + (uint32_t)row;
+            const uint32_t block_idx = kt * 2u + (uint32_t)kb_local;
+            if (out_row < out_dim) {
+                const unsigned char *blk = w + (uint64_t)out_row * row_bytes + (uint64_t)block_idx * 17u;
+                memcpy(&a_qs[row * 8 + kb_local * 4], blk + 1, 16);
+                if (kb_local == 0) {
+                    const unsigned char *blk1 = blk + 17;
+                    a_sc[row] = (uint32_t)blk[0] | ((uint32_t)blk1[0] << 8);
+                }
+            } else {
+                a_qs[row * 8 + kb_local * 4 + 0] = 0;
+                a_qs[row * 8 + kb_local * 4 + 1] = 0;
+                a_qs[row * 8 + kb_local * 4 + 2] = 0;
+                a_qs[row * 8 + kb_local * 4 + 3] = 0;
+                if (kb_local == 0) a_sc[row] = 0;
+            }
+        }
+        __syncthreads();
+
+        /* ---- stage B: quantize this k64-chunk of each of the 8 tokens ---- */
+        for (int j = 0; j < 8; j++) {
+            const uint32_t tok = tok0 + (uint32_t)j;
+            const __half *xrow = (tok < group_size) ? (x + (uint64_t)tok * in_dim + (uint64_t)kt * 64u) : NULL;
+            uint8_t e_b[2];
+            #pragma unroll
+            for (int b = 0; b < 2; b++) {
+                const float xi = xrow ? __half2float(xrow[b * 32 + lane]) : 0.0f;
+                float amax = fabsf(xi);
+                #pragma unroll
+                for (int mask = 16; mask > 0; mask >>= 1) {
+                    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, mask, 32));
+                }
+                e_b[b] = dsv4_compute_e8m0_scale(amax);
+                const float inv_s = (amax == 0.0f) ? 0.0f : __frcp_rn(dsv4_e8m0_to_fp32(e_b[b]));
+                b_nib[j][b * 32 + lane] = dsv4_float_to_fp4_e2m1(xi, inv_s);
+            }
+            if (lane == 0) {
+                b_sc[j] = (uint32_t)e_b[0] | ((uint32_t)e_b[1] << 8);
+            }
+        }
+        __syncthreads();
+
+        /* ---- pack B nibbles into the 8x8 physical-int layout ---- */
+        #pragma unroll
+        for (int p = 0; p < 2; p++) {
+            const int i_local = lane / 8;
+            const int j = lane % 8;
+            const int i = p * 4 + i_local;
+            const int base = p * 32 + i_local * 4;
+            unsigned int b0 = (unsigned int)b_nib[j][base + 0] | ((unsigned int)b_nib[j][base + 16] << 4);
+            unsigned int b1 = (unsigned int)b_nib[j][base + 1] | ((unsigned int)b_nib[j][base + 17] << 4);
+            unsigned int b2 = (unsigned int)b_nib[j][base + 2] | ((unsigned int)b_nib[j][base + 18] << 4);
+            unsigned int b3 = (unsigned int)b_nib[j][base + 3] | ((unsigned int)b_nib[j][base + 19] << 4);
+            b_qs[i * 8 + j] = (int)(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+        }
+        __syncthreads();
+
+        /* ---- load tiles and run the block-scaled tensor-core MMA ---- */
+        dsv4_tile16x8i A;
+        {
+            const int *xs = a_qs + (lane % 16) * 8 + (lane / 16) * 4;
+            int *xi = A.x;
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
+                : "=r"(xi[0]), "=r"(xi[1]), "=r"(xi[2]), "=r"(xi[3])
+                : "l"(xs));
+        }
+        dsv4_tile8x8i B;
+        {
+            const int bi = lane / 4;
+            const int bj0 = 0 * 4 + (lane % 4);
+            const int bj1 = 1 * 4 + (lane % 4);
+            B.x[0] = b_qs[bi * 8 + bj0];
+            B.x[1] = b_qs[bi * 8 + bj1];
+        }
+        const int tidx_A = lane / 4 + (lane % 2) * 8;
+        const int tidx_B = lane / 4;
+        const uint32_t a_scale = a_sc[tidx_A];
+        const uint32_t b_scale = b_sc[tidx_B];
+
+        dsv4_mma_mxfp4(C, A, B, a_scale, b_scale);
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int l = 0; l < 4; l++) {
+        const int i = ((l / 2) * 8) + (lane / 4);
+        const int j = ((lane % 4) * 2) + (l % 2);
+        const uint32_t out_row = out_row0 + (uint32_t)i;
+        const uint32_t tok = tok0 + (uint32_t)j;
+        if (out_row < out_dim && tok < group_size) {
+            out[(uint64_t)tok * out_dim + out_row] = C.x[l];
+        }
+    }
+#else
+    (void)out; (void)x; (void)w; (void)in_dim; (void)out_dim; (void)group_size; (void)row_bytes;
+#endif
+}
+
+static int g_dsv4_mxfp4_mma_capable = -1;
+
+static int dsv4_mxfp4_mma_capable(void) {
+    if (g_dsv4_mxfp4_mma_capable < 0) {
+        int dev = 0;
+        cudaDeviceProp prop;
+        g_dsv4_mxfp4_mma_capable =
+            (cudaGetDevice(&dev) == cudaSuccess &&
+             cudaGetDeviceProperties(&prop, dev) == cudaSuccess &&
+             prop.major == 12 && prop.minor == 1) ? 1 : 0;
+    }
+    return g_dsv4_mxfp4_mma_capable;
+}
+
+/* Host launch wrapper for dsv4_mxfp4_mma_gemm_kernel -- validates the
+ * native MXFP4 row-byte layout and dispatches the grid. Returns 0 (caller
+ * falls back to dequant+cuBLAS) on any precondition failure or launch
+ * error; never partial-writes `out_group` on failure since the kernel
+ * itself only ever writes the exact in-range (out_row, tok) cells it
+ * computed a full k-loop for. */
+static int dqg_group_gemm_mxfp4_mma(
+        float *out_group,
+        const char *w,
+        uint64_t row_bytes,
+        const __half *xh_group,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        uint32_t group_size) {
+    if (!out_group || !w || !xh_group || group_size == 0u) return 0;
+    if (in_dim % 64u != 0u || out_dim % 16u != 0u) return 0;
+    const uint32_t blocks = in_dim / 32u;
+    if (row_bytes != (uint64_t)blocks * 17u) return 0;
+    if (getenv("DS4_DEBUG_MMA_PREFILL")) {
+        fprintf(stderr, "ds4: mma-prefill group_size=%u in_dim=%u out_dim=%u\n", group_size, in_dim, out_dim);
+    }
+
+    const dim3 grid((out_dim + 15u) / 16u, (group_size + 7u) / 8u);
+    const dim3 block(32);
+    dsv4_mxfp4_mma_gemm_kernel<<<grid, block>>>(
+            out_group, xh_group, reinterpret_cast<const unsigned char *>(w),
+            in_dim, out_dim, group_size, row_bytes);
+    return cuda_ok(cudaGetLastError(), "routed_moe mxfp4 mma gemm launch");
+}
+/* =========================== end P3c-1 take 2 ============================ */
+
+/* TEMPORARY debug-only entry point for isolating dsv4_mxfp4_mma_gemm_kernel
+ * from the MoE grouping machinery -- research/gb10/test_mxfp4_mma_gemm.c.
+ * Not part of the public API surface; to be removed before final commit. */
+extern "C" int ds4_debug_mxfp4_mma_gemm(
+        float *out_group_host,
+        const unsigned char *w_host,
+        uint64_t row_bytes,
+        const float *x_host,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        uint32_t group_size) {
+    unsigned char *w_dev = NULL;
+    __half *xh_dev = NULL;
+    float *out_dev = NULL;
+    __half *xh_host = (__half *)malloc((size_t)group_size * in_dim * sizeof(__half));
+    if (!xh_host) return 0;
+    for (uint64_t i = 0; i < (uint64_t)group_size * in_dim; i++) xh_host[i] = __float2half(x_host[i]);
+
+    const uint64_t w_bytes = (uint64_t)out_dim * row_bytes;
+    cudaMalloc(&w_dev, w_bytes);
+    cudaMalloc(&xh_dev, (uint64_t)group_size * in_dim * sizeof(__half));
+    cudaMalloc(&out_dev, (uint64_t)group_size * out_dim * sizeof(float));
+    cudaMemcpy(w_dev, w_host, w_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(xh_dev, xh_host, (uint64_t)group_size * in_dim * sizeof(__half), cudaMemcpyHostToDevice);
+    cudaMemset(out_dev, 0, (uint64_t)group_size * out_dim * sizeof(float));
+    free(xh_host);
+
+    int ok = dqg_group_gemm_mxfp4_mma(out_dev, (const char *)w_dev, row_bytes, xh_dev, in_dim, out_dim, group_size);
+    cudaDeviceSynchronize();
+    cudaMemcpy(out_group_host, out_dev, (uint64_t)group_size * out_dim * sizeof(float), cudaMemcpyDeviceToHost);
+
+    cudaFree(w_dev); cudaFree(xh_dev); cudaFree(out_dev);
+    return ok;
+}
+
 /* Dequant-once, GEMM-with-n=group_size sibling of dequant_gemm_row_f16gemm
  * above. `wh_scratch` must already be sized to hold >= out_dim*in_dim f16
  * elements (the caller carves it out of one shared cuda_tmp_alloc_on
@@ -21829,6 +22159,54 @@ static int dqg_group_gemm(
         __half *wh_scratch,
         int logical_tier) {
     if (!out_group || !w || !xh_group || !wh_scratch || !g_cublas_ready) return 0;
+
+    /* P3c-1 take 2: native MXFP4 tensor-core MMA path, sm_121a only.
+     *
+     * KNOWN BROKEN, DEFAULT OFF -- do not flip the default without fixing
+     * the bug documented below and re-running research/gb10/
+     * test_mxfp4_mma_diag.c / test_mxfp4_mma_gemm.c as the correctness
+     * gate. The probe (mxf4_probe.cu) confirms the raw PTX
+     * mma.sync...kind::mxf4.block_scale instruction itself compiles and
+     * executes correctly on this hardware/toolchain (D==64.0 exactly).
+     * dsv4_mxfp4_mma_gemm_kernel (above) builds on that with ported
+     * tile<>/load_ldmatrix/load_generic layout primitives from
+     * llama.cpp's mma.cuh (MIT, @5f55650) plus an independently-derived
+     * activation (B-operand) quantize+pack matching
+     * quantize_mmq_mxfp4's output byte layout -- it compiles clean and
+     * produces plausible (GEMM-shaped, right order of magnitude)
+     * output, but is numerically WRONG: a one-hot diagnostic
+     * (research/gb10/test_mxfp4_mma_diag.c -- weight row r has a single
+     * nonzero element at k=r, distinct per-k activation values) shows
+     * only 2 of 16 output rows (a fixed, lane-correlated pair) come out
+     * correct; the rest are silently zero. This narrows the bug to the
+     * A-operand (weight) ldmatrix addressing or the tile_C write-back
+     * lane mapping -- ported directly from llama.cpp's own formulas, so
+     * either the port has a transcription error not yet found, or (less
+     * likely, since the probe's own D==64 check exercises a superset of
+     * the same asm operands) there's a subtlety in how those formulas
+     * compose when used outside the donor's full templated MMQ
+     * scheduling context (e.g. an implicit assumption about nwarps>1 or
+     * SRAM tile width that a single-warp, single-k64-chunk-at-a-time
+     * specialization violates). Follow-up should bisect A vs C
+     * independently (e.g. force B to an all-ones constant with a known
+     * scale, or dump A.x[]/C.x[] via device printf for a single lane)
+     * before trusting this path's numbers again. See
+     * research/gb10/FP4_PORT_SCOPE.md's P3c-1 take 2 section for the
+     * full writeup.
+     *
+     * Requires explicit opt-in (DS4_CUDA_ENABLE_MMA_PREFILL_EXPERIMENTAL=1)
+     * specifically so no default build path can silently compute wrong
+     * routed-expert outputs. Decode (n_tokens==1) never reaches
+     * dqg_group_gemm at all (see routed_moe_dequant_gemm_dispatch_prefill_grouped's
+     * own n_tokens>1 gate) and Q3_K/Q5_K-typed weights are unaffected:
+     * only gate_type/down_type == 39 (MXFP4) ever reaches this branch. */
+    if (type == 39u && group_size > 1u &&
+        getenv("DS4_CUDA_ENABLE_MMA_PREFILL_EXPERIMENTAL") != NULL &&
+        dsv4_mxfp4_mma_capable() &&
+        dqg_group_gemm_mxfp4_mma(out_group, w, row_bytes, xh_group, in_dim, out_dim, group_size)) {
+        return 1;
+    }
+
     const uint32_t block_elems = dequant_gemm_block_elems(type);
     const uint64_t block_bytes = dequant_gemm_block_bytes(type);
     if (block_elems == 0u || in_dim % block_elems != 0u) return 0;

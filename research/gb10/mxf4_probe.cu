@@ -20,9 +20,14 @@ __global__ void mxf4_probe_kernel(float * out) {
     for (int i = 0; i < 4; ++i) Axi[i] = 0x22222222u;
     for (int i = 0; i < 2; ++i) Bxi[i] = 0x22222222u;
 
-    // E8M0 scale byte 127 -> 2^(127-127) = 1.0, packed in low byte, rest zero.
-    unsigned int a_scale = 127u;
-    unsigned int b_scale = 127u;
+    // E8M0 scale byte 127 -> 2^(127-127) = 1.0. scale_vec::2X consumes TWO scale
+    // bytes per operand row (one per k32 sub-block of the k64 tile); pack 127 into
+    // every byte of the 32-bit scale register (not just byte 0) so the result is
+    // correct regardless of which byte-id/thread-id the hardware actually reads --
+    // the original bug left byte 1 (and up) as 0x00 (~2^-127), collapsing the second
+    // k32 sub-block's contribution to ~0 and halving D from 64.0 to 32.0.
+    unsigned int a_scale = 0x7F7F7F7Fu;
+    unsigned int b_scale = 0x7F7F7F7Fu;
 
     asm volatile(
         "mma.sync.aligned.kind::mxf4.block_scale.scale_vec::2X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0 "
