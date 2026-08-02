@@ -2237,6 +2237,26 @@ compatibility" unit; summary for anyone touching this code next:
   fetch). **A full warm multi-turn with/without-drafter trajectory was not completed within
   this unit's time budget** -- the natural next step for whoever picks this up.
 
+**Follow-up (2026-08-02): GA-matched drafter detection fixed, full warm A/B completed --
+verdict is a measured non-win, not another blocker.** The `a335048` blocker (GA-matched
+drafter, different tensor-naming dialect, `support_model_detect()` didn't recognize it) is
+resolved: `dspark.*`-dialect per-stage and global/head tensor binding added to `ds4.c`
+(dialect-compat-alias style, additive, legacy `mtp.*` path untouched), after confirming the
+two-matrix `markov_w1`/`markov_w2` head is exactly what ds4's own DSpark compute already
+consumes (not new math -- verified against the artifact's own conversion recipe and raw GGUF
+header, both matching ds4's existing `[markov_rank, DS4_N_VOCAB]` two-matrix consumer). The
+matched drafter now loads, detects, and decodes correctly (byte-identical to no-drafter on
+verbatim/identity checks). The completed warm 8-turn A/B, finally answering this section's
+own "natural next step" above: **the matched drafter does not beat the no-drafter baseline at
+either confidence setting** -- default confidence (0.9) is 26.7% slower (3.85 vs. 5.25 t/s
+steady state), force-accept (0.0) is 69.1% slower (1.62 t/s), because the verify path in this
+build never accepts more than 2 tokens per event regardless of draft length or confidence
+setting, so longer/more-frequent drafting only adds cost without adding accepted tokens.
+Full writeup, evidence, and the acceptance-rate/draft-length stats behind this verdict: see
+`MEASUREMENTS.md`'s "Matched-drafter detection fix + completed A/B" entry. Production
+recommendation unchanged from the entry above -- do not enable `--mtp`/`--dspark` on the live
+`ExecStart`.
+
 ## Quality battery
 
 Calibration/hallucination probe battery for pre-promotion GA-FP4 checks: see `research/gb10/calibration_probes/` (40-item probes.jsonl across unanswerable/known-fact/trap-premise/tool-precision categories, runner + heuristic scorer, protocol comparing IQ2 baseline vs. GA FP4 vs. GA FP4 with an abstention system prompt).

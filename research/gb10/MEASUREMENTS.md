@@ -2453,3 +2453,295 @@ reference tracking only, not auto-synced) and committed as `ee5c976`
 streamed MXFP4 config"). The litellm ConfigMap was not changed, so no litellm
 IaC diff exists this unit. Not pushed, per instructions -- operator pushes
 that repo.
+
+## Matched-drafter detection fix + completed A/B: `dspark.*` dialect wired, drafter does not beat baseline (2026-08-02)
+
+**Scope.** Resume the `a335048` blocker: the GA-matched DSpark drafter
+(`gguf/DeepSeek-V4-Flash-0731-DSpark-Drafter-MXFP4-Q8_0.gguf`, 10.9 GB,
+alessandrobologna) failed `support_model_detect()` because it uses a
+`dspark.<stage>.<component>` / top-level-head tensor-naming dialect instead
+of the `mtp.<stage>.<component>` dialect ds4's detector/binder hardcode.
+`a335048` explicitly deferred wiring this up until the Markov two-matrix
+question ("is `markov_w1`/`markov_w2` a drop-in equivalent to the detector's
+assumed single `markov_head` tensor") was resolved by someone who understands
+the DSpark head's math -- not guessed at blind. That resolution, the
+detection/binding fix, and the full A/B this unblocks are this unit's scope.
+
+### Phase 1: Markov/shape semantics -- resolved before any wiring
+
+**Verdict: the two-matrix `markov_w1`/`markov_w2` form is exactly what ds4's
+own DSpark compute already consumes -- this is a pure naming-dialect gap,
+not a different math variant.** Evidence, not assumption:
+
+1. **ds4's own compute already implements a two-matrix Markov head.**
+   `dspark_weights_bind_optional()` (`ds4.c`) already binds two separate
+   tensors, `markov_w1` and `markov_w2` (not one), both validated to shape
+   `[markov_rank, DS4_N_VOCAB]` (`dspark_validate_tensor_layout()`). The
+   consumer (`dspark_apply_markov_greedy_probe()`, CPU path, and its CUDA
+   counterparts) reads a `markov_w1` row indexed by the previous token
+   (`dspark_dense_row_to_f32()`, treating `markov_w1` as a
+   `[DS4_N_VOCAB, markov_rank]` lookup table -- one `markov_rank`-length
+   state vector per vocabulary token) and then matrix-vector-multiplies
+   that state through `markov_w2` (`[markov_rank, DS4_N_VOCAB]`) to produce
+   a per-vocab logit bias. This is a genuine, pre-existing rank-decomposed
+   Markov head, not a detector limitation to work around -- no
+   reconstruction (e.g. `w1 @ w2` into a single matrix) is needed or
+   appropriate.
+2. **The GA artifact's tensors are shape-identical to what that compute
+   expects.** Raw GGUF header parse (no dependency on `--inspect`, which
+   refuses to load a support-only file) of
+   `DeepSeek-V4-Flash-0731-DSpark-Drafter-MXFP4-Q8_0.gguf`:
+   `dspark.markov_rank = 256`; `dspark.markov_w1.weight` dims=`(256, 129280)`
+   F16; `dspark.markov_w2.weight` dims=`(256, 129280)` F16. The main model's
+   own `token_embd.weight` confirms `DS4_N_VOCAB = 129280`
+   (`dims=(4096, 129280)`). Both tensors match ds4's expected
+   `[markov_rank, DS4_N_VOCAB]` layout exactly, same dtype family
+   (`DS4_DSPARK_LAYOUT_DENSE` accepts F16/F32/Q8_0).
+3. **The artifact builder's own conversion recipe confirms it's a rename,
+   not new math.** Fetched `scripts/recipe.py` from
+   `alessandrobologna/DeepSeek-V4-Flash-0731-DSpark-Drafter-GGUF` (HF resolve
+   API, small text file, no model weights pulled). Its `_global_plan()`
+   reads the *source* checkpoint's `markov_w1`/`markov_w2` tensors from
+   `f"{head}.markov_head.{suffix}.weight"` -- i.e. the source uses ds4's own
+   `mtp.<stage>.markov_head.markov_wN.weight`-shaped convention -- and
+   re-emits them as top-level `dspark.markov_w1.weight`/
+   `dspark.markov_w2.weight` with `dims=(MARKOV_RANK, VOCAB_SIZE)`,
+   `GGML_F16`. Same declared shape, same source tensor, only the on-disk
+   name changed by the conversion script. No factorization, reconstruction,
+   or new head design is involved anywhere in this artifact's build
+   pipeline.
+4. **The one genuine (not just naming) wrinkle found: the confidence
+   projection is stored with a different tensor rank, not different data.**
+   ds4 expects `confidence_head.proj.weight` as a 2-D
+   `[D_EMBD + markov_rank, 1]` single-column matrix; this dialect's
+   `dspark.confidence_head.weight` is a 1-D `[D_EMBD + markov_rank]`
+   (`dims=(4352,)`, `4352 = 4096 + 256`) flat vector -- same total elements,
+   identical contiguous bytes, just a cosmetic `ndim` difference (a
+   length-N vector and an Nx1 matrix have the same memory layout). Handled
+   as an in-place shape promotion (append a trailing dim of 1), not a
+   separate math path -- see "Detection + binding fix" below.
+
+Per the `a335048` decision gate ("if the two-matrix form is provably
+equivalent... proceed. If the semantics are genuinely different math, STOP"):
+**proceed** -- confirmed provably equivalent, not approximated.
+
+### Detection + binding fix (`ds4.c`)
+
+Additive, dialect-compat style, matching the existing `find_tensor_alias()`
+precedent (one-line notice per aliased tensor, canonical name tried first):
+
+- `ds4_tensor_dspark_stage()`: new sibling of `ds4_tensor_mtp_stage()`,
+  recognizes the `dspark.<N>.` per-stage prefix.
+- `model_dspark_summary()`: its detection loop now also walks
+  `dspark.<N>.`-prefixed tensors for stage counting, and additionally
+  inspects any `dspark.`-prefixed tensor (stage-prefixed or not) for the
+  `main_proj`/`main_norm`/confidence/final-head component-name checks,
+  since this dialect keeps global head tensors top-level, not
+  stage-prefixed. The `has_markov_head` check gained `markov_w1.`/
+  `markov_w2.` substring matches alongside the existing `.markov_head.`
+  check (this dialect drops that infix).
+- `tensor_by_stage_suffix_dialect()` (per-block tensors: attn_kv,
+  ffn_gate_inp, hc_attn_fn, ...): tries canonical `mtp.<stage>.<suffix>`
+  first, falls back to `dspark.<stage>.<suffix>` (identical suffix in both
+  dialects, verified against the artifact's own recipe -- only the stage
+  prefix differs).
+- `tensor_by_head_suffix_dialect()` (global/head tensors: main_proj,
+  main_norm, norm, hc_head_*, markov_w1/w2, confidence proj): tries
+  canonical `mtp.<stage>.<mtp_suffix>` first, falls back to top-level
+  `dspark.<dspark_suffix>` -- a *different* suffix string per role where the
+  legacy dialect embeds an infix this one doesn't
+  (`markov_head.markov_w1.weight` -> `markov_w1.weight`,
+  `confidence_head.proj.weight` -> `confidence_head.weight`), mapped
+  explicitly per tensor role, not derived mechanically.
+- Confidence-projection shape promotion: after binding, if the resolved
+  tensor is 1-D with the expected combined width
+  (`D_EMBD + markov_rank`), its `ndim`/`dim[]` are promoted in place to 2-D
+  `[width, 1]` (same tensor, no copy) before `dspark_weights_validate_layout()`
+  runs, with a one-line notice. This is the one place the fix does more than
+  rename a lookup path, and it's the exact case flagged in Phase 1 point 4
+  above -- a shape-representation fix, not new math.
+- `support_model_detect()` itself is unchanged -- it already consumes
+  `model_dspark_summary()`'s flags, so the summary fix alone makes it return
+  `DS4_SUPPORT_DSPARK` correctly for this artifact.
+
+**Legacy `mtp.*` dialect: unaffected, additive-only** -- every fallback
+tries the canonical `mtp.*` name first and only reaches the new `dspark.*`
+lookup on a miss; `model_dspark_summary()`'s stage-counting and
+component-flag logic for `mtp.*`-prefixed tensors is untouched. **Honest
+caveat, as instructed:** no `mtp.*`-named drafter file exists on this box to
+regression-test the legacy path end-to-end against; the additivity claim is
+a code-review guarantee (every new fallback is provably reached only after
+the old canonical lookup misses), not a measured one.
+
+**Build/test verification.** `make cuda-spark`: clean, zero warnings.
+`make test`: `ds4 tests: 2 failure(s)` -- `logprob-vectors` (assertion at
+`tests/ds4_test.c:5285`, exact line this doc has repeatedly logged as
+pre-existing/flaky) and the tool-call-quality/`think-tool-recovery` flake
+(same family as this doc's documented `tests/ds4_test.c:6436/6437`
+pre-existing flake; line number shifted by this unit's ~194-line addition
+earlier in the file). `metal-tensor-equivalence` **passed** this run
+(previously noted in this doc as fluctuating pass/fail across runs
+independent of any DSpark-related diff). No new failing test names; nothing
+in this unit's diff touches the tool-call or logprob-vector code paths.
+`dspark-verify-depth`/`mtp-verify-depth`: skipped (no `DS4_TEST_DSPARK`/
+`DS4_TEST_MTP` configured), same as every prior unit.
+
+### Phase 2: A/B, now unblocked
+
+**Pairing smoke** (`ds4-server` stopped first; this doubled as the memory
+freed up for `make test`'s own CUDA runs, which refuse to start alongside
+another `ds4` process):
+```
+DS4_DSPARK_SPEC_LOG=1 DS4_CUDA_STREAM_STATS=1 ./ds4 \
+  -m gguf/DeepSeek-V4-Flash-0731-MXFP4_MOE-Q8_0.gguf \
+  --cuda --ssd-streaming --ssd-streaming-cache-experts 75GB \
+  --mtp gguf/DeepSeek-V4-Flash-0731-DSpark-Drafter-MXFP4-Q8_0.gguf --dspark \
+  --nothink --temp 0 -p "Reply with exactly: ok"
+```
+Load succeeds: `ds4: DSpark support model detected: ...(stages=3 block=5
+markov_rank=256 tensors=81 missing=0 invalid=0 metadata_errors=0)`. All 81
+tensors bind (76 dialect-compat-aliased per-stage/head tensors plus the one
+confidence-vector reshape notice; full alias list in this unit's raw logs).
+`"ok"` prompt: output `ok`. France prompt (`"What is the capital of
+France?"`): output `The capital of France is Paris.`, with real speculative
+activity observed this time (`DSpark spec partial drafted=4 verified=1
+accepted=2`) -- unlike the prior blocked unit, drafting now actually runs.
+
+**Verbatim + identity check vs. no-drafter**, both prompts, `--temp 0`:
+stdout (diagnostic lines stripped) byte-identical between the `--mtp
+--dspark`-enabled run and a plain no-drafter run:
+- `"ok"`: identical (`ok\n`) both arms.
+- France: identical (`The capital of France is Paris.\n`) both arms.
+
+Identity gate: **PASS**.
+
+**Memory incident during Arm B setup (dropped budget, per protocol).**
+Launching Arm B (drafter, default confidence) at the established 75GB
+budget, `available` memory fell to 8 GiB (`free -g`: `used=113 free=2
+buff/cache=7 available=8`, swap engaged to 1 GiB) -- below this unit's
+10 GiB floor. Checked against real signals before reacting (per this doc's
+own precedent for telling genuine thrashing from a scary-looking number):
+`uptime` load average 1.49-1.91 (not the 50-59 seen in the documented 100GB
+thrash incident), `vmstat` `sy` 1-5% (not 93-94%), no `dmesg`
+memory-pressure/OOM lines. Not a confirmed thrash, but the ticket's explicit
+protocol for this exact scenario ("drafter ~11GB on top of 75GB budget --
+drop budget to 65GB if the floor is threatened") is directive on a numeric
+floor, so it was followed: killed the run at turn 1 (`SIGTERM`, no `SIGKILL`
+needed), confirmed memory recovered to baseline (117 GiB free, 0 swap), and
+re-ran both drafter arms at **65GB** instead of 75GB. At 65GB, `available`
+stayed at 16-18 GiB throughout both drafter arms (brief 1 GiB swap blips on
+a couple of samples, never sustained, never approaching the incident
+pattern). **Deviation from spec, flagged explicitly:** the drafter arms
+below are measured at 65GB cache budget, not the no-drafter arm's 75GB --
+not a controlled apples-to-apples cache budget between arms A and B/C,
+mirroring the same caveat this doc already carries for the GA-without-drafter
+75GB-vs-100GB comparison.
+
+**Warm 8-turn A/B**, `research/gb10/session_prompts.txt` (identical prompts
+to this doc's established no-drafter baseline), `--nothink --temp 0`,
+`DS4_CUDA_STREAM_STATS=1`, `DS4_DSPARK_SPEC_LOG=1` on the drafter arms,
+single session per arm (n=1, consistent with this doc's existing warm-session
+methodology and its stated time-budget constraint):
+
+| turn | topic | prefill tok | Arm A: no-drafter, 75GB (t/s) | Arm B: drafter, confidence 0.9 (default), 65GB (t/s) | Arm C: drafter, confidence 0.0 (force-accept), 65GB (t/s) |
+|---|---|---|---|---|---|
+| 1 | photosynthesis (cold start) | n/a | 5.85 | 3.53 | 1.69 |
+| 2 | C3/C4/CAM (follow-up) | 33 | 5.87 | 4.08 | 1.71 |
+| 3 | TCP handshake (topic switch) | 28 | 5.64 | 4.03 | 1.63 |
+| 4 | TCP congestion control (follow-up) | 34 | 5.32 | 3.90 | 1.64 |
+| 5 | red-black trees (topic switch) | 30 | 5.26 | 3.72 | 1.61 |
+| 6 | red-black vs. AVL (follow-up) | 34 | 5.12 | 3.61 | 1.55 |
+| 7 | Paxos/Raft (topic switch) | 29 | 5.28 | 3.91 | 1.66 |
+| 8 | ants/load-balancing analogy (topic switch) | 32 | 5.35 | 4.03 | 1.65 |
+| | **steady state (mean, turns 6-8)** | | **5.25** | **3.85** | **1.62** |
+| | mean, turns 2-8 | | 5.41 | 3.90 | 1.64 |
+
+Prefill token counts and prefill t/s (not tabulated above, all ~0.56-0.70
+t/s across all three arms) are identical across arms turn-for-turn --
+confirms the three sessions ran the same prompts/context, only the decode
+path differs.
+
+**Acceptance/draft-length stats** (`DS4_DSPARK_SPEC_LOG=1` parsed from the
+full session logs):
+
+Arm B (confidence 0.9, default):
+- 10,734 decode steps total; **9,875 (92.0%) skip drafting entirely**
+  (scheduler's no-draft pause), only 411 (3.8%) reach a verify/accept event,
+  remainder are mid-block continuation steps.
+- Of the 411 verify events: drafted-length histogram `{2: 231, 3: 116, 4: 42,
+  5: 22}`; **every single event accepted exactly 2 tokens** (`verified=1
+  accepted=2`), independent of how many were drafted -- the verify path
+  never extends acceptance past the second token in this build/regime.
+- Aggregate accepted/drafted ratio: 822/1088 = **75.6%** -- high when a draft
+  is actually tried, but tried on only 3.8% of steps.
+
+Arm C (confidence 0.0, force-accept):
+- 8,218 decode steps; 4,102 (49.9%) skip, 2,927 (35.6%) reach verify --
+  drafting is attempted far more often than Arm B, as expected for a
+  force-accept threshold.
+- **Every verify event drafts the full block size (5) and accepts exactly 2**
+  (`drafted=5 verified=1 accepted=2` uniformly) -- so forcing acceptance
+  doesn't increase the per-event accepted-token count at all, it only
+  increases *how often* a (always-2-token, always-full-5-draft) event is
+  attempted, at 2.5x the per-event drafting cost of Arm B's shorter average
+  proposals.
+- Aggregate accepted/drafted ratio: 5854/14635 = **40.0%** -- lower than Arm
+  B's ratio, because force-accept pays for a full 5-token draft every time
+  but the target's own verify step still only ever confirms 2.
+
+**Verdict: the GA-matched DSpark drafter does not beat the no-drafter
+baseline on this ds4 CUDA `--ssd-streaming` architecture, at either
+confidence setting, on this warm 8-turn protocol.** Arm B (default
+confidence) is **26.7% slower** than Arm A's steady state (3.85 vs. 5.25
+t/s); Arm C (force-accept) is **69.1% slower** (1.62 vs. 5.25 t/s) --
+force-accepting makes it *worse*, not better, because every accept event
+still only ever nets 2 tokens (the verify path's own ceiling in this
+build/regime) while the drafter's own forward-pass cost scales with how
+often and how long it drafts. This is not the "measurement wasn't reached"
+outcome `a335048` left off at -- **this is a real, measured negative
+result**, now with a completed protocol behind it (unlike the preview-era
+community drafter, which failed even the correctness bar at first; this
+matched drafter is verbatim-correct, loads cleanly, and genuinely drafts
+and accepts tokens -- it's just not a net throughput win in the
+SSD-streaming regime on this hardware). The most plausible explanation,
+consistent with this doc's other SSD-streaming findings: per-token expert
+fetch cost dominates decode time in this regime, and the drafter's own
+per-step forward pass (loaded non-streamed, per `a335048`'s memory-plan
+note) adds real wall-clock cost that a fixed 2-tokens-per-accept-event
+ceiling can't amortize away. **Root-causing why acceptance never extends
+past 2 tokens is flagged as a genuine open question for a future unit, not
+answered here** -- this unit measured the behavior faithfully, it did not
+diagnose the verify path's internals.
+
+**Server discipline.** `ds4-server` (systemd, port 8000, production GA-0731
+streamed config) stopped before this unit's `make test`/pairing/A-B work
+began; restarted and verified `systemctl is-active`=`active`,
+`curl http://localhost:8000/v1/models`->HTTP 200 at the end. `ExecStart` was
+not touched (see recommendation block below -- drafter flags are a
+recommendation only, not applied to the live unit). No stray
+`ds4`/`ds4_test` processes left running (`ps aux` checked after every step);
+several long-dead polling-loop shells from unrelated prior sessions on this
+box were observed but not touched (not this unit's stragglers).
+
+**PRODUCTION RECOMMENDATION BLOCK (drafter: do not enable).** The detection
+gap is now closed and the drafter is fully functional and correct, but
+measurably *not* a throughput win -- do not add `--mtp`/`--dspark` to the
+live `ExecStart`. Current production config (unchanged, already correct)
+remains:
+```
+ExecStart=/home/jacinta/src/ds4/ds4-server \
+  -m /home/jacinta/src/ds4/gguf/DeepSeek-V4-Flash-0731-MXFP4_MOE-Q8_0.gguf \
+  --cuda --ssd-streaming --ssd-streaming-cache-experts 75GB \
+  --host 0.0.0.0 --port 8000 --ctx 65536 --batched-session 2 \
+  --kv-disk-dir /home/jacinta/.ds4/kv
+```
+If a future unit wants to revisit the drafter after root-causing the
+2-token acceptance ceiling above (the one lever that could plausibly change
+this verdict), the tested-working invocation to build from is:
+```
+--mtp /home/jacinta/src/ds4/gguf/DeepSeek-V4-Flash-0731-DSpark-Drafter-MXFP4-Q8_0.gguf \
+--dspark [--dspark-confidence F]
+```
+-- confirmed to load and decode correctly at both 65GB and 75GB
+`--ssd-streaming-cache-experts` budgets (drafter's own resident footprint is
+~10-11 GiB on top of that budget, non-streamed).

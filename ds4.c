@@ -2615,6 +2615,31 @@ static bool ds4_tensor_mtp_stage(ds4_str name, uint32_t *stage) {
     return true;
 }
 
+/* Same per-stage tensor-name parsing as ds4_tensor_mtp_stage() above, but
+ * for the "dspark.<stage>.<component>" naming dialect (as opposed to
+ * "mtp.<stage>.<component>") seen in the alessandrobologna GA-0731 DSpark
+ * drafter GGUF conversion (dspark.0.attn_kv.weight, dspark.1.ffn_gate_inp.weight,
+ * etc.). Verified against that artifact's own recipe.py: per-block tensor
+ * suffixes are identical between the two dialects (only the stage prefix
+ * differs -- "mtp." vs "dspark."), so this only needs to recognize the
+ * alternate prefix; component-name matching downstream is unchanged. */
+static bool ds4_tensor_dspark_stage(ds4_str name, uint32_t *stage) {
+    if (!ds4_str_starts_with(name, "dspark.")) return false;
+    uint64_t pos = 7;
+    if (pos >= name.len || !isdigit((unsigned char)name.ptr[pos])) return false;
+
+    uint32_t value = 0;
+    while (pos < name.len && isdigit((unsigned char)name.ptr[pos])) {
+        uint32_t digit = (uint32_t)(name.ptr[pos] - '0');
+        if (value > (UINT32_MAX - digit) / 10u) return false;
+        value = value * 10u + digit;
+        pos++;
+    }
+    if (pos >= name.len || name.ptr[pos] != '.') return false;
+    *stage = value;
+    return true;
+}
+
 static ds4_dspark_summary model_dspark_summary(const ds4_model *m) {
     static const char *const block_keys[] = {
         "deepseek4.dspark.block_size",
@@ -2668,13 +2693,40 @@ static ds4_dspark_summary model_dspark_summary(const ds4_model *m) {
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         ds4_str name = m->tensors[i].name;
         uint32_t stage = 0;
-        if (!ds4_tensor_mtp_stage(name, &stage)) continue;
-        if (!have_stage || stage > max_stage) max_stage = stage;
-        have_stage = true;
+        /* Two per-stage dialects share this loop: legacy "mtp.<stage>."
+         * and the alessandrobologna GA-0731 "dspark.<stage>." naming.
+         * A tensor that matches either contributes to stage-count
+         * tracking. Additionally, that same dspark.* dialect keeps its
+         * shared/global head tensors (main_proj, main_norm, norm,
+         * markov_w1/w2, confidence_head, hc_head_*) *top-level*, not
+         * stage-prefixed at all (e.g. "dspark.markov_w1.weight", not
+         * "dspark.2.markov_head.markov_w1.weight") -- confirmed against
+         * the artifact's own conversion recipe (scripts/recipe.py in
+         * alessandrobologna/DeepSeek-V4-Flash-0731-DSpark-Drafter-GGUF),
+         * which builds these from a stage-prefixed *source* checkpoint
+         * (mtp.<final_stage>.markov_head.markov_w1/w2.weight, same
+         * shapes ds4 already consumes) and re-emits them without the
+         * stage/markov_head/confidence_head/proj infixes. So any
+         * "dspark."-prefixed tensor -- stage-prefixed or not -- is
+         * eligible for the component-name checks below; only stage-count
+         * tracking is restricted to tensors with a genuine numeric stage
+         * prefix. */
+        bool has_stage_prefix = ds4_tensor_mtp_stage(name, &stage) ||
+                                 ds4_tensor_dspark_stage(name, &stage);
+        if (has_stage_prefix) {
+            if (!have_stage || stage > max_stage) max_stage = stage;
+            have_stage = true;
+        } else if (!ds4_str_starts_with(name, "dspark.")) {
+            continue;
+        }
 
         if (ds4_str_contains(name, ".main_proj.")) s.has_main_proj = true;
         if (ds4_str_contains(name, ".main_norm.")) s.has_main_norm = true;
-        if (ds4_str_contains(name, ".markov_head.")) s.has_markov_head = true;
+        if (ds4_str_contains(name, ".markov_head.") ||
+            ds4_str_contains(name, ".markov_w1.") ||
+            ds4_str_contains(name, ".markov_w2.")) {
+            s.has_markov_head = true;
+        }
         if (ds4_str_contains(name, ".confidence_head.")) s.has_confidence_head = true;
         if (ds4_str_contains(name, ".hc_head_") ||
             ds4_str_contains(name, ".norm.weight")) {
@@ -4823,6 +4875,83 @@ static ds4_tensor *tensor_by_mtp_stage_suffix(
     int n = snprintf(name, sizeof(name), "mtp.%u.%s", stage, suffix);
     if (n < 0 || (size_t)n >= sizeof(name)) ds4_die("tensor name is too long");
     return model_find_tensor(m, name);
+}
+
+/* dspark.* dialect compat for per-stage DSpark block tensors (attn_kv,
+ * ffn_gate_inp, hc_attn_fn, ...): canonical is "mtp.<stage>.<suffix>";
+ * the alessandrobologna GA-0731 drafter dialect uses "dspark.<stage>.<suffix>"
+ * with the identical suffix (verified against that artifact's own
+ * scripts/recipe.py, which carries per-block suffixes through unchanged
+ * from its "mtp.<stage>." source naming -- only the stage prefix differs),
+ * so the fallback here needs no suffix remapping, just the alternate
+ * prefix. Same one-line-notice spirit as find_tensor_alias() above. */
+static ds4_tensor *tensor_by_stage_suffix_dialect(
+        const ds4_model *m,
+        uint32_t         stage,
+        const char      *suffix) {
+    ds4_tensor *t = tensor_by_mtp_stage_suffix(m, stage, suffix);
+    if (t) return t;
+
+    char mtp_name[160];
+    char dspark_name[160];
+    int n1 = snprintf(mtp_name, sizeof(mtp_name), "mtp.%u.%s", stage, suffix);
+    int n2 = snprintf(dspark_name, sizeof(dspark_name), "dspark.%u.%s", stage, suffix);
+    if (n1 < 0 || (size_t)n1 >= sizeof(mtp_name) ||
+        n2 < 0 || (size_t)n2 >= sizeof(dspark_name)) {
+        ds4_die("tensor name is too long");
+    }
+    t = model_find_tensor(m, dspark_name);
+    if (t) {
+        fprintf(stderr,
+                "ds4: tensor %s missing, found %s -- dialect compat "
+                "(dspark.* per-stage naming), using it as %s\n",
+                mtp_name, dspark_name, mtp_name);
+    }
+    return t;
+}
+
+/* dspark.* dialect compat for DSpark *head/global* tensors (main_proj,
+ * main_norm, norm, hc_head_*, markov_w1/w2, confidence proj): canonical is
+ * "mtp.<stage>.<mtp_suffix>" (stage 0 for main_proj/main_norm, final stage
+ * for the rest, per ds4's existing legacy-MTP convention); the
+ * alessandrobologna GA-0731 dialect keeps these tensors *global*, not
+ * stage-prefixed, and drops the "markov_head."/"confidence_head.proj."
+ * infixes the legacy suffix carries -- e.g. legacy
+ * "mtp.2.markov_head.markov_w1.weight" is this dialect's top-level
+ * "dspark.markov_w1.weight". Verified against the artifact's own
+ * scripts/recipe.py (its _global_plan(), which reads
+ * "mtp.<HEAD_LAYER>.markov_head.markov_w1/w2.weight" from the *source*
+ * checkpoint and re-emits it as "dspark.markov_w1/w2.weight" -- same
+ * tensor, same (markov_rank, DS4_N_VOCAB) shape ds4's compute already
+ * consumes, just renamed) and against the raw GGUF header of
+ * DeepSeek-V4-Flash-0731-DSpark-Drafter-MXFP4-Q8_0.gguf (dims match
+ * exactly). dspark_suffix must therefore be supplied per role, not
+ * derived from mtp_suffix. */
+static ds4_tensor *tensor_by_head_suffix_dialect(
+        const ds4_model *m,
+        uint32_t         stage,
+        const char      *mtp_suffix,
+        const char      *dspark_suffix) {
+    ds4_tensor *t = tensor_by_mtp_stage_suffix(m, stage, mtp_suffix);
+    if (t) return t;
+
+    char mtp_name[160];
+    char dspark_name[160];
+    int n1 = snprintf(mtp_name, sizeof(mtp_name), "mtp.%u.%s", stage, mtp_suffix);
+    int n2 = snprintf(dspark_name, sizeof(dspark_name), "dspark.%s", dspark_suffix);
+    if (n1 < 0 || (size_t)n1 >= sizeof(mtp_name) ||
+        n2 < 0 || (size_t)n2 >= sizeof(dspark_name)) {
+        ds4_die("tensor name is too long");
+    }
+    t = model_find_tensor(m, dspark_name);
+    if (t) {
+        fprintf(stderr,
+                "ds4: tensor %s missing, found %s -- dialect compat "
+                "(dspark.* head tensors are global, not stage-prefixed), "
+                "using it as %s\n",
+                mtp_name, dspark_name, mtp_name);
+    }
+    return t;
 }
 
 static void tensor_expect_layout(
@@ -7400,7 +7529,26 @@ static ds4_tensor *dspark_bind_tensor(
         uint32_t            stage,
         const char         *suffix,
         bool                required) {
-    ds4_tensor *t = tensor_by_mtp_stage_suffix(m, stage, suffix);
+    ds4_tensor *t = tensor_by_stage_suffix_dialect(m, stage, suffix);
+    if (t) {
+        dw->present_tensors++;
+    } else if (required) {
+        dw->missing_tensors++;
+    }
+    return t;
+}
+
+/* Same as dspark_bind_tensor() but for global/head tensors, which the
+ * dspark.* dialect names differently from the per-stage suffix passed in
+ * (see tensor_by_head_suffix_dialect() for the mapping and evidence). */
+static ds4_tensor *dspark_bind_head_tensor(
+        ds4_dspark_weights *dw,
+        const ds4_model    *m,
+        uint32_t            stage,
+        const char         *mtp_suffix,
+        const char         *dspark_suffix,
+        bool                required) {
+    ds4_tensor *t = tensor_by_head_suffix_dialect(m, stage, mtp_suffix, dspark_suffix);
     if (t) {
         dw->present_tensors++;
     } else if (required) {
@@ -7466,27 +7614,53 @@ static void dspark_weights_bind_optional(
         ds4_dspark_stage_weights *sw = &dw->stage[stage];
         dspark_bind_block(dw, &sw->block, m, stage);
         if (stage == 0) {
-            sw->main_proj = dspark_bind_tensor(dw, m, stage, "main_proj.weight", true);
-            sw->main_norm = dspark_bind_tensor(dw, m, stage, "main_norm.weight", true);
+            sw->main_proj = dspark_bind_head_tensor(
+                dw, m, stage, "main_proj.weight", "main_proj.weight", true);
+            sw->main_norm = dspark_bind_head_tensor(
+                dw, m, stage, "main_norm.weight", "main_norm.weight", true);
         }
     }
 
     if (dw->n_stages != 0) {
         const uint32_t final_stage = dw->n_stages - 1u;
         ds4_dspark_stage_weights *sw = &dw->stage[final_stage];
-        sw->norm = dspark_bind_tensor(dw, m, final_stage, "norm.weight", true);
-        sw->hc_head_base =
-            dspark_bind_tensor(dw, m, final_stage, "hc_head_base.weight", true);
-        sw->hc_head_fn =
-            dspark_bind_tensor(dw, m, final_stage, "hc_head_fn.weight", true);
-        sw->hc_head_scale =
-            dspark_bind_tensor(dw, m, final_stage, "hc_head_scale.weight", true);
-        sw->markov_w1 =
-            dspark_bind_tensor(dw, m, final_stage, "markov_head.markov_w1.weight", true);
-        sw->markov_w2 =
-            dspark_bind_tensor(dw, m, final_stage, "markov_head.markov_w2.weight", true);
-        sw->confidence_proj =
-            dspark_bind_tensor(dw, m, final_stage, "confidence_head.proj.weight", true);
+        sw->norm = dspark_bind_head_tensor(
+            dw, m, final_stage, "norm.weight", "norm.weight", true);
+        sw->hc_head_base = dspark_bind_head_tensor(
+            dw, m, final_stage, "hc_head_base.weight", "hc_head_base.weight", true);
+        sw->hc_head_fn = dspark_bind_head_tensor(
+            dw, m, final_stage, "hc_head_fn.weight", "hc_head_fn.weight", true);
+        sw->hc_head_scale = dspark_bind_head_tensor(
+            dw, m, final_stage, "hc_head_scale.weight", "hc_head_scale.weight", true);
+        sw->markov_w1 = dspark_bind_head_tensor(
+            dw, m, final_stage, "markov_head.markov_w1.weight", "markov_w1.weight", true);
+        sw->markov_w2 = dspark_bind_head_tensor(
+            dw, m, final_stage, "markov_head.markov_w2.weight", "markov_w2.weight", true);
+        sw->confidence_proj = dspark_bind_head_tensor(
+            dw, m, final_stage, "confidence_head.proj.weight", "confidence_head.weight", true);
+        if (sw->confidence_proj && sw->confidence_proj->ndim == 1 &&
+            sw->confidence_proj->dim[0] == (uint64_t)DS4_N_EMBD + dw->markov_rank) {
+            /* dspark.* dialect stores the confidence projection as a flat
+             * [D_EMBD + markov_rank] vector ("dspark.confidence_head.weight",
+             * dims=(4352,) in the GA-0731 drafter artifact) rather than
+             * ds4's expected [D_EMBD + markov_rank, 1] single-column
+             * matrix ("confidence_head.proj.weight" in the legacy
+             * dialect). Both are the same contiguous bytes -- a
+             * length-N vector and an Nx1 matrix have identical memory
+             * layout -- so promote the shape in place (same tensor, no
+             * data copy) rather than duplicate the downstream compute
+             * path for a cosmetic ndim difference. */
+            ds4_tensor *cp = sw->confidence_proj;
+            if (cp->ndim < DS4_MAX_DIMS) {
+                cp->dim[cp->ndim] = 1;
+                cp->ndim += 1;
+                fprintf(stderr,
+                        "ds4: tensor %.*s reshaped from [%" PRIu64 "] to "
+                        "[%" PRIu64 ", 1] -- dialect compat (dspark.* "
+                        "confidence head stored as a flat vector)\n",
+                        (int)cp->name.len, cp->name.ptr, cp->dim[0], cp->dim[0]);
+            }
+        }
     }
 
     dspark_weights_validate_layout(dw);
