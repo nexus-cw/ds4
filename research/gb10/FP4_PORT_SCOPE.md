@@ -2257,6 +2257,47 @@ Full writeup, evidence, and the acceptance-rate/draft-length stats behind this v
 recommendation unchanged from the entry above -- do not enable `--mtp`/`--dspark` on the live
 `ExecStart`.
 
+## DSpark drafter 2-token acceptance ceiling: root-caused, STRUCTURAL (2026-08-02)
+
+Root-caused why every DSpark verify event accepts exactly 2 tokens
+(bonus + 1) regardless of drafted length (2-5) or confidence setting, per
+this section's own "one lever that could plausibly change this verdict"
+follow-up. Full trace and evidence in `MEASUREMENTS.md`'s "Spec-decode
+2-token acceptance ceiling" entry; summary:
+
+- The verify/accept machinery (`ds4.c:62050-62420` `commit_drafts`
+  longest-common-prefix loop, `metal_graph_verify_suffix_tops_impl`
+  `ds4.c:35063`) is correct, standard speculative-decode logic -- not the
+  cause. No hardcoded cap, no window-size-2 bug, no truncation before
+  verify.
+- Real cause: the drafter's one-shot batched proposal
+  (`metal_graph_eval_dspark_stage_chain`, `ds4.c:32351`) seeds every
+  draft-slot position beyond the first with the checkpoint's own
+  `noise_token_id` metadata placeholder
+  (`metal_graph_prepare_dspark_setup_block`, `ds4.c:31401-31432`), not the
+  real (or even self-consistent) continuation, then applies only a weak
+  order-1 "Markov" correction (`ds4.c:33103-33356`, previous-token
+  embedding bias, no re-encode). Position 0 gets real context and verifies
+  well (that's the pre-verify `target_top == drafts[0]` gate passing);
+  position 1+ is conditioned on a noise mask and, in this GA-matched
+  drafter/target pairing, essentially never survives batch-verify against
+  the target's real causal continuation -- confirmed uniform across all
+  3,338 verify events measured in both A/B arms (`verified=1` always).
+  This is the model checkpoint's own intended masked/parallel-block
+  decoding design (real GGUF metadata field, not a ds4 port artifact), and
+  there is no iterative refinement/denoising loop in the codebase to let
+  later positions condition on earlier drafted tokens' real content.
+- **Verdict: STRUCTURAL, not wiring** -- nothing to point-fix. A real fix
+  would need a new multi-round refinement mechanism (re-embed +
+  re-run the stage-chain per round with real tokens replacing the noise
+  placeholder), estimated **medium** size, its own ticket, and no
+  guaranteed win even then (each refinement round adds real forward-pass
+  cost on hardware where per-token expert-fetch cost already dominates,
+  per this section's own prior finding).
+- No model runs performed this unit (code-trace only); `ds4-server` was
+  not touched.
+
+
 ## Quality battery
 
 Calibration/hallucination probe battery for pre-promotion GA-FP4 checks: see `research/gb10/calibration_probes/` (40-item probes.jsonl across unanswerable/known-fact/trap-premise/tool-precision categories, runner + heuristic scorer, protocol comparing IQ2 baseline vs. GA FP4 vs. GA FP4 with an abstention system prompt).

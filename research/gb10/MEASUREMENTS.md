@@ -2745,3 +2745,161 @@ this verdict), the tested-working invocation to build from is:
 -- confirmed to load and decode correctly at both 65GB and 75GB
 `--ssd-streaming-cache-experts` budgets (drafter's own resident footprint is
 ~10-11 GiB on top of that budget, non-streamed).
+
+## Spec-decode 2-token acceptance ceiling: root-caused, STRUCTURAL, no code changed (2026-08-02)
+
+**Task**: find what caps every DSpark verify event at exactly `accepted=2`
+(`n_accept` starts at 1 for the pre-verified bonus token, then the verify/replay
+path never adds more than 1 further token), independent of drafted length
+(2/3/4/5) or confidence setting (default 0.9 or force-accept 0.0), as measured
+in the prior unit's 8-turn A/B (`822/1088 = 75.6%` aggregate ratio, but
+`{2:231, 3:116, 4:42, 5:22}` drafted-length histogram against a **uniform**
+`verified=1` on every one of 411 (Arm B) and 2,927 (Arm C) verify events).
+
+**Phase 1 code trace, read-only, no model runs.**
+
+1. **Log/state machine** (`ds4.c:62050` `ds4_session_eval_dspark_speculative_argmax`):
+   `n_accept` enters already holding 1 (the bonus token accepted by the
+   caller at `ds4.c:65444-65445` before this function is ever called).
+   `max=max_tokens`/`valid`/`len` in the "spec enter" log
+   (`ds4.c:62078`) are `s->dspark_draft_valid`/`s->dspark_draft_len` from the
+   *previous* decode step's proposal. `drafted=` in "spec accept"/"spec
+   partial" (`ds4.c:62229-62233`, `62404-62408`) is `draft_n` (the number of
+   draft tokens actually sent into this verify call, after all caps);
+   `verified=` is `commit_drafts` -- the longest common prefix between the
+   drafter's proposed suffix and the target's own batched-verify top-1 per
+   row; `accepted=` is the running `n_accept` (bonus + `commit_drafts`,
+   capped by `accepted_cap`).
+
+2. **Verify pass** (`metal_graph_verify_suffix_tops_impl`, `ds4.c:35063`):
+   genuinely batch-verifies **all** `draft_n` draft tokens in one pass
+   (`top_rows = n_tokens - 1`, one argmax row per position via
+   `ds4_gpu_indexer_topk_tensor`/`ds4_gpu_argmax_tensor`). The commit loop
+   (`ds4.c:62234-62240`) does standard longest-common-prefix comparison,
+   `row_tops[i-1]` (target's true next-token prediction after real token
+   `drafts[i-1]`) vs. `drafts[i]` (drafter's own proposed token at position
+   `i`) -- **this is correct, textbook speculative-decode verify semantics,
+   not the source of the ceiling.** None of the suspects (a)-(c)/(e) from
+   the ticket hold: the verify batch is not artificially limited to 1 draft
+   token, there is no hardcoded `min()`/window-size-2 cap, and
+   `spec_frontier_snapshot`/`_restore` (`ds4.c:50537-50395`) is a rollback
+   primitive only, not an accept-count limiter.
+
+3. **Root cause -- suspect (d), confirmed** (`ds4.c:31401-31432`
+   `metal_graph_prepare_dspark_setup_block`, and the fused
+   `_stage0_setup_block` twin at `ds4.c:31489-31520`): the one-shot batched
+   forward that produces the drafter's own per-position `base_logits`
+   (`metal_graph_eval_dspark_stage_chain`, `ds4.c:32351-32427`, called
+   **once per decode step**, not once per draft position) seeds every
+   draft-slot position beyond the first with a **fixed placeholder token**,
+   not the real (or even the drafter's own previously-picked) continuation:
+   ```
+   ids[0] = (int32_t)token;                         /* true last-accepted token */
+   for (uint32_t i = 1; i < dw->block_size; i++) {
+       ids[i] = (int32_t)dw->noise_token_id;        /* fixed mask/noise token, from GGUF metadata */
+   }
+   ```
+   `dw->noise_token_id` is a genuine checkpoint-supplied metadata field
+   (`deepseek4.dspark.noise_token_id` / `dspark.noise_token_id`,
+   `ds4.c:2655-2679`, `ds4.c:7602-7606`), confirming this is the model's
+   own intended parallel/masked-block decoding scheme (a DeepSeek DSpark
+   design: predict a whole block from one non-causal pass over a
+   real-token-then-noise-masked sequence), **not** an artifact of ds4's
+   port. The subsequent per-position "Markov correction"
+   (`dspark_apply_markov_greedy_probe` / `_lazy_runtime`, `ds4.c:33103-33356`)
+   only ever conditions on the *single previous drafted token's embedding*
+   (`markov_w1` lookup + `markov_w2` bias added onto the already-fixed,
+   noise-conditioned `base_logits[draft]` row) -- it is a cheap **order-1**
+   fix-up, not a re-encode. There is no iterative refinement/denoising loop
+   anywhere in the DSpark code (`grep`-confirmed: no `refine`/`iterat`/
+   `round`/`denois` hits) that would let position `i`'s `base_logits` be
+   recomputed once positions `0..i-1` are actually known.
+   **Consequence**: position 0's proposal is high quality (it only needs
+   the real preceding context, which is genuinely available -- this is why
+   `target_top == drafts[0]` passes almost every time, i.e. the "own"
+   pre-verify gate). Position 1's proposal is base_logits computed against
+   a *noise*-masked stand-in for position 0 (not drafts[0]'s real content),
+   corrected only by a weak order-1 bias -- structurally much weaker than a
+   true causal continuation, and it empirically never survives batch verify
+   against the target's real (fully causal) next-token distribution in this
+   GA-matched drafter/target pairing. Every verify event in both arms shows
+   exactly this: `commit_drafts` (`verified=`) is 1, always, regardless of
+   how many further (also noise-conditioned) tokens were drafted beyond
+   position 1 -- consistent with a hard architectural cliff at depth 1, not
+   a statistical/tuning artifact.
+
+4. **Flag sanity-check**: `--mtp <drafter.gguf> --dspark [--dspark-confidence
+   F]` reaches the verify path correctly; `dw->block_size` (5, from the
+   artifact's own metadata, "block=5" in the load-time summary) is the max
+   draft length and is honored end-to-end (`draft_n` caps at
+   `accepted_cap - n_accept`, `max_tokens - n_accept`, `room - 1`, none of
+   which truncate to 2 -- the drafted-length histogram `{2,3,4,5}` proves
+   longer proposals genuinely reach the verify call). No truncation bug
+   found upstream of verify.
+
+5. **Upstream cross-check**: DSpark support does not exist on
+   `upstream/main` (antirez/ds4) at all (`git log upstream/main --oneline |
+   grep -iE 'dspark|noise|mtp'` -- zero hits); it was added directly on this
+   repo by `fc9efd1` ("Add DSpark speculative decoding", authored
+   `antirez`, not yet on his public `main`). That commit's own `README.md`
+   addition documents DSpark as "currently a greedy argmax-only path" with
+   confidence-gated pruning "to avoid replay-heavy low-confidence blocks",
+   but says nothing about expected per-event accepted-token depth --
+   there is no upstream design note contradicting the depth-1 collapse
+   found here; the masked/noise-token block-decode scheme visible in the
+   code is consistent with DeepSeek's own DSpark architecture as shipped in
+   the checkpoint's metadata (real `noise_token_id`), not a ds4-side bug.
+
+**Verdict: STRUCTURAL, not wiring.** The verify/accept machinery
+(`ds4.c:62050-62420`) is correct standard speculative-decode logic and is
+not the cause. The ceiling is inherent to the DSpark drafter's own
+single-shot, noise-masked parallel-block proposal design: only position 0
+of any drafted block is conditioned on real context; positions 1+ are
+conditioned on a fixed noise/mask placeholder plus a weak order-1 Markov
+correction, and empirically never survive batch-verify against the target
+model's real causal continuation in this GA-matched drafter/target pairing
+-- 100% of 3,338 combined verify events across both A/B arms, not a
+sometimes-partial-credit distribution. No `min()`/constant/window-size bug
+exists to fix; there is nothing to point-fix in `ds4.c`.
+
+**What a real fix would require (out of scope for this unit, sizing only):**
+an iterative "denoising"/refinement loop -- after the order-1 Markov pass
+picks a greedy token for position `i`, re-run (a strict subset of)
+`metal_graph_eval_dspark_stage_chain` with the real token substituted for
+`noise_token_id` at that position before proposing position `i+1`, likely
+2-4 refinement rounds to recover meaningful depth-2+ accuracy (masked/
+parallel-decode literature pattern, e.g. discrete-diffusion LM block
+decoding). This is a **real feature addition**, not a constant tweak:
+it needs (a) a per-round re-embed + re-run of the (currently single-shot)
+stage-chain GPU graph, (b) a new stopping/round-count heuristic weighed
+against each round's real forward-pass cost (which this unit's prior A/B
+already showed dominates over the ~2-tokens/event ceiling on this hardware
+-- more refinement rounds add cost per drafted block, so the win is not
+guaranteed even if depth-2+ accuracy improves), and (c) end-to-end
+correctness verification (byte-identity vs. no-drafter) redone from
+scratch. Estimated size: **medium** (bounded to the existing DSpark
+propose path, no new abstraction needed, but a real GPU-graph change, not
+a wiring fix) -- a good candidate for its own ticket, not a quick follow-up.
+
+**No model runs were performed this unit** (Phase 1 code trace only,
+consistent with the ticket's own Phase 2 branch for a STRUCTURAL verdict:
+"document precisely... and stop"). `ds4-server` was not touched (no
+`systemctl stop` needed since nothing was executed against the GPU).
+
+**Draft upstream issue text (not filed, for the orchestrator to route):**
+"ds4's DSpark drafter (`--mtp ... --dspark`) never accepts more than 1
+token beyond the initial bonus token per speculative block, regardless of
+draft length (tested 2-5) or `--dspark-confidence` setting (0.0-0.9),
+across 3,338 measured verify events with the GA-matched
+DeepSeek-V4-Flash-0731 target+drafter pair. Root cause: the drafter's
+per-block proposal for draft positions beyond the first is computed from a
+single non-causal forward pass seeded with the checkpoint's own
+`noise_token_id` placeholder at all not-yet-committed positions
+(`metal_graph_prepare_dspark_setup_block`), corrected only by a weak
+order-1 'Markov' bias on the previous token's embedding -- there is no
+iterative refinement pass to let later positions condition on earlier
+drafted tokens' real content, so verify-time divergence from the target's
+true causal continuation is effectively total past depth 1. Net effect:
+DSpark drafting is currently a measured throughput loss (up to 69% slower)
+on this hardware/model, and cannot become a win without adding a
+multi-round refinement mechanism to the proposal path."
