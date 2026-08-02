@@ -2413,3 +2413,25 @@ completed -- see `MEASUREMENTS.md`'s "GA-0731 swap unit: UNBLOCKED" entry for th
 writeup, including a real memory-thrashing incident found at the preview-precedent 100GB
 cache budget (corrected to 75GB for this artifact) and the resulting GA-promotion
 recommendation.
+
+## DSpark chaining hypothesis check + resident A/B, ceiling claim corrected (2026-08-02)
+
+Cross-reference only -- not an FP4/MXFP4 CUDA kernel issue, full writeup lives in
+`MEASUREMENTS.md`'s entry of the same name. Summary for anyone landing here from a
+DSpark/spec-decode angle: operator hypothesis that ds4's DSpark "3-stage" drafter chain
+is missing DeepSeek-style per-position argmax-embed chaining between draft positions was
+checked against the code, both drafter GGUFs' own metadata, and upstream `fc9efd1`'s
+commit/README intent -- **refuted**: `n_stages`/`dspark.layer_count=3` is the small
+drafter's own transformer depth (EAGLE-style, tapping 3 target hidden layers via
+`dspark.target_layer_ids`), already correctly hidden-state-chained layer-to-layer; the
+axis DeepSeek's true MTP chaining would apply to (`dw->block_size`, 5 draft positions) is
+deliberately noise/mask-seeded per the checkpoint's own `noise_token_id` metadata, matching
+upstream's own "greedy argmax-only path" framing, not a ds4 port omission. Prior unit's
+`c832953` "structural, no fix" verdict stands. New: the prior unit's "always exactly
+accepted=2" claim was pairing-specific (a different resident pairing reaches depth 6); a
+genuine greedy-identity divergence (drafter-enabled output differs from no-drafter output
+at `--temp 0`, on a pairing where the no-drafter path is itself perfectly reproducible) was
+found and flagged for follow-up, not root-caused this unit -- distinct from this file's
+already-documented `--ssd-streaming`+`--temp 0` FP-reduction-order non-determinism note
+above (that one reproduces with **zero** drafter code involved; this one only appears with
+the drafter enabled, in **resident**, non-streaming mode).

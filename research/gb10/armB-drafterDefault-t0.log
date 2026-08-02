@@ -1,0 +1,1599 @@
+ds4: Linux cuda backend set oom_score_adj=1000
+ds4: DSpark support model detected: gguf/DeepSeek-V4-Flash-DSpark-support.gguf (stages=3 block=5 markov_rank=256 tensors=81 missing=0 invalid=0 metadata_errors=0); use --dspark to enable experimental runtime decode
+ds4: CUDA backend initialized on NVIDIA GB10 (sm_121) dev=0
+ds4: CUDA (no-copy) host registration skipped: operation not supported
+ds4: CUDA (no-copy) host registration skipped: operation not supported
+ds4: CUDA preparing model tensor mappings
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA loading model tensors 16.02 GiB cached
+ds4: CUDA prepared model tensor mappings 16.37 GiB
+ds4: CUDA loading model tensors 32.06 GiB cached
+ds4: CUDA prepared model tensor mappings 32.07 GiB
+ds4: CUDA loading model tensors 48.02 GiB cached
+ds4: CUDA prepared model tensor mappings 48.43 GiB
+ds4: CUDA loading model tensors 64.06 GiB cached
+ds4: CUDA prepared model tensor mappings 64.13 GiB
+ds4: CUDA loading model tensors 80.04 GiB cached
+ds4: CUDA prepared model tensor mappings 80.24 GiB
+ds4: CUDA startup model preparation covered 80.76 GiB of tensor spans in 19.187s
+ds4: CUDA preparing model tensor mappings
+ds4: CUDA startup model preparation covered 5.58 GiB of tensor spans in 1.247s
+ds4: cuda backend initialized for graph diagnostics
+ds4: memory: KV 0.78 GiB (raw 0.36 + compressed 0.42) + buffers 0.25 GiB + resident model 80.76 GiB = 81.79 GiB planned
+ds4: memory detail: ctx=32768 prefill_cap=4096 raw_kv_rows=4352 compressed_kv_rows=8194 backend=cuda
+ds4: memory: KV 0.78 GiB (raw 0.36 + compressed 0.42) + buffers 0.25 GiB = 1.03 GiB context
+ds4: memory detail: ctx=32768 prefill_cap=4096 raw_kv_rows=4352 compressed_kv_rows=8194 backend=cuda
+ds4: DSpark target-hidden capture enabled: layers=40,41,42
+ds4: DSpark spec enter accepted=1 max=32749 valid=1 len=3 pos=19
+ds4: DSpark spec accept drafted=3 accepted=4
+Commands:
+  /help          Show this help.
+  /think         Use normal thinking mode.
+  /think-max     Use Think Max only when context is at least 393216 tokens.
+  /nothink       Disable thinking mode.
+  /ctx N         Set context size for following prompts.
+  /power N       Set GPU duty cycle percentage, 1..100.
+  /read FILE     Read a prompt from FILE and run it.
+  /quit, /exit   Leave the prompt.
+  Ctrl+C         Stop generation and return to the prompt.
+Photosynthesis is theds4: DSpark spec enter accepted=1 max=32745 valid=1 len=2 pos=23
+ds4: DSpark spec accept drafted=2 accepted=3
+ process by whichds4: DSpark spec enter accepted=1 max=32742 valid=0 len=0 pos=26
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=5 long_accept=1 confidence0=-0.269
+ds4: DSpark spec skip no-draft
+ plantsds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32741 valid=0 len=0 pos=27
+ds4: DSpark spec skip no-draft
+,ds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32740 valid=0 len=0 pos=28
+ds4: DSpark spec skip no-draft
+ algaeds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32739 valid=0 len=0 pos=29
+ds4: DSpark spec skip no-draft
+,ds4: DSpark spec enter accepted=1 max=32738 valid=1 len=3 pos=30
+ds4: DSpark scheduler pause cycles=4 accepted=8 avg=2.000 no_draft=1 extra_per_accept=71.210ms saved=516.937ms extra=569.684ms skip=4
+ds4: DSpark spec accept drafted=3 accepted=4
+ and some bacteria convertds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32734 valid=0 len=0 pos=34
+ds4: DSpark spec skip no-draft
+ sunlightds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32733 valid=0 len=0 pos=35
+ds4: DSpark spec skip no-draft
+ intods4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32732 valid=0 len=0 pos=36
+ds4: DSpark spec skip no-draft
+ chemicalds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32731 valid=0 len=0 pos=37
+ds4: DSpark spec skip no-draft
+ energyds4: DSpark spec enter accepted=1 max=32730 valid=0 len=0 pos=38
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=8 long_accept=1 confidence0=0.143
+ds4: DSpark spec skip no-draft
+.ds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32729 valid=0 len=0 pos=39
+ds4: DSpark spec skip no-draft
+ Usingds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32728 valid=0 len=0 pos=40
+ds4: DSpark spec skip no-draft
+ chlorophyllds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32727 valid=0 len=0 pos=41
+ds4: DSpark spec skip no-draft
+ inds4: DSpark spec enter accepted=1 max=32726 valid=1 len=2 pos=42
+ds4: DSpark spec miss first draft=4011 base=88535
+ theirds4: DSpark spec enter accepted=1 max=32725 valid=1 len=2 pos=43
+ds4: DSpark spec accept drafted=2 accepted=3
+ chloroplasts,ds4: DSpark spec enter accepted=1 max=32722 valid=0 len=0 pos=46
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=10 long_accept=1 confidence0=2.104
+ds4: DSpark scheduler pause cycles=4 accepted=2 avg=0.500 no_draft=2 extra_per_accept=91.472ms saved=121.314ms extra=182.943ms skip=4
+ds4: DSpark spec skip no-draft
+ theyds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32721 valid=0 len=0 pos=47
+ds4: DSpark spec skip no-draft
+ absorbds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32720 valid=0 len=0 pos=48
+ds4: DSpark spec skip no-draft
+ carbonds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32719 valid=0 len=0 pos=49
+ds4: DSpark spec skip no-draft
+ dioxideds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32718 valid=0 len=0 pos=50
+ds4: DSpark spec skip no-draft
+ andds4: DSpark spec enter accepted=1 max=32717 valid=0 len=0 pos=51
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=10 long_accept=1 confidence0=-0.450
+ds4: DSpark spec skip no-draft
+ waterds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32716 valid=0 len=0 pos=52
+ds4: DSpark spec skip no-draft
+,ds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32715 valid=0 len=0 pos=53
+ds4: DSpark spec skip no-draft
+ andds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32714 valid=0 len=0 pos=54
+ds4: DSpark spec skip no-draft
+ withds4: DSpark spec enter accepted=1 max=32713 valid=0 len=0 pos=55
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=10 long_accept=1 confidence0=0.250
+ds4: DSpark spec skip no-draft
+ theds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32712 valid=0 len=0 pos=56
+ds4: DSpark spec skip no-draft
+ energyds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32711 valid=0 len=0 pos=57
+ds4: DSpark spec skip no-draft
+ fromds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32710 valid=0 len=0 pos=58
+ds4: DSpark spec skip no-draft
+ sunlightds4: DSpark spec enter accepted=1 max=32709 valid=0 len=0 pos=59
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=10 long_accept=1 confidence0=-0.270
+ds4: DSpark spec skip no-draft
+,ds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32708 valid=0 len=0 pos=60
+ds4: DSpark spec skip no-draft
+ transformds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32707 valid=0 len=0 pos=61
+ds4: DSpark spec skip no-draft
+ themds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32706 valid=0 len=0 pos=62
+ds4: DSpark spec skip no-draft
+ intods4: DSpark spec enter accepted=1 max=32705 valid=1 len=1 pos=63
+ds4: DSpark scheduler pause cycles=4 accepted=0 avg=0.000 no_draft=3 extra_per_accept=0.000ms saved=0.000ms extra=49.227ms skip=4
+ds4: DSpark spec miss first draft=305 base=343
+ glucoseds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32704 valid=0 len=0 pos=64
+ds4: DSpark spec skip no-draft
+ (ds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32703 valid=0 len=0 pos=65
+ds4: DSpark spec skip no-draft
+ads4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32702 valid=0 len=0 pos=66
+ds4: DSpark spec skip no-draft
+ sugards4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32701 valid=0 len=0 pos=67
+ds4: DSpark spec skip no-draft
+)ds4: DSpark spec enter accepted=1 max=32700 valid=1 len=2 pos=68
+ds4: DSpark spec miss first draft=7917 base=11627
+ andds4: DSpark spec enter accepted=1 max=32699 valid=1 len=1 pos=69
+ds4: DSpark spec accept drafted=1 accepted=2
+ oxygen.ds4: DSpark spec enter accepted=1 max=32697 valid=0 len=0 pos=71
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=11 long_accept=1 confidence0=0.200
+ds4: DSpark spec skip no-draft
+ Thisds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32696 valid=0 len=0 pos=72
+ds4: DSpark spec skip no-draft
+ processds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32695 valid=0 len=0 pos=73
+ds4: DSpark spec skip no-draft
+ notds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32694 valid=0 len=0 pos=74
+ds4: DSpark spec skip no-draft
+ onlyds4: DSpark spec enter accepted=1 max=32693 valid=0 len=0 pos=75
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=11 long_accept=1 confidence0=1.349
+ds4: DSpark scheduler pause cycles=4 accepted=1 avg=0.250 no_draft=2 extra_per_accept=120.966ms saved=60.739ms extra=120.966ms skip=4
+ds4: DSpark spec skip no-draft
+ providesds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32692 valid=0 len=0 pos=76
+ds4: DSpark spec skip no-draft
+ foodds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32691 valid=0 len=0 pos=77
+ds4: DSpark spec skip no-draft
+ fords4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32690 valid=0 len=0 pos=78
+ds4: DSpark spec skip no-draft
+ theds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32689 valid=0 len=0 pos=79
+ds4: DSpark spec skip no-draft
+ plantds4: DSpark spec enter accepted=1 max=32688 valid=0 len=0 pos=80
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=11 long_accept=1 confidence0=2.149
+ds4: DSpark spec skip no-draft
+ butds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32687 valid=0 len=0 pos=81
+ds4: DSpark spec skip no-draft
+ alsods4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32686 valid=0 len=0 pos=82
+ds4: DSpark spec skip no-draft
+ releasesds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32685 valid=0 len=0 pos=83
+ds4: DSpark spec skip no-draft
+ oxygends4: DSpark spec enter accepted=1 max=32684 valid=1 len=2 pos=84
+ds4: DSpark spec accept drafted=2 accepted=3
+ into the atmosphereds4: DSpark spec enter accepted=1 max=32681 valid=1 len=2 pos=87
+ds4: DSpark spec accept drafted=2 accepted=3
+, which isds4: DSpark spec enter accepted=1 max=32678 valid=1 len=1 pos=90
+ds4: DSpark scheduler pause cycles=4 accepted=5 avg=1.250 no_draft=1 extra_per_accept=75.623ms saved=297.542ms extra=378.115ms skip=4
+ds4: DSpark spec accept drafted=1 accepted=2
+ essential fords4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32676 valid=0 len=0 pos=92
+ds4: DSpark spec skip no-draft
+ mostds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32675 valid=0 len=0 pos=93
+ds4: DSpark spec skip no-draft
+ livingds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32674 valid=0 len=0 pos=94
+ds4: DSpark spec skip no-draft
+ organismsds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32673 valid=0 len=0 pos=95
+ds4: DSpark spec skip no-draft
+.
+ds4: prefill: 29.16 t/s, generation: 15.63 t/s
+processing 18 input tokens: 0/18 (0.0%)
+processing 18 input tokens: 18/18 (100.0%)
+ds4: DSpark spec enter accepted=1 max=32654 valid=0 len=0 pos=114
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=16 long_accept=1 confidence0=0.334
+ds4: DSpark spec skip no-draft
+Theds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32653 valid=0 len=0 pos=115
+ds4: DSpark spec skip no-draft
+ threeds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32652 valid=0 len=0 pos=116
+ds4: DSpark spec skip no-draft
+ photosyntheticds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32651 valid=0 len=0 pos=117
+ds4: DSpark spec skip no-draft
+ pathwaysds4: DSpark spec enter accepted=1 max=32650 valid=1 len=3 pos=118
+ds4: DSpark spec miss first draft=295 base=11911
+ differds4: DSpark spec enter accepted=1 max=32649 valid=1 len=1 pos=119
+ds4: DSpark spec accept drafted=1 accepted=2
+ mainly inds4: DSpark spec enter accepted=1 max=32647 valid=0 len=0 pos=121
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=17 long_accept=1 confidence0=2.061
+ds4: DSpark scheduler pause cycles=4 accepted=1 avg=0.250 no_draft=2 extra_per_accept=122.317ms saved=59.293ms extra=122.317ms skip=4
+ds4: DSpark spec skip no-draft
+ howds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32646 valid=0 len=0 pos=122
+ds4: DSpark spec skip no-draft
+ theyds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32645 valid=0 len=0 pos=123
+ds4: DSpark spec skip no-draft
+ handleds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32644 valid=0 len=0 pos=124
+ds4: DSpark spec skip no-draft
+ carbonds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32643 valid=0 len=0 pos=125
+ds4: DSpark spec skip no-draft
+ fixationds4: DSpark spec enter accepted=1 max=32642 valid=0 len=0 pos=126
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=17 long_accept=1 confidence0=-0.724
+ds4: DSpark spec skip no-draft
+ andds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32641 valid=0 len=0 pos=127
+ds4: DSpark spec skip no-draft
+ waterds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32640 valid=0 len=0 pos=128
+ds4: DSpark spec skip no-draft
+ efficiencyds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32639 valid=0 len=0 pos=129
+ds4: DSpark spec skip no-draft
+.ds4: DSpark spec enter accepted=1 max=32638 valid=1 len=2 pos=130
+ds4: DSpark spec accept drafted=2 accepted=3
+ **C3ds4: DSpark spec enter accepted=1 max=32635 valid=1 len=1 pos=133
+ds4: DSpark spec accept drafted=1 accepted=2
+ plants**ds4: DSpark spec enter accepted=1 max=32633 valid=0 len=0 pos=135
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=20 long_accept=1 confidence0=0.135
+ds4: DSpark scheduler pause cycles=4 accepted=3 avg=0.750 no_draft=2 extra_per_accept=81.837ms saved=176.348ms extra=245.512ms skip=4
+ds4: DSpark spec skip no-draft
+ (ds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32632 valid=0 len=0 pos=136
+ds4: DSpark spec skip no-draft
+likeds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32631 valid=0 len=0 pos=137
+ds4: DSpark spec skip no-draft
+ riceds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32630 valid=0 len=0 pos=138
+ds4: DSpark spec skip no-draft
+ andds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32629 valid=0 len=0 pos=139
+ds4: DSpark spec skip no-draft
+ wheatds4: DSpark spec enter accepted=1 max=32628 valid=0 len=0 pos=140
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=20 long_accept=1 confidence0=-0.056
+ds4: DSpark spec skip no-draft
+)ds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32627 valid=0 len=0 pos=141
+ds4: DSpark spec skip no-draft
+ useds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32626 valid=0 len=0 pos=142
+ds4: DSpark spec skip no-draft
+ theds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32625 valid=0 len=0 pos=143
+ds4: DSpark spec skip no-draft
+ Calvinds4: DSpark spec enter accepted=1 max=32624 valid=0 len=0 pos=144
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=20 long_accept=1 confidence0=0.376
+ds4: DSpark spec skip no-draft
+ cycleds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32623 valid=0 len=0 pos=145
+ds4: DSpark spec skip no-draft
+ directlyds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32622 valid=0 len=0 pos=146
+ds4: DSpark spec skip no-draft
+,ds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32621 valid=0 len=0 pos=147
+ds4: DSpark spec skip no-draft
+ fixingds4: DSpark spec enter accepted=1 max=32620 valid=0 len=0 pos=148
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=20 long_accept=1 confidence0=0.734
+ds4: DSpark spec skip no-draft
+ COds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32619 valid=0 len=0 pos=149
+ds4: DSpark spec skip no-draft
+₂ds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32618 valid=0 len=0 pos=150
+ds4: DSpark spec skip no-draft
+ intods4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32617 valid=0 len=0 pos=151
+ds4: DSpark spec skip no-draft
+ ads4: DSpark spec enter accepted=1 max=32616 valid=0 len=0 pos=152
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=20 long_accept=1 confidence0=0.743
+ds4: DSpark scheduler pause cycles=4 accepted=0 avg=0.000 no_draft=4 extra_per_accept=0.000ms saved=0.000ms extra=40.966ms skip=4
+ds4: DSpark spec skip no-draft
+ ds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32615 valid=0 len=0 pos=153
+ds4: DSpark spec skip no-draft
+3ds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32614 valid=0 len=0 pos=154
+ds4: DSpark spec skip no-draft
+-carbonds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32613 valid=0 len=0 pos=155
+ds4: DSpark spec skip no-draft
+ compoundds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32612 valid=0 len=0 pos=156
+ds4: DSpark spec skip no-draft
+,ds4: DSpark spec enter accepted=1 max=32611 valid=0 len=0 pos=157
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=20 long_accept=1 confidence0=1.047
+ds4: DSpark spec skip no-draft
+ butds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32610 valid=0 len=0 pos=158
+ds4: DSpark spec skip no-draft
+ theyds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32609 valid=0 len=0 pos=159
+ds4: DSpark spec skip no-draft
+ oftends4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32608 valid=0 len=0 pos=160
+ds4: DSpark spec skip no-draft
+ wasteds4: DSpark spec enter accepted=1 max=32607 valid=0 len=0 pos=161
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=20 long_accept=1 confidence0=-0.653
+ds4: DSpark spec skip no-draft
+ waterds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32606 valid=0 len=0 pos=162
+ds4: DSpark spec skip no-draft
+ andds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32605 valid=0 len=0 pos=163
+ds4: DSpark spec skip no-draft
+ areds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32604 valid=0 len=0 pos=164
+ds4: DSpark spec skip no-draft
+ proneds4: DSpark spec enter accepted=1 max=32603 valid=0 len=0 pos=165
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=20 long_accept=1 confidence0=-2.567
+ds4: DSpark spec skip no-draft
+ tods4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32602 valid=0 len=0 pos=166
+ds4: DSpark spec skip no-draft
+ photds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32601 valid=0 len=0 pos=167
+ds4: DSpark spec skip no-draft
+oresds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32600 valid=0 len=0 pos=168
+ds4: DSpark spec skip no-draft
+pirationds4: DSpark spec enter accepted=1 max=32599 valid=0 len=0 pos=169
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=20 long_accept=1 confidence0=0.998
+ds4: DSpark scheduler pause cycles=4 accepted=0 avg=0.000 no_draft=4 extra_per_accept=0.000ms saved=0.000ms extra=37.351ms skip=4
+ds4: DSpark spec skip no-draft
+ inds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32598 valid=0 len=0 pos=170
+ds4: DSpark spec skip no-draft
+ hotds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32597 valid=0 len=0 pos=171
+ds4: DSpark spec skip no-draft
+,ds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32596 valid=0 len=0 pos=172
+ds4: DSpark spec skip no-draft
+ dryds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32595 valid=0 len=0 pos=173
+ds4: DSpark spec skip no-draft
+ conditionsds4: DSpark spec enter accepted=1 max=32594 valid=1 len=5 pos=174
+ds4: DSpark spec accept drafted=5 accepted=6
+. **C4 plants**ds4: DSpark spec enter accepted=1 max=32588 valid=0 len=0 pos=180
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=25 long_accept=1 confidence0=1.726
+ds4: DSpark spec skip no-draft
+ (ds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32587 valid=0 len=0 pos=181
+ds4: DSpark spec skip no-draft
+likeds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32586 valid=0 len=0 pos=182
+ds4: DSpark spec skip no-draft
+ cornds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32585 valid=0 len=0 pos=183
+ds4: DSpark spec skip no-draft
+ andds4: DSpark spec enter accepted=1 max=32584 valid=0 len=0 pos=184
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=25 long_accept=1 confidence0=0.460
+ds4: DSpark spec skip no-draft
+ sugarcaneds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32583 valid=0 len=0 pos=185
+ds4: DSpark spec skip no-draft
+)ds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32582 valid=0 len=0 pos=186
+ds4: DSpark spec skip no-draft
+ firstds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32581 valid=0 len=0 pos=187
+ds4: DSpark spec skip no-draft
+ fixds4: DSpark spec enter accepted=1 max=32580 valid=1 len=2 pos=188
+ds4: DSpark scheduler pause cycles=4 accepted=5 avg=1.250 no_draft=2 extra_per_accept=45.815ms saved=295.060ms extra=229.077ms skip=4
+ds4: DSpark spec miss first draft=1055 base=59853
+ COds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32579 valid=0 len=0 pos=189
+ds4: DSpark spec skip no-draft
+₂ds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32578 valid=0 len=0 pos=190
+ds4: DSpark spec skip no-draft
+ intods4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32577 valid=0 len=0 pos=191
+ds4: DSpark spec skip no-draft
+ ads4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32576 valid=0 len=0 pos=192
+ds4: DSpark spec skip no-draft
+ ds4: DSpark spec enter accepted=1 max=32575 valid=1 len=2 pos=193
+ds4: DSpark spec accept drafted=2 accepted=3
+4-carbon compoundds4: DSpark spec enter accepted=1 max=32572 valid=0 len=0 pos=196
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=27 long_accept=1 confidence0=-0.690
+ds4: DSpark spec skip no-draft
+ inds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32571 valid=0 len=0 pos=197
+ds4: DSpark spec skip no-draft
+ specializedds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32570 valid=0 len=0 pos=198
+ds4: DSpark spec skip no-draft
+ cellsds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32569 valid=0 len=0 pos=199
+ds4: DSpark spec skip no-draft
+,ds4: DSpark spec enter accepted=1 max=32568 valid=0 len=0 pos=200
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=27 long_accept=1 confidence0=0.716
+ds4: DSpark spec skip no-draft
+ thends4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32567 valid=0 len=0 pos=201
+ds4: DSpark spec skip no-draft
+ releaseds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32566 valid=0 len=0 pos=202
+ds4: DSpark spec skip no-draft
+ itds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32565 valid=0 len=0 pos=203
+ds4: DSpark spec skip no-draft
+ fords4: DSpark spec enter accepted=1 max=32564 valid=1 len=2 pos=204
+ds4: DSpark scheduler pause cycles=4 accepted=4 avg=1.000 no_draft=2 extra_per_accept=77.364ms saved=237.166ms extra=309.454ms skip=4
+ds4: DSpark spec accept drafted=2 accepted=3
+ the Calvin cycleds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32561 valid=0 len=0 pos=207
+ds4: DSpark spec skip no-draft
+,ds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32560 valid=0 len=0 pos=208
+ds4: DSpark spec skip no-draft
+ whichds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32559 valid=0 len=0 pos=209
+ds4: DSpark spec skip no-draft
+ minimizesds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32558 valid=0 len=0 pos=210
+ds4: DSpark spec skip no-draft
+ photds4: DSpark spec enter accepted=1 max=32557 valid=1 len=2 pos=211
+ds4: DSpark spec accept drafted=2 accepted=3
+orespiration andds4: DSpark spec enter accepted=1 max=32554 valid=1 len=2 pos=214
+ds4: DSpark spec accept drafted=2 accepted=3
+ conserves waterds4: DSpark spec enter accepted=1 max=32551 valid=0 len=0 pos=217
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=33 long_accept=1 confidence0=-0.337
+ds4: DSpark spec skip no-draft
+ inds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32550 valid=0 len=0 pos=218
+ds4: DSpark spec skip no-draft
+ hotds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32549 valid=0 len=0 pos=219
+ds4: DSpark spec skip no-draft
+ climatesds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32548 valid=0 len=0 pos=220
+ds4: DSpark spec skip no-draft
+.ds4: DSpark spec enter accepted=1 max=32547 valid=0 len=0 pos=221
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=33 long_accept=1 confidence0=1.360
+ds4: DSpark scheduler pause cycles=4 accepted=4 avg=1.000 no_draft=2 extra_per_accept=77.639ms saved=235.640ms extra=310.557ms skip=4
+ds4: DSpark spec skip no-draft
+ **ds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32546 valid=0 len=0 pos=222
+ds4: DSpark spec skip no-draft
+CAMds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32545 valid=0 len=0 pos=223
+ds4: DSpark spec skip no-draft
+ plantsds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32544 valid=0 len=0 pos=224
+ds4: DSpark spec skip no-draft
+**ds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32543 valid=0 len=0 pos=225
+ds4: DSpark spec skip no-draft
+ (ds4: DSpark spec enter accepted=1 max=32542 valid=0 len=0 pos=226
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=33 long_accept=1 confidence0=0.279
+ds4: DSpark spec skip no-draft
+likeds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32541 valid=0 len=0 pos=227
+ds4: DSpark spec skip no-draft
+ cds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32540 valid=0 len=0 pos=228
+ds4: DSpark spec skip no-draft
+actds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32539 valid=0 len=0 pos=229
+ds4: DSpark spec skip no-draft
+ids4: DSpark spec enter accepted=1 max=32538 valid=0 len=0 pos=230
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=33 long_accept=1 confidence0=0.337
+ds4: DSpark spec skip no-draft
+ andds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32537 valid=0 len=0 pos=231
+ds4: DSpark spec skip no-draft
+ succds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32536 valid=0 len=0 pos=232
+ds4: DSpark spec skip no-draft
+ulds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32535 valid=0 len=0 pos=233
+ds4: DSpark spec skip no-draft
+entsds4: DSpark spec enter accepted=1 max=32534 valid=0 len=0 pos=234
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=33 long_accept=1 confidence0=-2.593
+ds4: DSpark spec skip no-draft
+)ds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32533 valid=0 len=0 pos=235
+ds4: DSpark spec skip no-draft
+ separateds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32532 valid=0 len=0 pos=236
+ds4: DSpark spec skip no-draft
+ carbonds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32531 valid=0 len=0 pos=237
+ds4: DSpark spec skip no-draft
+ fixationds4: DSpark spec enter accepted=1 max=32530 valid=1 len=2 pos=238
+ds4: DSpark scheduler pause cycles=4 accepted=2 avg=0.500 no_draft=3 extra_per_accept=87.321ms saved=117.624ms extra=174.641ms skip=4
+ds4: DSpark spec accept drafted=2 accepted=3
+ temporally,ds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32527 valid=0 len=0 pos=241
+ds4: DSpark spec skip no-draft
+ openingds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32526 valid=0 len=0 pos=242
+ds4: DSpark spec skip no-draft
+ stomds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32525 valid=0 len=0 pos=243
+ds4: DSpark spec skip no-draft
+atads4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32524 valid=0 len=0 pos=244
+ds4: DSpark spec skip no-draft
+ atds4: DSpark spec enter accepted=1 max=32523 valid=0 len=0 pos=245
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=35 long_accept=1 confidence0=-0.548
+ds4: DSpark spec skip no-draft
+ nightds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32522 valid=0 len=0 pos=246
+ds4: DSpark spec skip no-draft
+ tods4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32521 valid=0 len=0 pos=247
+ds4: DSpark spec skip no-draft
+ takeds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32520 valid=0 len=0 pos=248
+ds4: DSpark spec skip no-draft
+ inds4: DSpark spec enter accepted=1 max=32519 valid=1 len=2 pos=249
+ds4: DSpark spec accept drafted=2 accepted=3
+ CO₂ andds4: DSpark spec enter accepted=1 max=32516 valid=1 len=2 pos=252
+ds4: DSpark spec accept drafted=2 accepted=3
+ storing it asds4: DSpark spec enter accepted=1 max=32513 valid=1 len=2 pos=255
+ds4: DSpark scheduler pause cycles=4 accepted=4 avg=1.000 no_draft=1 extra_per_accept=78.815ms saved=237.762ms extra=315.260ms skip=4
+ds4: DSpark spec miss first draft=297 base=434
+ malds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32512 valid=0 len=0 pos=256
+ds4: DSpark spec skip no-draft
+ateds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32511 valid=0 len=0 pos=257
+ds4: DSpark spec skip no-draft
+,ds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32510 valid=0 len=0 pos=258
+ds4: DSpark spec skip no-draft
+ thends4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32509 valid=0 len=0 pos=259
+ds4: DSpark spec skip no-draft
+ usingds4: DSpark spec enter accepted=1 max=32508 valid=1 len=2 pos=260
+ds4: DSpark spec miss first draft=82 base=2184
+ itds4: DSpark spec enter accepted=1 max=32507 valid=1 len=2 pos=261
+ds4: DSpark spec accept drafted=2 accepted=3
+ during the dayds4: DSpark spec enter accepted=1 max=32504 valid=1 len=1 pos=264
+ds4: DSpark spec miss first draft=51248 base=270
+ fords4: DSpark spec enter accepted=1 max=32503 valid=0 len=0 pos=265
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=41 long_accept=1 confidence0=1.286
+ds4: DSpark scheduler pause cycles=4 accepted=2 avg=0.500 no_draft=1 extra_per_accept=99.120ms saved=118.775ms extra=198.239ms skip=4
+ds4: DSpark spec skip no-draft
+ theds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32502 valid=0 len=0 pos=266
+ds4: DSpark spec skip no-draft
+ Calvinds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32501 valid=0 len=0 pos=267
+ds4: DSpark spec skip no-draft
+ cycleds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32500 valid=0 len=0 pos=268
+ds4: DSpark spec skip no-draft
+—ds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32499 valid=0 len=0 pos=269
+ds4: DSpark spec skip no-draft
+thisds4: DSpark spec enter accepted=1 max=32498 valid=0 len=0 pos=270
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=41 long_accept=1 confidence0=1.284
+ds4: DSpark spec skip no-draft
+ drasticallyds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32497 valid=0 len=0 pos=271
+ds4: DSpark spec skip no-draft
+ reducesds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32496 valid=0 len=0 pos=272
+ds4: DSpark spec skip no-draft
+ waterds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32495 valid=0 len=0 pos=273
+ds4: DSpark spec skip no-draft
+ lossds4: DSpark spec enter accepted=1 max=32494 valid=0 len=0 pos=274
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=41 long_accept=1 confidence0=1.979
+ds4: DSpark spec skip no-draft
+ inds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32493 valid=0 len=0 pos=275
+ds4: DSpark spec skip no-draft
+ aridds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32492 valid=0 len=0 pos=276
+ds4: DSpark spec skip no-draft
+ environmentsds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32491 valid=0 len=0 pos=277
+ds4: DSpark spec skip no-draft
+.
+ds4: prefill: 64.72 t/s, generation: 16.00 t/s
+processing 12 input tokens: 0/12 (0.0%)
+processing 12 input tokens: 12/12 (100.0%)
+ds4: DSpark spec enter accepted=1 max=32478 valid=0 len=0 pos=290
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=41 long_accept=1 confidence0=1.295
+ds4: DSpark spec skip no-draft
+Theds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32477 valid=0 len=0 pos=291
+ds4: DSpark spec skip no-draft
+ TCPds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32476 valid=0 len=0 pos=292
+ds4: DSpark spec skip no-draft
+ threeds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32475 valid=0 len=0 pos=293
+ds4: DSpark spec skip no-draft
+-wayds4: DSpark spec enter accepted=1 max=32474 valid=1 len=2 pos=294
+ds4: DSpark scheduler pause cycles=4 accepted=2 avg=0.500 no_draft=3 extra_per_accept=89.749ms saved=117.531ms extra=179.498ms skip=4
+ds4: DSpark spec accept drafted=2 accepted=3
+ handshake isds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32471 valid=0 len=0 pos=297
+ds4: DSpark spec skip no-draft
+ theds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32470 valid=0 len=0 pos=298
+ds4: DSpark spec skip no-draft
+ processds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32469 valid=0 len=0 pos=299
+ds4: DSpark spec skip no-draft
+ usedds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32468 valid=0 len=0 pos=300
+ds4: DSpark spec skip no-draft
+ tods4: DSpark spec enter accepted=1 max=32467 valid=1 len=2 pos=301
+ds4: DSpark spec accept drafted=2 accepted=3
+ establish a reliableds4: DSpark spec enter accepted=1 max=32464 valid=1 len=1 pos=304
+ds4: DSpark spec accept drafted=1 accepted=2
+ connection betweends4: DSpark spec enter accepted=1 max=32462 valid=1 len=3 pos=306
+ds4: DSpark spec accept drafted=3 accepted=4
+ a client and ads4: DSpark spec enter accepted=1 max=32458 valid=0 len=0 pos=310
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=49 long_accept=1 confidence0=1.828
+ds4: DSpark scheduler pause cycles=4 accepted=6 avg=1.500 no_draft=1 extra_per_accept=67.291ms saved=356.056ms extra=403.747ms skip=4
+ds4: DSpark spec skip no-draft
+ serverds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32457 valid=0 len=0 pos=311
+ds4: DSpark spec skip no-draft
+ beforeds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32456 valid=0 len=0 pos=312
+ds4: DSpark spec skip no-draft
+ datads4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32455 valid=0 len=0 pos=313
+ds4: DSpark spec skip no-draft
+ transmissionds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32454 valid=0 len=0 pos=314
+ds4: DSpark spec skip no-draft
+ beginsds4: DSpark spec enter accepted=1 max=32453 valid=0 len=0 pos=315
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=49 long_accept=1 confidence0=-0.439
+ds4: DSpark spec skip no-draft
+.ds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32452 valid=0 len=0 pos=316
+ds4: DSpark spec skip no-draft
+ Itds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32451 valid=0 len=0 pos=317
+ds4: DSpark spec skip no-draft
+ worksds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32450 valid=0 len=0 pos=318
+ds4: DSpark spec skip no-draft
+ asds4: DSpark spec enter accepted=1 max=32449 valid=1 len=3 pos=319
+ds4: DSpark spec accept drafted=3 accepted=4
+ follows:
+
+1.ds4: DSpark spec enter accepted=1 max=32445 valid=1 len=2 pos=323
+ds4: DSpark spec accept drafted=2 accepted=3
+ **SYNds4: DSpark spec enter accepted=1 max=32442 valid=1 len=4 pos=326
+ds4: DSpark scheduler pause cycles=4 accepted=9 avg=2.250 no_draft=1 extra_per_accept=53.404ms saved=532.620ms extra=480.640ms skip=4
+ds4: DSpark spec accept drafted=4 accepted=5
+**: The client sends ads4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32437 valid=0 len=0 pos=331
+ds4: DSpark spec skip no-draft
+ TCPds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32436 valid=0 len=0 pos=332
+ds4: DSpark spec skip no-draft
+ segmentds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32435 valid=0 len=0 pos=333
+ds4: DSpark spec skip no-draft
+ withds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32434 valid=0 len=0 pos=334
+ds4: DSpark spec skip no-draft
+ theds4: DSpark spec enter accepted=1 max=32433 valid=0 len=0 pos=335
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=58 long_accept=1 confidence0=0.165
+ds4: DSpark spec skip no-draft
+ SYNds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32432 valid=0 len=0 pos=336
+ds4: DSpark spec skip no-draft
+ (ds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32431 valid=0 len=0 pos=337
+ds4: DSpark spec skip no-draft
+sds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32430 valid=0 len=0 pos=338
+ds4: DSpark spec skip no-draft
+ynchronds4: DSpark spec enter accepted=1 max=32429 valid=1 len=1 pos=339
+ds4: DSpark spec accept drafted=1 accepted=2
+ize)ds4: DSpark spec enter accepted=1 max=32427 valid=0 len=0 pos=341
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=59 long_accept=1 confidence0=1.620
+ds4: DSpark spec skip no-draft
+ flagds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32426 valid=0 len=0 pos=342
+ds4: DSpark spec skip no-draft
+ setds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32425 valid=0 len=0 pos=343
+ds4: DSpark spec skip no-draft
+,ds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32424 valid=0 len=0 pos=344
+ds4: DSpark spec skip no-draft
+ alongds4: DSpark spec enter accepted=1 max=32423 valid=0 len=0 pos=345
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=59 long_accept=1 confidence0=0.587
+ds4: DSpark scheduler pause cycles=4 accepted=1 avg=0.250 no_draft=3 extra_per_accept=112.757ms saved=59.586ms extra=112.757ms skip=4
+ds4: DSpark spec skip no-draft
+ withds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32422 valid=0 len=0 pos=346
+ds4: DSpark spec skip no-draft
+ ands4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32421 valid=0 len=0 pos=347
+ds4: DSpark spec skip no-draft
+ initialds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32420 valid=0 len=0 pos=348
+ds4: DSpark spec skip no-draft
+ sequenceds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32419 valid=0 len=0 pos=349
+ds4: DSpark spec skip no-draft
+ numberds4: DSpark spec enter accepted=1 max=32418 valid=0 len=0 pos=350
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=59 long_accept=1 confidence0=-0.466
+ds4: DSpark spec skip no-draft
+ (ds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32417 valid=0 len=0 pos=351
+ds4: DSpark spec skip no-draft
+ISds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32416 valid=0 len=0 pos=352
+ds4: DSpark spec skip no-draft
+Nds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32415 valid=0 len=0 pos=353
+ds4: DSpark spec skip no-draft
+),ds4: DSpark spec enter accepted=1 max=32414 valid=1 len=2 pos=354
+ds4: DSpark spec accept drafted=2 accepted=3
+ to the serverds4: DSpark spec enter accepted=1 max=32411 valid=0 len=0 pos=357
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=61 long_accept=1 confidence0=0.195
+ds4: DSpark spec skip no-draft
+ tods4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32410 valid=0 len=0 pos=358
+ds4: DSpark spec skip no-draft
+ initiateds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32409 valid=0 len=0 pos=359
+ds4: DSpark spec skip no-draft
+ ads4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32408 valid=0 len=0 pos=360
+ds4: DSpark spec skip no-draft
+ connectionds4: DSpark spec enter accepted=1 max=32407 valid=0 len=0 pos=361
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=61 long_accept=1 confidence0=0.735
+ds4: DSpark scheduler pause cycles=4 accepted=2 avg=0.500 no_draft=3 extra_per_accept=88.490ms saved=117.652ms extra=176.979ms skip=4
+ds4: DSpark spec skip no-draft
+.
+ds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32406 valid=0 len=0 pos=362
+ds4: DSpark spec skip no-draft
+2ds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32405 valid=0 len=0 pos=363
+ds4: DSpark spec skip no-draft
+.ds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32404 valid=0 len=0 pos=364
+ds4: DSpark spec skip no-draft
+ **ds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32403 valid=0 len=0 pos=365
+ds4: DSpark spec skip no-draft
+SYds4: DSpark spec enter accepted=1 max=32402 valid=0 len=0 pos=366
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=61 long_accept=1 confidence0=1.795
+ds4: DSpark spec skip no-draft
+Nds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32401 valid=0 len=0 pos=367
+ds4: DSpark spec skip no-draft
+-ds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32400 valid=0 len=0 pos=368
+ds4: DSpark spec skip no-draft
+ACKds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32399 valid=0 len=0 pos=369
+ds4: DSpark spec skip no-draft
+**:ds4: DSpark spec enter accepted=1 max=32398 valid=1 len=1 pos=370
+ds4: DSpark spec accept drafted=1 accepted=2
+ The serverds4: DSpark spec enter accepted=1 max=32396 valid=1 len=2 pos=372
+ds4: DSpark spec accept drafted=2 accepted=3
+ responds with ads4: DSpark spec enter accepted=1 max=32393 valid=0 len=0 pos=375
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=64 long_accept=1 confidence0=0.336
+ds4: DSpark scheduler pause cycles=4 accepted=3 avg=0.750 no_draft=2 extra_per_accept=81.148ms saved=178.576ms extra=243.444ms skip=4
+ds4: DSpark spec skip no-draft
+ segmentds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32392 valid=0 len=0 pos=376
+ds4: DSpark spec skip no-draft
+ thatds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32391 valid=0 len=0 pos=377
+ds4: DSpark spec skip no-draft
+ hasds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32390 valid=0 len=0 pos=378
+ds4: DSpark spec skip no-draft
+ bothds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32389 valid=0 len=0 pos=379
+ds4: DSpark spec skip no-draft
+ theds4: DSpark spec enter accepted=1 max=32388 valid=0 len=0 pos=380
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=64 long_accept=1 confidence0=-0.263
+ds4: DSpark spec skip no-draft
+ SYNds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32387 valid=0 len=0 pos=381
+ds4: DSpark spec skip no-draft
+ andds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32386 valid=0 len=0 pos=382
+ds4: DSpark spec skip no-draft
+ ACds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32385 valid=0 len=0 pos=383
+ds4: DSpark spec skip no-draft
+Kds4: DSpark spec enter accepted=1 max=32384 valid=0 len=0 pos=384
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=64 long_accept=1 confidence0=-0.167
+ds4: DSpark spec skip no-draft
+ (ds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32383 valid=0 len=0 pos=385
+ds4: DSpark spec skip no-draft
+ackds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32382 valid=0 len=0 pos=386
+ds4: DSpark spec skip no-draft
+nowds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32381 valid=0 len=0 pos=387
+ds4: DSpark spec skip no-draft
+ledds4: DSpark spec enter accepted=1 max=32380 valid=0 len=0 pos=388
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=64 long_accept=1 confidence0=2.050
+ds4: DSpark spec skip no-draft
+gmentds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32379 valid=0 len=0 pos=389
+ds4: DSpark spec skip no-draft
+)ds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32378 valid=0 len=0 pos=390
+ds4: DSpark spec skip no-draft
+ flagsds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32377 valid=0 len=0 pos=391
+ds4: DSpark spec skip no-draft
+ setds4: DSpark spec enter accepted=1 max=32376 valid=0 len=0 pos=392
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=64 long_accept=1 confidence0=-1.468
+ds4: DSpark scheduler pause cycles=4 accepted=0 avg=0.000 no_draft=4 extra_per_accept=0.000ms saved=0.000ms extra=40.818ms skip=4
+ds4: DSpark spec skip no-draft
+,ds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32375 valid=0 len=0 pos=393
+ds4: DSpark spec skip no-draft
+ acknowledgingds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32374 valid=0 len=0 pos=394
+ds4: DSpark spec skip no-draft
+ theds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32373 valid=0 len=0 pos=395
+ds4: DSpark spec skip no-draft
+ clientds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32372 valid=0 len=0 pos=396
+ds4: DSpark spec skip no-draft
+'sds4: DSpark spec enter accepted=1 max=32371 valid=0 len=0 pos=397
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=64 long_accept=1 confidence0=1.178
+ds4: DSpark spec skip no-draft
+ SYNds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32370 valid=0 len=0 pos=398
+ds4: DSpark spec skip no-draft
+ andds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32369 valid=0 len=0 pos=399
+ds4: DSpark spec skip no-draft
+ sendingds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32368 valid=0 len=0 pos=400
+ds4: DSpark spec skip no-draft
+ itsds4: DSpark spec enter accepted=1 max=32367 valid=0 len=0 pos=401
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=64 long_accept=1 confidence0=1.324
+ds4: DSpark spec skip no-draft
+ ownds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32366 valid=0 len=0 pos=402
+ds4: DSpark spec skip no-draft
+ initialds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32365 valid=0 len=0 pos=403
+ds4: DSpark spec skip no-draft
+ sequenceds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32364 valid=0 len=0 pos=404
+ds4: DSpark spec skip no-draft
+ numberds4: DSpark spec enter accepted=1 max=32363 valid=0 len=0 pos=405
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=64 long_accept=1 confidence0=-3.578
+ds4: DSpark spec skip no-draft
+.
+ds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32362 valid=0 len=0 pos=406
+ds4: DSpark spec skip no-draft
+3ds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32361 valid=0 len=0 pos=407
+ds4: DSpark spec skip no-draft
+.ds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32360 valid=0 len=0 pos=408
+ds4: DSpark spec skip no-draft
+ **ds4: DSpark spec enter accepted=1 max=32359 valid=0 len=0 pos=409
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=64 long_accept=1 confidence0=-0.215
+ds4: DSpark scheduler pause cycles=4 accepted=0 avg=0.000 no_draft=4 extra_per_accept=0.000ms saved=0.000ms extra=43.192ms skip=4
+ds4: DSpark spec skip no-draft
+ACKds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32358 valid=0 len=0 pos=410
+ds4: DSpark spec skip no-draft
+**:ds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32357 valid=0 len=0 pos=411
+ds4: DSpark spec skip no-draft
+ Theds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32356 valid=0 len=0 pos=412
+ds4: DSpark spec skip no-draft
+ clientds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32355 valid=0 len=0 pos=413
+ds4: DSpark spec skip no-draft
+ sendsds4: DSpark spec enter accepted=1 max=32354 valid=1 len=3 pos=414
+ds4: DSpark spec accept drafted=3 accepted=4
+ back an ACKds4: DSpark spec enter accepted=1 max=32350 valid=1 len=1 pos=418
+ds4: DSpark spec accept drafted=1 accepted=2
+ segment,ds4: DSpark spec enter accepted=1 max=32348 valid=0 len=0 pos=420
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=68 long_accept=1 confidence0=0.058
+ds4: DSpark spec skip no-draft
+ confirmingds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32347 valid=0 len=0 pos=421
+ds4: DSpark spec skip no-draft
+ receiptds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32346 valid=0 len=0 pos=422
+ds4: DSpark spec skip no-draft
+ ofds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32345 valid=0 len=0 pos=423
+ds4: DSpark spec skip no-draft
+ theds4: DSpark spec enter accepted=1 max=32344 valid=1 len=1 pos=424
+ds4: DSpark scheduler pause cycles=4 accepted=5 avg=1.250 no_draft=1 extra_per_accept=66.031ms saved=295.822ms extra=330.153ms skip=4
+ds4: DSpark spec accept drafted=1 accepted=2
+ server'sds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32342 valid=0 len=0 pos=426
+ds4: DSpark spec skip no-draft
+ SYNds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32341 valid=0 len=0 pos=427
+ds4: DSpark spec skip no-draft
+-ds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32340 valid=0 len=0 pos=428
+ds4: DSpark spec skip no-draft
+ACKds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32339 valid=0 len=0 pos=429
+ds4: DSpark spec skip no-draft
+.ds4: DSpark spec enter accepted=1 max=32338 valid=0 len=0 pos=430
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=69 long_accept=1 confidence0=0.190
+ds4: DSpark spec skip no-draft
+ Atds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32337 valid=0 len=0 pos=431
+ds4: DSpark spec skip no-draft
+ thisds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32336 valid=0 len=0 pos=432
+ds4: DSpark spec skip no-draft
+ pointds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32335 valid=0 len=0 pos=433
+ds4: DSpark spec skip no-draft
+,ds4: DSpark spec enter accepted=1 max=32334 valid=0 len=0 pos=434
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=69 long_accept=1 confidence0=-0.425
+ds4: DSpark spec skip no-draft
+ theds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32333 valid=0 len=0 pos=435
+ds4: DSpark spec skip no-draft
+ connectionds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32332 valid=0 len=0 pos=436
+ds4: DSpark spec skip no-draft
+ isds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32331 valid=0 len=0 pos=437
+ds4: DSpark spec skip no-draft
+ establishedds4: DSpark spec enter accepted=1 max=32330 valid=1 len=2 pos=438
+ds4: DSpark spec accept drafted=2 accepted=3
+, and bothds4: DSpark spec enter accepted=1 max=32327 valid=0 len=0 pos=441
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=71 long_accept=1 confidence0=0.470
+ds4: DSpark scheduler pause cycles=4 accepted=2 avg=0.500 no_draft=3 extra_per_accept=90.876ms saved=117.772ms extra=181.753ms skip=4
+ds4: DSpark spec skip no-draft
+ sidesds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32326 valid=0 len=0 pos=442
+ds4: DSpark spec skip no-draft
+ cands4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32325 valid=0 len=0 pos=443
+ds4: DSpark spec skip no-draft
+ beginds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32324 valid=0 len=0 pos=444
+ds4: DSpark spec skip no-draft
+ sendingds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32323 valid=0 len=0 pos=445
+ds4: DSpark spec skip no-draft
+ datads4: DSpark spec enter accepted=1 max=32322 valid=0 len=0 pos=446
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=71 long_accept=1 confidence0=-2.371
+ds4: DSpark spec skip no-draft
+.
+
+ds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32321 valid=0 len=0 pos=447
+ds4: DSpark spec skip no-draft
+Thisds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32320 valid=0 len=0 pos=448
+ds4: DSpark spec skip no-draft
+ handds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32319 valid=0 len=0 pos=449
+ds4: DSpark spec skip no-draft
+shakeds4: DSpark spec enter accepted=1 max=32318 valid=0 len=0 pos=450
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=71 long_accept=1 confidence0=0.256
+ds4: DSpark spec skip no-draft
+ ensuresds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32317 valid=0 len=0 pos=451
+ds4: DSpark spec skip no-draft
+ thatds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32316 valid=0 len=0 pos=452
+ds4: DSpark spec skip no-draft
+ bothds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32315 valid=0 len=0 pos=453
+ds4: DSpark spec skip no-draft
+ partiesds4: DSpark spec enter accepted=1 max=32314 valid=0 len=0 pos=454
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=71 long_accept=1 confidence0=0.185
+ds4: DSpark spec skip no-draft
+ agreeds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32313 valid=0 len=0 pos=455
+ds4: DSpark spec skip no-draft
+ onds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32312 valid=0 len=0 pos=456
+ds4: DSpark spec skip no-draft
+ initialds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32311 valid=0 len=0 pos=457
+ds4: DSpark spec skip no-draft
+ sequenceds4: DSpark spec enter accepted=1 max=32310 valid=0 len=0 pos=458
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=71 long_accept=1 confidence0=-0.061
+ds4: DSpark scheduler pause cycles=4 accepted=0 avg=0.000 no_draft=4 extra_per_accept=0.000ms saved=0.000ms extra=39.769ms skip=4
+ds4: DSpark spec skip no-draft
+ numbersds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32309 valid=0 len=0 pos=459
+ds4: DSpark spec skip no-draft
+ andds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32308 valid=0 len=0 pos=460
+ds4: DSpark spec skip no-draft
+ areds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32307 valid=0 len=0 pos=461
+ds4: DSpark spec skip no-draft
+ readyds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32306 valid=0 len=0 pos=462
+ds4: DSpark spec skip no-draft
+ tods4: DSpark spec enter accepted=1 max=32305 valid=0 len=0 pos=463
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=71 long_accept=1 confidence0=-0.687
+ds4: DSpark spec skip no-draft
+ communicateds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32304 valid=0 len=0 pos=464
+ds4: DSpark spec skip no-draft
+,ds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32303 valid=0 len=0 pos=465
+ds4: DSpark spec skip no-draft
+ providingds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32302 valid=0 len=0 pos=466
+ds4: DSpark spec skip no-draft
+ reliabilityds4: DSpark spec enter accepted=1 max=32301 valid=0 len=0 pos=467
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=71 long_accept=1 confidence0=-1.156
+ds4: DSpark spec skip no-draft
+ andds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32300 valid=0 len=0 pos=468
+ds4: DSpark spec skip no-draft
+ synchronizationds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32299 valid=0 len=0 pos=469
+ds4: DSpark spec skip no-draft
+ fords4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32298 valid=0 len=0 pos=470
+ds4: DSpark spec skip no-draft
+ theds4: DSpark spec enter accepted=1 max=32297 valid=0 len=0 pos=471
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=71 long_accept=1 confidence0=0.200
+ds4: DSpark spec skip no-draft
+ TCPds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32296 valid=0 len=0 pos=472
+ds4: DSpark spec skip no-draft
+ connectionds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32295 valid=0 len=0 pos=473
+ds4: DSpark spec skip no-draft
+.
+ds4: prefill: 52.72 t/s, generation: 16.14 t/s
+processing 11 input tokens: 0/11 (0.0%)
+processing 11 input tokens: 11/11 (100.0%)
+ds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32283 valid=0 len=0 pos=485
+ds4: DSpark spec skip no-draft
+TCPds4: DSpark spec enter accepted=1 max=32282 valid=0 len=0 pos=486
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=71 long_accept=1 confidence0=1.998
+ds4: DSpark scheduler pause cycles=4 accepted=0 avg=0.000 no_draft=4 extra_per_accept=0.000ms saved=0.000ms extra=45.173ms skip=4
+ds4: DSpark spec skip no-draft
+ congestionds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32281 valid=0 len=0 pos=487
+ds4: DSpark spec skip no-draft
+ controlds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32280 valid=0 len=0 pos=488
+ds4: DSpark spec skip no-draft
+ isds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32279 valid=0 len=0 pos=489
+ds4: DSpark spec skip no-draft
+ ads4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32278 valid=0 len=0 pos=490
+ds4: DSpark spec skip no-draft
+ setds4: DSpark spec enter accepted=1 max=32277 valid=0 len=0 pos=491
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=71 long_accept=1 confidence0=-1.728
+ds4: DSpark spec skip no-draft
+ ofds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32276 valid=0 len=0 pos=492
+ds4: DSpark spec skip no-draft
+ algorithmsds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32275 valid=0 len=0 pos=493
+ds4: DSpark spec skip no-draft
+ usedds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32274 valid=0 len=0 pos=494
+ds4: DSpark spec skip no-draft
+ byds4: DSpark spec enter accepted=1 max=32273 valid=0 len=0 pos=495
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=71 long_accept=1 confidence0=0.415
+ds4: DSpark spec skip no-draft
+ ads4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32272 valid=0 len=0 pos=496
+ds4: DSpark spec skip no-draft
+ senderds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32271 valid=0 len=0 pos=497
+ds4: DSpark spec skip no-draft
+ tods4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32270 valid=0 len=0 pos=498
+ds4: DSpark spec skip no-draft
+ manageds4: DSpark spec enter accepted=1 max=32269 valid=0 len=0 pos=499
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=71 long_accept=1 confidence0=1.490
+ds4: DSpark spec skip no-draft
+ theds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32268 valid=0 len=0 pos=500
+ds4: DSpark spec skip no-draft
+ rateds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32267 valid=0 len=0 pos=501
+ds4: DSpark spec skip no-draft
+ ofds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32266 valid=0 len=0 pos=502
+ds4: DSpark spec skip no-draft
+ datads4: DSpark spec enter accepted=1 max=32265 valid=0 len=0 pos=503
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=71 long_accept=1 confidence0=-1.825
+ds4: DSpark scheduler pause cycles=4 accepted=0 avg=0.000 no_draft=4 extra_per_accept=0.000ms saved=0.000ms extra=39.924ms skip=4
+ds4: DSpark spec skip no-draft
+ transmissionds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32264 valid=0 len=0 pos=504
+ds4: DSpark spec skip no-draft
+,ds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32263 valid=0 len=0 pos=505
+ds4: DSpark spec skip no-draft
+ preventingds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32262 valid=0 len=0 pos=506
+ds4: DSpark spec skip no-draft
+ networkds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32261 valid=0 len=0 pos=507
+ds4: DSpark spec skip no-draft
+ overloadds4: DSpark spec enter accepted=1 max=32260 valid=0 len=0 pos=508
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=71 long_accept=1 confidence0=2.033
+ds4: DSpark spec skip no-draft
+ andds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32259 valid=0 len=0 pos=509
+ds4: DSpark spec skip no-draft
+ ensuringds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32258 valid=0 len=0 pos=510
+ds4: DSpark spec skip no-draft
+ fairds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32257 valid=0 len=0 pos=511
+ds4: DSpark spec skip no-draft
+ bandwidthds4: DSpark spec enter accepted=1 max=32256 valid=0 len=0 pos=512
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=71 long_accept=1 confidence0=-2.399
+ds4: DSpark spec skip no-draft
+ sharingds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32255 valid=0 len=0 pos=513
+ds4: DSpark spec skip no-draft
+.ds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32254 valid=0 len=0 pos=514
+ds4: DSpark spec skip no-draft
+ Itds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32253 valid=0 len=0 pos=515
+ds4: DSpark spec skip no-draft
+ worksds4: DSpark spec enter accepted=1 max=32252 valid=0 len=0 pos=516
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=71 long_accept=1 confidence0=0.725
+ds4: DSpark spec skip no-draft
+ throughds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32251 valid=0 len=0 pos=517
+ds4: DSpark spec skip no-draft
+ severalds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32250 valid=0 len=0 pos=518
+ds4: DSpark spec skip no-draft
+ phasesds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32249 valid=0 len=0 pos=519
+ds4: DSpark spec skip no-draft
+:
+
+ds4: DSpark spec enter accepted=1 max=32248 valid=1 len=2 pos=520
+ds4: DSpark scheduler pause cycles=4 accepted=2 avg=0.500 no_draft=3 extra_per_accept=89.711ms saved=119.473ms extra=179.422ms skip=4
+ds4: DSpark spec accept drafted=2 accepted=3
+- **Slowds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32245 valid=0 len=0 pos=523
+ds4: DSpark spec skip no-draft
+ Startds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32244 valid=0 len=0 pos=524
+ds4: DSpark spec skip no-draft
+**:ds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32243 valid=0 len=0 pos=525
+ds4: DSpark spec skip no-draft
+ Theds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32242 valid=0 len=0 pos=526
+ds4: DSpark spec skip no-draft
+ senderds4: DSpark spec enter accepted=1 max=32241 valid=0 len=0 pos=527
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=73 long_accept=1 confidence0=1.621
+ds4: DSpark spec skip no-draft
+ startsds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32240 valid=0 len=0 pos=528
+ds4: DSpark spec skip no-draft
+ withds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32239 valid=0 len=0 pos=529
+ds4: DSpark spec skip no-draft
+ ads4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32238 valid=0 len=0 pos=530
+ds4: DSpark spec skip no-draft
+ smallds4: DSpark spec enter accepted=1 max=32237 valid=1 len=2 pos=531
+ds4: DSpark spec accept drafted=2 accepted=3
+ congestion window (ds4: DSpark spec enter accepted=1 max=32234 valid=1 len=2 pos=534
+ds4: DSpark spec miss first draft=11 base=289
+cwds4: DSpark spec enter accepted=1 max=32233 valid=0 len=0 pos=535
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=75 long_accept=1 confidence0=1.129
+ds4: DSpark scheduler pause cycles=4 accepted=2 avg=0.500 no_draft=2 extra_per_accept=94.283ms saved=118.105ms extra=188.565ms skip=4
+ds4: DSpark spec skip no-draft
+ndds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32232 valid=0 len=0 pos=536
+ds4: DSpark spec skip no-draft
+)ds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32231 valid=0 len=0 pos=537
+ds4: DSpark spec skip no-draft
+ andds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32230 valid=0 len=0 pos=538
+ds4: DSpark spec skip no-draft
+ doublesds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32229 valid=0 len=0 pos=539
+ds4: DSpark spec skip no-draft
+ itds4: DSpark spec enter accepted=1 max=32228 valid=0 len=0 pos=540
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=75 long_accept=1 confidence0=1.011
+ds4: DSpark spec skip no-draft
+ eachds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32227 valid=0 len=0 pos=541
+ds4: DSpark spec skip no-draft
+ roundds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32226 valid=0 len=0 pos=542
+ds4: DSpark spec skip no-draft
+-tds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32225 valid=0 len=0 pos=543
+ds4: DSpark spec skip no-draft
+ripds4: DSpark spec enter accepted=1 max=32224 valid=0 len=0 pos=544
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=75 long_accept=1 confidence0=1.880
+ds4: DSpark spec skip no-draft
+ timeds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32223 valid=0 len=0 pos=545
+ds4: DSpark spec skip no-draft
+ (ds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32222 valid=0 len=0 pos=546
+ds4: DSpark spec skip no-draft
+Rds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32221 valid=0 len=0 pos=547
+ds4: DSpark spec skip no-draft
+TTds4: DSpark spec enter accepted=1 max=32220 valid=0 len=0 pos=548
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=75 long_accept=1 confidence0=0.278
+ds4: DSpark spec skip no-draft
+)ds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32219 valid=0 len=0 pos=549
+ds4: DSpark spec skip no-draft
+ untilds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32218 valid=0 len=0 pos=550
+ds4: DSpark spec skip no-draft
+ ads4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32217 valid=0 len=0 pos=551
+ds4: DSpark spec skip no-draft
+ lossds4: DSpark spec enter accepted=1 max=32216 valid=1 len=2 pos=552
+ds4: DSpark scheduler pause cycles=4 accepted=2 avg=0.500 no_draft=3 extra_per_accept=87.935ms saved=119.640ms extra=175.869ms skip=4
+ds4: DSpark spec accept drafted=2 accepted=3
+ is detected ords4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32213 valid=0 len=0 pos=555
+ds4: DSpark spec skip no-draft
+ ads4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32212 valid=0 len=0 pos=556
+ds4: DSpark spec skip no-draft
+ slowds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32211 valid=0 len=0 pos=557
+ds4: DSpark spec skip no-draft
+ startds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32210 valid=0 len=0 pos=558
+ds4: DSpark spec skip no-draft
+ thresholdds4: DSpark spec enter accepted=1 max=32209 valid=1 len=3 pos=559
+ds4: DSpark spec accept drafted=3 accepted=4
+ (ssthreshds4: DSpark spec enter accepted=1 max=32205 valid=1 len=3 pos=563
+ds4: DSpark spec accept drafted=3 accepted=4
+) is reached.
+ds4: DSpark spec enter accepted=1 max=32201 valid=1 len=4 pos=567
+ds4: DSpark spec accept drafted=4 accepted=5
+- **Congestion Avoidds4: DSpark spec enter accepted=1 max=32196 valid=1 len=1 pos=572
+ds4: DSpark scheduler pause cycles=4 accepted=11 avg=2.750 no_draft=0 extra_per_accept=54.194ms saved=657.337ms extra=596.137ms skip=4
+ds4: DSpark spec accept drafted=1 accepted=2
+ance**:ds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32194 valid=0 len=0 pos=574
+ds4: DSpark spec skip no-draft
+ Afterds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32193 valid=0 len=0 pos=575
+ds4: DSpark spec skip no-draft
+ reachingds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32192 valid=0 len=0 pos=576
+ds4: DSpark spec skip no-draft
+ sds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32191 valid=0 len=0 pos=577
+ds4: DSpark spec skip no-draft
+sthds4: DSpark spec enter accepted=1 max=32190 valid=0 len=0 pos=578
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=88 long_accept=1 confidence0=0.835
+ds4: DSpark spec skip no-draft
+reshds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32189 valid=0 len=0 pos=579
+ds4: DSpark spec skip no-draft
+,ds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32188 valid=0 len=0 pos=580
+ds4: DSpark spec skip no-draft
+ theds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32187 valid=0 len=0 pos=581
+ds4: DSpark spec skip no-draft
+ windowds4: DSpark spec enter accepted=1 max=32186 valid=0 len=0 pos=582
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=88 long_accept=1 confidence0=0.797
+ds4: DSpark spec skip no-draft
+ increasesds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32185 valid=0 len=0 pos=583
+ds4: DSpark spec skip no-draft
+ moreds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32184 valid=0 len=0 pos=584
+ds4: DSpark spec skip no-draft
+ slowlyds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32183 valid=0 len=0 pos=585
+ds4: DSpark spec skip no-draft
+ (ds4: DSpark spec enter accepted=1 max=32182 valid=0 len=0 pos=586
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=88 long_accept=1 confidence0=-0.193
+ds4: DSpark spec skip no-draft
+byds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32181 valid=0 len=0 pos=587
+ds4: DSpark spec skip no-draft
+ oneds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32180 valid=0 len=0 pos=588
+ds4: DSpark spec skip no-draft
+ segmentds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32179 valid=0 len=0 pos=589
+ds4: DSpark spec skip no-draft
+ perds4: DSpark spec enter accepted=1 max=32178 valid=1 len=1 pos=590
+ds4: DSpark scheduler pause cycles=4 accepted=1 avg=0.250 no_draft=3 extra_per_accept=113.811ms saved=58.928ms extra=113.811ms skip=4
+ds4: DSpark spec accept drafted=1 accepted=2
+ RTTds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32176 valid=0 len=0 pos=592
+ds4: DSpark spec skip no-draft
+)ds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32175 valid=0 len=0 pos=593
+ds4: DSpark spec skip no-draft
+ tods4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32174 valid=0 len=0 pos=594
+ds4: DSpark spec skip no-draft
+ probeds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32173 valid=0 len=0 pos=595
+ds4: DSpark spec skip no-draft
+ fords4: DSpark spec enter accepted=1 max=32172 valid=1 len=1 pos=596
+ds4: DSpark spec miss first draft=34393 base=7768
+ availableds4: DSpark spec enter accepted=1 max=32171 valid=0 len=0 pos=597
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=89 long_accept=1 confidence0=2.082
+ds4: DSpark spec skip no-draft
+ capacityds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32170 valid=0 len=0 pos=598
+ds4: DSpark spec skip no-draft
+.
+ds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32169 valid=0 len=0 pos=599
+ds4: DSpark spec skip no-draft
+-ds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32168 valid=0 len=0 pos=600
+ds4: DSpark spec skip no-draft
+ **ds4: DSpark spec enter accepted=1 max=32167 valid=0 len=0 pos=601
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=89 long_accept=1 confidence0=0.074
+ds4: DSpark spec skip no-draft
+Fastds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32166 valid=0 len=0 pos=602
+ds4: DSpark spec skip no-draft
+ Retds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32165 valid=0 len=0 pos=603
+ds4: DSpark spec skip no-draft
+ransds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32164 valid=0 len=0 pos=604
+ds4: DSpark spec skip no-draft
+mitds4: DSpark spec enter accepted=1 max=32163 valid=0 len=0 pos=605
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=89 long_accept=1 confidence0=1.003
+ds4: DSpark scheduler pause cycles=4 accepted=0 avg=0.000 no_draft=3 extra_per_accept=0.000ms saved=0.000ms extra=50.479ms skip=4
+ds4: DSpark spec skip no-draft
+ andds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32162 valid=0 len=0 pos=606
+ds4: DSpark spec skip no-draft
+ Fastds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32161 valid=0 len=0 pos=607
+ds4: DSpark spec skip no-draft
+ Recoveryds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32160 valid=0 len=0 pos=608
+ds4: DSpark spec skip no-draft
+**:ds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32159 valid=0 len=0 pos=609
+ds4: DSpark spec skip no-draft
+ Whends4: DSpark spec enter accepted=1 max=32158 valid=1 len=1 pos=610
+ds4: DSpark spec miss first draft=999 base=23648
+ ads4: DSpark spec enter accepted=1 max=32157 valid=0 len=0 pos=611
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=89 long_accept=1 confidence0=1.820
+ds4: DSpark spec skip no-draft
+ packetds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32156 valid=0 len=0 pos=612
+ds4: DSpark spec skip no-draft
+ lossds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32155 valid=0 len=0 pos=613
+ds4: DSpark spec skip no-draft
+ isds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32154 valid=0 len=0 pos=614
+ds4: DSpark spec skip no-draft
+ detectedds4: DSpark spec enter accepted=1 max=32153 valid=0 len=0 pos=615
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=89 long_accept=1 confidence0=1.780
+ds4: DSpark spec skip no-draft
+ viads4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32152 valid=0 len=0 pos=616
+ds4: DSpark spec skip no-draft
+ duplicateds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32151 valid=0 len=0 pos=617
+ds4: DSpark spec skip no-draft
+ ACds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32150 valid=0 len=0 pos=618
+ds4: DSpark spec skip no-draft
+Ksds4: DSpark spec enter accepted=1 max=32149 valid=0 len=0 pos=619
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=89 long_accept=1 confidence0=2.188
+ds4: DSpark scheduler pause cycles=4 accepted=0 avg=0.000 no_draft=3 extra_per_accept=0.000ms saved=0.000ms extra=48.898ms skip=4
+ds4: DSpark spec skip no-draft
+,ds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32148 valid=0 len=0 pos=620
+ds4: DSpark spec skip no-draft
+ theds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32147 valid=0 len=0 pos=621
+ds4: DSpark spec skip no-draft
+ senderds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32146 valid=0 len=0 pos=622
+ds4: DSpark spec skip no-draft
+ retds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32145 valid=0 len=0 pos=623
+ds4: DSpark spec skip no-draft
+ransds4: DSpark spec enter accepted=1 max=32144 valid=0 len=0 pos=624
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=89 long_accept=1 confidence0=-0.667
+ds4: DSpark spec skip no-draft
+mds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32143 valid=0 len=0 pos=625
+ds4: DSpark spec skip no-draft
+itsds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32142 valid=0 len=0 pos=626
+ds4: DSpark spec skip no-draft
+ theds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32141 valid=0 len=0 pos=627
+ds4: DSpark spec skip no-draft
+ lostds4: DSpark spec enter accepted=1 max=32140 valid=0 len=0 pos=628
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=89 long_accept=1 confidence0=0.778
+ds4: DSpark spec skip no-draft
+ packetds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32139 valid=0 len=0 pos=629
+ds4: DSpark spec skip no-draft
+ withoutds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32138 valid=0 len=0 pos=630
+ds4: DSpark spec skip no-draft
+ waitingds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32137 valid=0 len=0 pos=631
+ds4: DSpark spec skip no-draft
+ fords4: DSpark spec enter accepted=1 max=32136 valid=1 len=3 pos=632
+ds4: DSpark spec accept drafted=3 accepted=4
+ a timeout, andds4: DSpark spec enter accepted=1 max=32132 valid=0 len=0 pos=636
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=92 long_accept=1 confidence0=0.781
+ds4: DSpark scheduler pause cycles=4 accepted=3 avg=0.750 no_draft=3 extra_per_accept=62.123ms saved=179.724ms extra=186.369ms skip=4
+ds4: DSpark spec skip no-draft
+ reducesds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32131 valid=0 len=0 pos=637
+ds4: DSpark spec skip no-draft
+ theds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32130 valid=0 len=0 pos=638
+ds4: DSpark spec skip no-draft
+ congestionds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32129 valid=0 len=0 pos=639
+ds4: DSpark spec skip no-draft
+ windowds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32128 valid=0 len=0 pos=640
+ds4: DSpark spec skip no-draft
+ (ds4: DSpark spec enter accepted=1 max=32127 valid=0 len=0 pos=641
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=92 long_accept=1 confidence0=-0.220
+ds4: DSpark spec skip no-draft
+typicallyds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32126 valid=0 len=0 pos=642
+ds4: DSpark spec skip no-draft
+ tods4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32125 valid=0 len=0 pos=643
+ds4: DSpark spec skip no-draft
+ halfds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32124 valid=0 len=0 pos=644
+ds4: DSpark spec skip no-draft
+)ds4: DSpark spec enter accepted=1 max=32123 valid=0 len=0 pos=645
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=92 long_accept=1 confidence0=-1.928
+ds4: DSpark spec skip no-draft
+ tods4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32122 valid=0 len=0 pos=646
+ds4: DSpark spec skip no-draft
+ adaptds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32121 valid=0 len=0 pos=647
+ds4: DSpark spec skip no-draft
+ tods4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32120 valid=0 len=0 pos=648
+ds4: DSpark spec skip no-draft
+ theds4: DSpark spec enter accepted=1 max=32119 valid=1 len=1 pos=649
+ds4: DSpark spec miss first draft=339 base=5664
+ networkds4: DSpark spec enter accepted=1 max=32118 valid=1 len=1 pos=650
+ds4: DSpark scheduler pause cycles=4 accepted=0 avg=0.000 no_draft=2 extra_per_accept=0.000ms saved=0.000ms extra=54.472ms skip=4
+ds4: DSpark spec miss first draft=1101 base=339
+ conditionds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32117 valid=0 len=0 pos=651
+ds4: DSpark spec skip no-draft
+.
+
+ds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32116 valid=0 len=0 pos=652
+ds4: DSpark spec skip no-draft
+Theseds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32115 valid=0 len=0 pos=653
+ds4: DSpark spec skip no-draft
+ mechanismsds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32114 valid=0 len=0 pos=654
+ds4: DSpark spec skip no-draft
+ helpds4: DSpark spec enter accepted=1 max=32113 valid=0 len=0 pos=655
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=92 long_accept=1 confidence0=-1.956
+ds4: DSpark spec skip no-draft
+ TCPds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32112 valid=0 len=0 pos=656
+ds4: DSpark spec skip no-draft
+ dynamicallyds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32111 valid=0 len=0 pos=657
+ds4: DSpark spec skip no-draft
+ adjustds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32110 valid=0 len=0 pos=658
+ds4: DSpark spec skip no-draft
+ itsds4: DSpark spec enter accepted=1 max=32109 valid=1 len=1 pos=659
+ds4: DSpark spec accept drafted=1 accepted=2
+ sending rateds4: DSpark spec enter accepted=1 max=32107 valid=1 len=1 pos=661
+ds4: DSpark spec accept drafted=1 accepted=2
+ based onds4: DSpark spec enter accepted=1 max=32105 valid=0 len=0 pos=663
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=94 long_accept=1 confidence0=-0.073
+ds4: DSpark scheduler pause cycles=4 accepted=2 avg=0.500 no_draft=2 extra_per_accept=92.093ms saved=118.633ms extra=184.186ms skip=4
+ds4: DSpark spec skip no-draft
+ networkds4: DSpark scheduler skip remaining=3
+ds4: DSpark spec enter accepted=1 max=32104 valid=0 len=0 pos=664
+ds4: DSpark spec skip no-draft
+ feedbackds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32103 valid=0 len=0 pos=665
+ds4: DSpark spec skip no-draft
+,ds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32102 valid=0 len=0 pos=666
+ds4: DSpark spec skip no-draft
+ aimingds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32101 valid=0 len=0 pos=667
+ds4: DSpark spec skip no-draft
+ fords4: DSpark spec enter accepted=1 max=32100 valid=1 len=1 pos=668
+ds4: DSpark spec accept drafted=1 accepted=2
+ high throughputds4: DSpark spec enter accepted=1 max=32098 valid=0 len=0 pos=670
+ds4: DSpark scheduler no-draft pause skip=3 accepted_total=95 long_accept=1 confidence0=1.090
+ds4: DSpark spec skip no-draft
+ whileds4: DSpark scheduler skip remaining=2
+ds4: DSpark spec enter accepted=1 max=32097 valid=0 len=0 pos=671
+ds4: DSpark spec skip no-draft
+ avoidingds4: DSpark scheduler skip remaining=1
+ds4: DSpark spec enter accepted=1 max=32096 valid=0 len=0 pos=672
+ds4: DSpark spec skip no-draft
+ congestionds4: DSpark scheduler skip remaining=0
+ds4: DSpark spec enter accepted=1 max=32095 valid=0 len=0 pos=673
+ds4: DSpark spec skip no-draft
+ collapseds4: DSpark spec enter accepted=1 max=32094 valid=1 len=1 pos=674
+ds4: DSpark spec accept drafted=1 accepted=2
+.
+ds4: prefill: 50.47 t/s, generation: 15.99 t/s

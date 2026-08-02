@@ -1,0 +1,51 @@
+ds4: Linux cuda backend set oom_score_adj=1000
+ds4: CUDA backend initialized on NVIDIA GB10 (sm_121) dev=0
+ds4: CUDA (no-copy) host registration skipped: operation not supported
+ds4: CUDA preparing model tensor mappings
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA loading model tensors 16.02 GiB cached
+ds4: CUDA prepared model tensor mappings 16.37 GiB
+ds4: CUDA loading model tensors 32.06 GiB cached
+ds4: CUDA prepared model tensor mappings 32.07 GiB
+ds4: CUDA loading model tensors 48.02 GiB cached
+ds4: CUDA prepared model tensor mappings 48.43 GiB
+ds4: CUDA loading model tensors 64.06 GiB cached
+ds4: CUDA prepared model tensor mappings 64.13 GiB
+ds4: CUDA loading model tensors 80.04 GiB cached
+ds4: CUDA prepared model tensor mappings 80.24 GiB
+ds4: CUDA startup model preparation covered 80.76 GiB of tensor spans in 19.568s
+ds4: cuda backend initialized for graph diagnostics
+ds4: memory: KV 0.78 GiB (raw 0.36 + compressed 0.42) + buffers 0.25 GiB + resident model 80.76 GiB = 81.79 GiB planned
+ds4: memory detail: ctx=32768 prefill_cap=4096 raw_kv_rows=4352 compressed_kv_rows=8194 backend=cuda
+ds4: memory: KV 0.78 GiB (raw 0.36 + compressed 0.42) + buffers 0.25 GiB = 1.03 GiB context
+ds4: memory detail: ctx=32768 prefill_cap=4096 raw_kv_rows=4352 compressed_kv_rows=8194 backend=cuda
+Commands:
+  /help          Show this help.
+  /think         Use normal thinking mode.
+  /think-max     Use Think Max only when context is at least 393216 tokens.
+  /nothink       Disable thinking mode.
+  /ctx N         Set context size for following prompts.
+  /power N       Set GPU duty cycle percentage, 1..100.
+  /read FILE     Read a prompt from FILE and run it.
+  /quit, /exit   Leave the prompt.
+  Ctrl+C         Stop generation and return to the prompt.
+Photosynthesis is the process by which plants, algae, and some bacteria convert sunlight into chemical energy. It takes place mainly in the leaves, where chlorophyll absorbs sunlight and uses it to transform carbon dioxide and water into glucose (a sugar) and oxygen. This reaction, summarized as 6CO₂ + 6H₂O → C₆H₁₂O₆ + 6O₂, provides energy for the organism's growth and releases oxygen as a byproduct.
+ds4: prefill: 28.17 t/s, generation: 16.93 t/s
+processing 18 input tokens: 0/18 (0.0%)
+processing 18 input tokens: 18/18 (100.0%)
+The three photosynthetic pathways differ mainly in how they handle carbon fixation and water efficiency. **C3 plants** (like rice and wheat) use the Calvin cycle directly, fixing CO₂ into a 3-carbon compound, but they often lose water through photorespiration under hot, dry conditions. **C4 plants** (like corn and sugarcane) spatially separate carbon fixation and the Calvin cycle, using an additional enzyme to concentrate CO₂ in bundle sheath cells, which minimizes photorespiration and improves water efficiency. **CAM plants** (like cacti and succulents) temporally separate these steps, fixing CO₂ at night into malate and releasing it during the day for the Calvin cycle, allowing them to conserve water in arid environments by keeping stomata closed during the day.
+ds4: prefill: 64.47 t/s, generation: 16.93 t/s
+processing 12 input tokens: 0/12 (0.0%)
+processing 12 input tokens: 12/12 (100.0%)
+The TCP three-way handshake is the process used to establish a reliable connection between a client and a server before data transmission begins. It works as follows:
+
+1. **SYN**: The client sends a TCP segment with the SYN (synchronize) flag set, along with an initial sequence number (ISN), to the server to initiate a connection.
+2. **SYN-ACK**: The server responds with a segment that has both the SYN and ACK (acknowledgment) flags set, acknowledging the client's SYN and sending its own initial sequence number.
+3. **ACK**: The client sends back an ACK segment, acknowledging the server's SYN-ACK, and the connection is established.
+
+After this exchange, both sides know the connection is reliable, and they can begin sending data.
+ds4: prefill: 52.90 t/s, generation: 16.88 t/s
+processing 11 input tokens: 0/11 (0.0%)
+processing 11 input tokens: 11/11 (100.0%)
+TCP congestion control is a set of algorithms used by a sender to prevent overwhelming a network with too much data at once, thereby avoiding packet loss and congestion. It works by dynamically adjusting the rate of data transmission based on feedback from the network, primarily through packet loss detection or explicit congestion signals. Key phases include **slow start** (ramping up the sending rate exponentially from a conservative starting point), **congestion avoidance** (switching to a more cautious linear increase after a threshold), and **fast retransmit/fast recovery** (reacting to duplicate acknowledgments by reducing the sending rate and then gradually increasing it again). The goal is to maximize throughput while keeping the network stable and fair to other connections.
+ds4: prefill: 45.76 t/s, generation: 16.85 t/s

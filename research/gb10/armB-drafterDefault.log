@@ -1,0 +1,70 @@
+ds4: Linux cuda backend set oom_score_adj=1000
+ds4: DSpark support model detected: gguf/DeepSeek-V4-Flash-DSpark-support.gguf (stages=3 block=5 markov_rank=256 tensors=81 missing=0 invalid=0 metadata_errors=0); use --dspark to enable experimental runtime decode
+ds4: CUDA backend initialized on NVIDIA GB10 (sm_121) dev=0
+ds4: CUDA (no-copy) host registration skipped: operation not supported
+ds4: CUDA (no-copy) host registration skipped: operation not supported
+ds4: CUDA preparing model tensor mappings
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA loading model tensors 16.02 GiB cached
+ds4: CUDA prepared model tensor mappings 16.37 GiB
+ds4: CUDA loading model tensors 32.06 GiB cached
+ds4: CUDA prepared model tensor mappings 32.07 GiB
+ds4: CUDA loading model tensors 48.02 GiB cached
+ds4: CUDA prepared model tensor mappings 48.43 GiB
+ds4: CUDA loading model tensors 64.06 GiB cached
+ds4: CUDA prepared model tensor mappings 64.13 GiB
+ds4: CUDA loading model tensors 80.04 GiB cached
+ds4: CUDA prepared model tensor mappings 80.24 GiB
+ds4: CUDA startup model preparation covered 80.76 GiB of tensor spans in 19.282s
+ds4: CUDA preparing model tensor mappings
+ds4: CUDA startup model preparation covered 5.58 GiB of tensor spans in 1.244s
+ds4: cuda backend initialized for graph diagnostics
+ds4: memory: KV 0.78 GiB (raw 0.36 + compressed 0.42) + buffers 0.25 GiB + resident model 80.76 GiB = 81.79 GiB planned
+ds4: memory detail: ctx=32768 prefill_cap=4096 raw_kv_rows=4352 compressed_kv_rows=8194 backend=cuda
+ds4: memory: KV 0.78 GiB (raw 0.36 + compressed 0.42) + buffers 0.25 GiB = 1.03 GiB context
+ds4: memory detail: ctx=32768 prefill_cap=4096 raw_kv_rows=4352 compressed_kv_rows=8194 backend=cuda
+ds4: DSpark target-hidden capture enabled: layers=40,41,42
+Commands:
+  /help          Show this help.
+  /think         Use normal thinking mode.
+  /think-max     Use Think Max only when context is at least 393216 tokens.
+  /nothink       Disable thinking mode.
+  /ctx N         Set context size for following prompts.
+  /power N       Set GPU duty cycle percentage, 1..100.
+  /read FILE     Read a prompt from FILE and run it.
+  /quit, /exit   Leave the prompt.
+  Ctrl+C         Stop generation and return to the prompt.
+Photosynthesis is the process by which plants, algae, and some bacteria convert sunlight into chemical energy. In the chloroplasts, chlorophyll absorbs sunlight and uses that energy to split water molecules into oxygen, protons, and electrons. The released electrons help convert carbon dioxide into glucose through a series of reactions, with oxygen being released as a byproduct.
+ds4: prefill: 11.86 t/s, generation: 16.76 t/s
+processing 18 input tokens: 0/18 (0.0%)
+processing 18 input tokens: 18/18 (100.0%)
+Here is a brief contrast of the three major photosynthetic pathways:
+
+**C3 photosynthesis** is the most common and ancestral pathway. It uses the enzyme Rubisco to fix carbon dioxide directly into a 3-carbon compound. While efficient under normal conditions, it suffers from **photorespiration** (wasting energy) when temperatures are high or carbon dioxide is low.
+
+**C4 photosynthesis** evolved as an adaptation to hot, dry environments. It spatially separates carbon fixation into two cell types: in mesophyll cells, carbon dioxide is temporarily fixed into a 4-carbon compound, which is then shuttled to bundle sheath cells to release CO₂ for the C3 cycle. This effectively **concentrates CO₂** and minimizes photorespiration, making it more efficient in heat and drought.
+
+**CAM photosynthesis** (Crassulacean Acid Metabolism) is an adaptation to extremely arid conditions. It **temporally** separates carbon fixation: at night, stomata open to take in CO₂ and fix it into malate (a 4-carbon acid); during the day, stomata close to conserve water, and the stored malate is broken down to release CO₂ for the C3 cycle. This allows plants to survive in deserts while reducing water loss.
+ds4: prefill: 64.63 t/s, generation: 16.87 t/s
+processing 12 input tokens: 0/12 (0.0%)
+processing 12 input tokens: 12/12 (100.0%)
+The TCP three-way handshake is the process used to establish a reliable connection between a client and a server before data transfer begins.
+
+1.  **SYN**: The client sends a TCP segment with the SYN flag set and an initial sequence number (e.g., `x`) to the server, requesting a connection.
+2.  **SYN-ACK**: The server responds with a segment that has both the SYN and ACK flags set. It acknowledges the client's sequence number by sending `ack = x + 1` and provides its own initial sequence number (e.g., `y`).
+3.  **ACK**: The client sends a final ACK segment back, acknowledging the server's sequence number (`ack = y + 1`). The connection is now established, and data transfer can begin.
+
+This exchange synchronizes sequence numbers and confirms that both sides are ready to communicate.
+ds4: prefill: 53.20 t/s, generation: 16.83 t/s
+processing 11 input tokens: 0/11 (0.0%)
+processing 11 input tokens: 11/11 (100.0%)
+TCP congestion control is a set of algorithms that prevent a sender from overwhelming the network with too much data at once. It works by dynamically adjusting the amount of data the sender can transmit before needing an acknowledgment (the congestion window).
+
+Key phases include:
+
+- **Slow Start**: The sender starts with a small window and doubles it each time an acknowledgment is received, quickly probing for available bandwidth.
+- **Congestion Avoidance**: Once a threshold is reached, the window grows more slowly (by one segment per round-trip) to avoid triggering congestion.
+- **Fast Retransmit and Recovery**: If three duplicate acknowledgments are received (suggesting a lost packet), the sender assumes mild congestion, halves its window, and retransmits the lost packet without waiting for a timeout.
+
+This approach allows TCP to efficiently use available bandwidth while being fair to other connections and preventing network collapse.
+ds4: prefill: 50.54 t/s, generation: 16.79 t/s

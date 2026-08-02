@@ -1,0 +1,5 @@
+Explain in a few sentences how photosynthesis works.
+Now contrast C3, C4, and CAM photosynthesis pathways briefly.
+Explain the TCP three-way handshake.
+Now explain TCP congestion control briefly.
+/quit

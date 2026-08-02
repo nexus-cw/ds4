@@ -2903,3 +2903,213 @@ true causal continuation is effectively total past depth 1. Net effect:
 DSpark drafting is currently a measured throughput loss (up to 69% slower)
 on this hardware/model, and cannot become a win without adding a
 multi-round refinement mechanism to the proposal path."
+
+## DSpark chaining hypothesis check + resident A/B, ceiling claim corrected (2026-08-02)
+
+**Task**: operator hypothesis -- DeepSeek's official MTP design chains draft stage
+`k`'s input on stage `k-1`'s predicted-token embedding (not a noise placeholder);
+if ds4's DSpark "stage chain" runs the 3 stages against static noise-seeded slots
+without feeding each stage's prediction forward, that would be a wiring-class bug,
+not the "structural, no fix" verdict the prior unit (`c832953`) reached. Two parts:
+(A) a cheap resident cost-structure discriminator, (B) a chain-code re-read
+targeted at the chaining question specifically.
+
+### Part A: resident IQ2XXS + `DSpark-support.gguf` A/B (`--temp 0`, 4-turn short
+protocol, `DS4_DSPARK_SPEC_LOG=1`, steady = last 2 turns)
+
+`ds4-server` stopped first (mandatory, restarted after -- see below). Pairing:
+`-m gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf`
+(81 GiB, fully resident, no `--ssd-streaming`) + `--mtp
+gguf/DeepSeek-V4-Flash-DSpark-support.gguf --dspark` (lineage-matched: both share
+`dspark.target_layer_ids=[40,41,42]`, `dspark.noise_token_id=128799`,
+`dspark.block_size=5`, confirmed via a direct GGUF key-value dump, not just the
+load-time banner). **Discovery**: DSpark speculation is a **greedy-only path** --
+default (non-zero) `--temp` silently disables `dspark_draft_valid` and zero
+`DSpark spec *` log lines are ever emitted; this matches upstream `fc9efd1`'s own
+README addition ("DSpark speculation is currently a greedy argmax-only path...
+Plain sampled and non-speculative session eval also skips DSpark draft
+preparation") -- not a bug, just an easy foot-gun for any A/B that forgets
+`--temp 0` (the first pass of this unit's own resident run did, and got zero
+drafting activity in all three arms as a result; redone with `--temp 0`).
+
+| Arm | generation t/s (steady, last 2 turns) | vs no-drafter |
+|---|---|---|
+| (a) no drafter | **16.87 t/s** (16.88, 16.85) | baseline |
+| (b) `--mtp ... --dspark` (default confidence 0.9) | **16.07 t/s** (16.14, 15.99) | **-4.7%** |
+| (c) `--dspark-confidence 0.0` (force-accept every draft) | **10.81 t/s** (11.32, 10.30) | **-35.9%** |
+
+**Resident verdict: spec decode is a net throughput loss at this ceiling, on this
+hardware/pairing, at every confidence setting tested** -- consistent with the
+prior unit's directional finding (spec decode doesn't currently pay for itself
+here), now confirmed resident (not just under `--ssd-streaming`) so the loss is
+not a streaming-specific artifact.
+
+**Accepted-token distribution -- corrects the prior unit's "always exactly 2"
+framing.** Filtering `DSpark spec accept`/`DSpark spec partial` result lines only
+(not the per-cycle `DSpark spec enter` lines, which start every cycle at
+`accepted=1` regardless of outcome -- a filtering mistake this unit made and
+caught on the first pass) gives a real spread, not a fixed point:
+
+- Arm (b), default confidence: 48 successful verify events, `no-draft` skips=459
+  (scheduler backs off aggressively). `{accepted=2: 15, 3: 22, 4: 8, 5: 2, 6: 1}`,
+  mean 3.0.
+- Arm (c), confidence 0.0 (always drafts full `block_size=5`): 98 successful
+  verify events, `no-draft` skips=134. `{accepted=2: 23, 3: 28, 4: 19, 5: 19,
+  6: 9}`, mean 3.6.
+
+**This directly contradicts the prior unit's claim that acceptance is "100% of
+3,338 combined verify events... not a sometimes-partial-credit distribution" --
+capped at exactly `accepted=2` every time.** That claim was true for the pairing
+that unit tested (streamed GA target + `DeepSeek-V4-Flash-0731-DSpark-Drafter-
+MXFP4-Q8_0.gguf` drafter); it does **not** generalize to the resident IQ2XXS +
+`DSpark-support.gguf` pairing tested here, which reaches depth 6 repeatedly. The
+underlying mechanism explanation from the prior unit (noise-conditioned
+positions beyond 0, order-1 Markov correction only) still holds and still
+explains *why* deeper acceptance is unreliable/inconsistent -- it just isn't a
+hard architectural wall at exactly depth 1 for every pairing; some pairings/
+continuations survive verify well past that. The net throughput loss in this
+unit's resident A/B is real regardless of the corrected distribution: even with
+mean depth 3.0-3.6, per-cycle drafter cost plus scheduler backoff overhead
+(459 and 134 no-draft skip cycles respectively, dwarfing the 48/98 successful
+ones) outweighs the savings on this hardware.
+
+**New correctness finding (caught by this unit's mandated identity check, not
+the chaining question -- flagged, not fixed, out of this unit's scope):** the
+ticket's protocol requires byte-identity vs. no-drafter to hold under the
+greedy contract before any A/B is trusted. Checked with `-p` (clean stdout,
+`2>/dev/null`) on `"Explain the TCP three-way handshake."`, `--temp 0`: the
+no-drafter path is perfectly reproducible run-to-run (`diff` clean across two
+independent runs). **The drafter-enabled path (Arm b config) diverges from the
+no-drafter output partway through the response** -- same opening sentence,
+then different phrasing/structure/section headers throughout the rest of the
+generation. This means the verify/accept path is, in at least this pairing +
+default-confidence config, committing at least one token that is not actually
+the target's true greedy argmax -- a real correctness bug in the accept logic
+or a floating-point/batch-size-dependent divergence in the target's own verify
+pass, independent of the throughput/chaining questions above. **Root cause not
+investigated this unit** (out of scope: this ticket's mandate was the chaining
+hypothesis and a cost-structure discriminator, not a new correctness bug hunt);
+recommend a dedicated follow-up unit re-examine `metal_graph_verify_suffix_
+tops_impl`/the commit-loop's longest-common-prefix comparison (`ds4.c:62234-
+62240`) specifically for this resident (non-streaming) + default-confidence
+pairing, since the earlier `05f0fde`/pairing-smoke identity check that passed
+only exercised two very short, high-predictability prompts ("ok", "capital of
+France") -- not long enough to hit whatever this divergence needs to trigger.
+
+### Part B: chaining-hypothesis code trace -- REFUTED, hypothesis based on a
+naming collision, prior structural verdict stands (corroborated, not just
+re-asserted)
+
+**The hypothesis, precisely**: does `metal_graph_eval_dspark_stage_chain`
+(`ds4.c:32351`) substitute stage `k`'s predicted-token embedding into stage
+`k+1`'s input in place of `noise_token_id`, per DeepSeek's chained-MTP design?
+
+**Answer: the "stages" in this function are not MTP prediction modules at all --
+they are the small DSpark drafter's own transformer layer depth.** Confirmed
+three independent ways:
+
+1. **GGUF metadata, dumped directly** (`python3` GGUF-header parser, both
+   `DeepSeek-V4-Flash-0731-DSpark-Drafter-MXFP4-Q8_0.gguf` and
+   `DeepSeek-V4-Flash-DSpark-support.gguf`): `dspark.layer_count=3` /
+   `dspark.stage_count=3` / `dspark.n_layers=3` (support GGUF has all three
+   spellings of the same field), plus `dspark.target_layer_ids=[40,41,42]` --
+   **3 target-model hidden-state taps**, one per drafter layer. This is an
+   EAGLE/Medusa-style small-transformer-conditioned-on-target-hidden-states
+   design (3 layers of the drafter's own net, each attached to a different
+   target layer's hidden state), not DeepSeek V3/V4's per-future-token MTP
+   module chain (where module count = number of future tokens predicted, each
+   module chained on the *previous module's own predicted-token embedding*,
+   not on different target layers).
+
+2. **Code**, `ds4.c:2600-2636` (`ds4_tensor_dspark_stage`) and the stage-count
+   derivation at `ds4.c:2736` (`s.stages = max_stage + 1u`, from the highest
+   `dspark.<N>.*` tensor-name prefix) -- this is exactly how ds4 already counts
+   ordinary transformer block depth for every other model family in this file
+   (`blk.<N>.*`), just with a `dspark.` prefix instead of `blk.`. `n_stages`
+   flows into `metal_graph_eval_dspark_stage_chain`'s `for (stage = 0; stage <
+   dw->n_stages; stage++)` loop unchanged from any other per-layer loop in the
+   file.
+
+3. **The chaining that already exists between stages is ordinary residual-
+   stream hand-off, already correct, not the site of any bug.**
+   `metal_graph_eval_dspark_stage_block` is called with `prepare_next_stage_
+   input = (stage + 1 < dw->n_stages)` (`ds4.c:32421-32427`); when true, it
+   calls `metal_graph_encode_dspark_next_stage_draft_input_from`
+   (`ds4.c:31947-31967`), which `ds4_gpu_tensor_copy`'s the **hidden-state**
+   (`hc`, `block_size` positions x `DS4_N_HC * DS4_N_EMBD` floats) produced by
+   stage `k`'s FFN output into `g->dspark_stage_input_hc`, the tensor stage
+   `k+1` reads its input from. This is textbook layer-to-layer residual-stream
+   propagation (exactly what `metal_graph_encode_layer_ffn_batch` does between
+   any two ordinary transformer layers elsewhere in this file) -- **not** a
+   token-id/embedding substitution, and not broken: hidden state genuinely
+   flows stage0->stage1->stage2 today.
+
+**The axis the operator's hypothesis actually describes -- per-draft-position
+chaining (position `i`'s proposal conditioned on position `i-1`'s real
+predicted token) -- is `dw->block_size` (5 draft positions), a completely
+different axis from `n_stages` (3 drafter layers).** That axis is exactly what
+the prior unit (`c832953`) already found unwired: `metal_graph_prepare_dspark_
+setup_block` (`ds4.c:31401-31432`, re-read this unit, unchanged) seeds
+positions `1..block_size-1` with the fixed `noise_token_id` **once**, before
+any of the 3 stages run, and the per-position "Markov correction"
+(`ds4.c:33103-33356`) is confirmed (again, unchanged) to be a single order-1
+bias on the previous drafted token's embedding, not a re-run of the 3-stage
+forward with the real token substituted in.
+
+**Cross-checks against the ticket's three named evidence sources:**
+
+- **(i) DeepSeek V3/V4 MTP tech-report design** (chained per-module
+  conditioning, module `k` sees module `k-1`'s predicted-token embedding):
+  describes what would need to happen along the `block_size` axis. It says
+  nothing about the `n_stages`/layer-depth axis, because that axis doesn't
+  exist in DeepSeek's official MTP design at all (their MTP modules are single
+  transformer layers each, not 3-layer sub-networks) -- **this GGUF's
+  3-layer-deep, 3-target-layer-tapped drafter is not literally DeepSeek's
+  official per-token MTP module structure**; it is a separate EAGLE-style
+  architecture the checkpoint's own name ("DSpark") distinguishes from plain
+  "MTP" (ds4 already tracks these as two different support-model dialects,
+  `DS4_SUPPORT_MTP_LEGACY` vs `DS4_SUPPORT_DSPARK`, `ds4.c` `support_kind`).
+- **(ii) the GGUF's own metadata**: `dspark.layer_count=3` (not "predict 3
+  future tokens" -- there is no such 3-future-token metadata key anywhere in
+  either drafter GGUF; `dspark.block_size=5` is the only draft-length field,
+  and confirms the real per-token draft depth is 5, already known).
+- **(iii) upstream commit intent**: `git log -S dspark` on this repo shows
+  DSpark was added whole-cloth by `fc9efd1` ("Add DSpark speculative
+  decoding", `antirez`, not yet on his public `main` -- reconfirmed this unit).
+  That commit's own `README.md` addition (re-read in full this unit) states
+  plainly: *"DSpark speculation is currently a greedy argmax-only path"* and
+  documents confidence-threshold pruning as the only tunable knob -- **no
+  commit message or doc anywhere in this repo's history describes an intended
+  but not-yet-wired per-position causal refinement/chaining pass.** If ds4's
+  own port were missing an intended chaining step, the commit that added
+  DSpark support would be the place to expect a TODO/known-gap note about it;
+  there is none.
+
+**VERDICT: (b)-but-structural, per this ticket's own branch 5.** The operator's
+specific hypothesis -- that the "3-stage" drafter is built for DeepSeek-style
+chained MTP and ds4's port is missing the argmax-embed-and-substitute wiring
+between stages -- does not hold: "stage" here is the drafter's own transformer
+depth (3 layers, EAGLE-style, tapping 3 different target hidden layers), already
+correctly hidden-state-chained layer-to-layer, and DeepSeek's true per-token MTP
+chaining design maps onto a *different* axis (`block_size`) that this
+checkpoint's own architecture (noise/mask-seeded parallel block proposal, per
+its own `noise_token_id` metadata field) does not chain by design, not by ds4
+port omission. The prior unit's "structural, no fix" verdict stands, now
+corroborated by direct GGUF metadata inspection and the upstream commit's own
+documentation (neither of which the prior unit had pulled in), not just
+re-derived from the same code read. **No wiring fix implemented this unit** --
+consistent with the ticket's step-5 branch ("if (b) but structural after all...
+document the conflict... and stop").
+
+**What *is* new and actionable from this unit, beyond re-confirming the prior
+verdict:** (1) the "always exactly ceiling 2" claim was pairing-specific, not
+universal -- real depth up to 6 is achievable with a different (still
+GA-lineage-matched) drafter/target pairing, but throughput is still a net loss
+either way on this hardware; (2) a genuine greedy-identity correctness
+divergence was found in the resident pairing at default confidence on a longer
+generation, not root-caused this unit, flagged for dedicated follow-up.
+
+**Server discipline.** `ds4-server` stopped before Part A (`systemctl stop
+ds4-server`, verified `inactive`); restarted and verified (`systemctl
+is-active`=`active`, `GET /v1/models`->HTTP 200) after -- see final entry below.
+No production `ExecStart` config touched.
