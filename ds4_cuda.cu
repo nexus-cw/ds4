@@ -1916,6 +1916,48 @@ static void cuda_model_drop_file_pages(uint64_t offset, uint64_t bytes) {
 #endif
 }
 
+/* DS4_STREAM_FADVISE: env-gated posix_fadvise hints on the SSD-streaming
+ * read fd. Default OFF (unset -> behavior unchanged). Values:
+ *   "random"          -> POSIX_FADV_RANDOM once when the streaming fd is set
+ *   "dontneed"        -> RANDOM at open + POSIX_FADV_DONTNEED on each read's
+ *                        page-rounded range right after the pread completes
+ *   "random,dontneed" or "all" -> both (dontneed implies random). */
+enum {
+    CUDA_STREAM_FADVISE_RANDOM   = 1,
+    CUDA_STREAM_FADVISE_DONTNEED = 2,
+};
+
+static int cuda_stream_fadvise_mode(void) {
+    static int mode = -1;
+    if (mode >= 0) return mode;
+    int m = 0;
+    const char *env = getenv("DS4_STREAM_FADVISE");
+    if (env && env[0]) {
+        if (strstr(env, "all") || strstr(env, "dontneed")) {
+            m = CUDA_STREAM_FADVISE_RANDOM | CUDA_STREAM_FADVISE_DONTNEED;
+        } else if (strstr(env, "random")) {
+            m = CUDA_STREAM_FADVISE_RANDOM;
+        }
+    }
+    mode = m;
+    return mode;
+}
+
+static void cuda_stream_fadvise_read_done(uint64_t offset, uint64_t bytes) {
+#if defined(POSIX_FADV_DONTNEED)
+    if (g_model_fd < 0 || bytes == 0) return;
+    if (!(cuda_stream_fadvise_mode() & CUDA_STREAM_FADVISE_DONTNEED)) return;
+    const long page_sz_l = sysconf(_SC_PAGESIZE);
+    const uint64_t page_sz = page_sz_l > 0 ? (uint64_t)page_sz_l : 4096u;
+    const uint64_t lo = (offset / page_sz) * page_sz;
+    const uint64_t hi = ((offset + bytes + page_sz - 1u) / page_sz) * page_sz;
+    (void)posix_fadvise(g_model_fd, (off_t)lo, (off_t)(hi - lo), POSIX_FADV_DONTNEED);
+#else
+    (void)offset;
+    (void)bytes;
+#endif
+}
+
 static uint64_t cuda_round_down(uint64_t v, uint64_t align) {
     if (align <= 1) return v;
     return (v / align) * align;
@@ -2024,7 +2066,9 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
 #else
     (void)stage_bytes;
 #endif
-    return cuda_pread_full(g_model_fd, stage, bytes, offset);
+    if (!cuda_pread_full(g_model_fd, stage, bytes, offset)) return 0;
+    cuda_stream_fadvise_read_done(offset, bytes);
+    return 1;
 }
 
 static void cuda_stream_selected_stage_release(void) {
@@ -4202,6 +4246,11 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
             g_model_file_size = (uint64_t)st.st_size;
             if (st.st_blksize > 1) g_model_direct_align = (uint64_t)st.st_blksize;
         }
+#if defined(POSIX_FADV_RANDOM)
+        if (cuda_stream_fadvise_mode() & CUDA_STREAM_FADVISE_RANDOM) {
+            (void)posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+        }
+#endif
 #if defined(__linux__) && defined(O_DIRECT)
         if (getenv("DS4_CUDA_NO_DIRECT_IO") == NULL) {
             char proc_path[64];
