@@ -1,0 +1,17 @@
+We need to explain the TCP three-way handshake. This is a fundamental concept in networking. The user likely wants a clear, concise explanation. I'll describe the process: SYN, SYN-ACK, ACK. Also mention why it's needed for reliable connection establishment, and maybe mention potential issues like SYN flood. Keep it accessible.
+The TCP three-way handshake is the process used by the Transmission Control Protocol (TCP) to establish a reliable connection between two hosts before data exchange begins. It ensures both sides agree on initial sequence numbers and parameters, and that the connection is ready for bidirectional communication.
+
+Here's the step-by-step breakdown:
+
+1. **SYN (Synchronize)** – The client sends a TCP segment with the SYN flag set, along with an initial sequence number (ISN) chosen randomly. This tells the server: "I want to start a connection, and here's my starting sequence number."
+
+2. **SYN-ACK (Synchronize-Acknowledge)** – The server responds with a segment that has both the SYN and ACK flags set. It acknowledges the client's SYN by setting the acknowledgment number to the client's ISN + 1, and it also sends its own initial sequence number. This says: "I received your request, and here's my starting sequence number."
+
+3. **ACK (Acknowledge)** – The client sends a final segment with the ACK flag set, acknowledging the server's SYN-ACK by setting the acknowledgment number to the server's ISN + 1. This completes the handshake, and the connection enters the **ESTABLISHED** state.
+
+After this, data can be sent in both directions reliably, with sequence numbers ensuring ordering and acknowledgments confirming delivery.
+
+### Why three steps?
+- It prevents old or duplicate connection requests from interfering (thanks to random ISNs).
+- It synchronizes sequence numbers so both sides know where to start counting.
+- It ensures both parties are ready to

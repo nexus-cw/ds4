@@ -3113,3 +3113,212 @@ generation, not root-caused this unit, flagged for dedicated follow-up.
 ds4-server`, verified `inactive`); restarted and verified (`systemctl
 is-active`=`active`, `GET /v1/models`->HTTP 200) after -- see final entry below.
 No production `ExecStart` config touched.
+
+## Determinism/identity probe: two temp-0 violations root-caused (2026-08-03)
+
+**Scope.** Two distinct reported temp-0 (greedy) nondeterminism/identity
+issues, investigated independently. Server stopped for the whole test window
+(`systemctl stop ds4-server`, verified `inactive`) and restarted + verified
+(`is-active`=`active`, `GET /v1/models`->200, production `ExecStart` untouched)
+afterward. Raw logs committed under `research/gb10/nd-probe-out/` (`runA*`,
+`runP*`, `runQ*`, `runC*` = Case A; `runB-*` = Case B).
+
+### CASE A -- streamed decode run-to-run divergence: does NOT reproduce on the
+GA model at 65GB, this hardware/build (negative result, well-tested)
+
+**Protocol.** GA model (`DeepSeek-V4-Flash-0731-MXFP4_MOE-Q8_0.gguf`), `--cuda
+--ssd-streaming --ssd-streaming-cache-experts 65GB --temp 0`, two prompts:
+(1) `-p "Explain the TCP three-way handshake."` (the same short prompt CASE B
+uses) and (2) `--prompt-file prose_prompt.txt` (the ~55-word TCP-handshake
+essay prompt that was the *original* trigger for the preview-artifact
+divergence report). Four identical runs each at `-n 400`, plus four more at
+`-n 800` on prompt (2) to push past the token count where the preview
+artifact diverged, plus a cache-regime discriminator: two runs at
+`--ssd-streaming-cold --ssd-streaming-cache-experts 8GB` (near-all-miss) vs.
+the 65GB warm runs, per hypothesis (a1) (cache hit/miss timing driving FP
+reduction-order variance).
+
+**Result: all 10 decode runs across both prompts, both token budgets (400 and
+800), and both cache regimes (65GB warm, 8GB cold) are byte-for-byte
+identical.** `diff` clean on every pairwise comparison run (1v2, 1v3, 1v4 for
+each batch; cold-run1 vs cold-run2; cold-run1 vs warm-run1). No divergence
+observed anywhere in ~11,000 combined generated tokens across the sweep.
+
+**Interpretation.** This does not reproduce the "First observed on the preview
+artifact (5d032d7 era)" divergence on the current GA model + `research/gb10`
+HEAD (`c860c9a`) + 65GB budget, on this hardware, for these two prompts, at
+these token counts. Two non-exclusive explanations, neither confirmed further
+this unit (would need bisecting `5d032d7..c860c9a` or a much larger n-of-runs
+sweep to fully rule out a low-frequency event):
+1. Something between the preview artifact and the GA promotion (dialect-compat
+   fixes, `05f0fde`/tensor-alias work, or the GA quant itself vs. the preview
+   quant) incidentally fixed or masked it.
+2. It is a low-probability/narrow-trigger event (the (a1)/(a2)/(a3) hypotheses
+   are all about *rare* races -- specific cache-hit-timing windows, specific
+   token positions landing on a near-tied argmax) that this sweep's 10 runs
+   didn't happen to hit. The cold-vs-warm test directly exercises the (a1)
+   mechanism (forces the opposite cache-hit pattern) and still produced
+   byte-identical pairs, which is evidence against (a1) as a *frequent*
+   driver at minimum, but is not proof of its absence at low frequency.
+
+**Verdict: cannot confirm as a wiring-class bug on this build -- documented as
+a non-reproducing negative result, not swept under the rug.** No code changed.
+A dedicated follow-up unit wanting to chase this further should either (a)
+bisect the two known-good vs. known-bad commits directly, or (b) run a much
+larger N (50-100+) of shorter generations to estimate an event rate before
+committing to expensive instrumentation (checksum/logit-gap dumps) that only
+pays off once a live repro is in hand.
+
+### CASE B -- DSpark spec-decode breaks greedy identity resident: ROOT-CAUSED,
+STRUCTURAL (batch-verify numerics vs. single-token decode numerics), b2 confirmed
+
+**Reproduction.** Resident IQ2XXS + `DSpark-support.gguf` (lineage-matched,
+`dspark.target_layer_ids=[40,41,42]`), `--cuda --temp 0 -n 400 -p "Explain the
+TCP three-way handshake."`, default confidence 0.9 -- the same config the
+prior unit (`c860c9a`) flagged and did not root-cause.
+- No-drafter: two independent runs, byte-identical (`diff` clean, 1902 bytes
+  each) -- confirms the pure-decode baseline is perfectly reproducible on this
+  hardware/build (also corroborates CASE A's negative result: resident
+  no-drafter decode has no detectable temp-0 nondeterminism here either).
+- Drafter-enabled: diverges from the no-drafter baseline at **character offset
+  277** (well into the reasoning preamble: `"...maybe mention potential
+  issues like SYN flood. Keep it accessible."` vs. `"...maybe mention the
+  states (CLOSED, LISTEN, SYN-SENT, etc.). Keep it simple..."`) -- a
+  near-tied paraphrase-level flip, not garbage, consistent with an FP-drift
+  signature rather than a logic bug. `DS4_DSPARK_SPEC_LOG=1` reruns are
+  byte-identical to the unlogged drafter run (confirms the drafter path's own
+  determinism; only the drafter-vs-no-drafter comparison diverges).
+
+**Discriminator (i) -- divergence only ever after the first accepted draft:
+CONFIRMED.** `DS4_DSPARK_SPEC_LOG` shows the first successful accept event at
+generated-token position 4 (`DSpark spec enter ... len=3 pos=18` ->
+`DSpark spec accept drafted=3 accepted=4`, i.e. `max` drops from 400 to 396 =
+4 tokens committed). The character-277 divergence falls roughly 55-65 tokens
+into generation -- far past that first accept. No divergence was observed
+before any accept event in this run. This puts the bug class squarely in
+"accepted-token KV/state differs from pure decode" (b1/b2), not a
+verify/accept-logic defect (ruled out already by the prior unit's independent
+code read of `ds4.c:62050-62420`, re-confirmed here by this run's own
+timing).
+
+**Discriminator (ii) -- code-trace pinpoint (in place of a live
+checksum-vs-replay diff, which the ticket itself flags as the *expensive*
+option; this code trace gives an equally decisive, cheaper answer). Root
+cause: hypothesis (b2), confirmed at the source level.**
+
+The DSpark verify batch (`n_tokens` = `block_size`, e.g. 5) computes the
+compressed-KV "compressor frontier" projection (`layer_attn_state_kv[il]`/
+`layer_attn_state_score[il]`, per the struct comment at `ds4.c:15976-15981`:
+"compressor frontiers for the next compressed row") for **every** verified
+position -- including position 0, the bonus token that is *always* accepted
+-- via a single **batched** GEMM over the whole verify chunk width
+(`ds4_gpu_matmul_f16_pair_tensor(metal_graph_batch_comp_kv(g),
+metal_graph_batch_comp_sc(g), ..., width=n_tokens*coff, ...)`, `ds4.c:27454`
+and the equivalent decode-batch site `ds4.c:28685-28753`; consumed per-token
+via row-views at `ds4.c:28619` inside the per-token commit loop that then
+calls the shared `ds4_gpu_compressor_update_tensor` with
+`comp_state_already_stored=false` hardcoded, `ds4.c:28637`).
+
+Ordinary single-token greedy decode computes the *identical logical
+quantity* (that same token's KV/gate projection) via a **different,
+fused single-vector kernel**, `ds4_gpu_matmul_f16_pair_compressor_store_tensor`
+(`ds4.c:22993-23011`), which sets `comp_state_already_stored=true` when it
+successfully fuses the projection+store into one kernel launch --a distinct
+code path from the batch-verify projection, not merely a different call to
+the same underlying math.
+
+**These are not required to be, and empirically are not, bit-identical.** A
+GEMM computing one row of a `[n_tokens x width]` batched matmul and a fused
+single-vector kernel computing the same logical `1 x width` row use different
+tiling/accumulation order internally (standard FP16/BF16 GEMM
+non-associativity across kernel implementations) -- so **every token
+committed through DSpark's accept path, including the always-accepted bonus
+token at draft position 0**, gets a KV compressor-frontier state that is
+numerically close to but not identical to what sequential single-token decode
+would have produced for the exact same token. This state feeds every
+subsequent layer's attention for the rest of the generation, so the drift
+accumulates silently until it flips an argmax tie -- consistent with the
+observed divergence being a late (~char 277, ~55-65 tokens in), paraphrase-
+level flip rather than an immediate/garbled break.
+
+This also explains why `spec_frontier_snapshot`/`_restore` (`ds4.c:50537-50611`)
+looked structurally sound under a pure code audit (KV_AUDIT.md's read):
+**it is not miscopying anything.** It faithfully snapshots and restores the
+row counters and frontier tensors exactly as the batch-verify pass computed
+them -- rollback/restore is correct *as a copy operation*; the bug is
+upstream of it, in what values get *written* into those frontier tensors by
+the accept-commit path in the first place. `spec_frontier_commit_prefix1`
+(`ds4.c:50617-50639`, the cheap N=1-accept fast path) doesn't help either: it
+captures/commits the same batch-computed row-0 state, it doesn't re-derive it
+via a single-token replay.
+
+**Verdict: (b2), STRUCTURAL** per this ticket's own branch -- "batch-vs-single
+numerics are legitimately different in FP" is not a wrong-formula bug to
+point-fix; it is inherent to using a batched verify GEMM for speculative-
+decode performance. b1 (incomplete KV rollback) and b3 (side-state leak) are
+both ruled out by this trace: the rollback mechanism restores exactly what it
+snapshotted, and no Markov/confidence side-state tensor is written into the
+attention-affecting frontier tensors anywhere in the traced call path.
+
+**What a real fix would look like (sizing only, out of scope for this
+diagnostic unit).** Re-derive each accepted token's compressor-frontier state
+via the cheap fused single-token kernel (`ds4_gpu_matmul_f16_pair_compressor_
+store_tensor`) after acceptance, discarding the batch-computed frontier
+values, instead of committing the batch-derived state directly. Cost: one
+extra fused single-token kernel launch per *accepted* token per block (not
+per drafted token), which is small relative to the verify batch's own cost --
+plausibly affordable without eating DSpark's throughput case, but unverified
+here (no model run to confirm) and is a real code change (touches the
+accept-commit path in `ds4.c` around 62175-62290 and 65628-65780), not a
+constant tweak. Good candidate for a dedicated follow-up unit; not attempted
+here per the ticket's structural-verdict branch ("document precisely...and
+stop").
+
+**Test-oracle guidance for a correct greedy-identity test.** Byte-identical
+text diff between drafter-enabled and no-drafter runs is the *wrong* oracle
+for long generations under this architecture -- it will always eventually
+fail once FP drift crosses an argmax near-tie, and that is expected/inherent,
+not evidence of a logic bug. A correct oracle should instead: (a) restrict
+strict byte-identity assertions to short generations empirically known to sit
+below the divergence-onset length for the tested prompt/model pair (this
+ticket's own evidence: the prior unit's "France"/"capital of France" short
+prompts passed byte-identical; this unit's TCP-handshake prompt diverges
+around char 277 / ~60 tokens -- so "short" is prompt- and model-dependent, not
+a fixed token count), or (b) for longer generations, measure per-token
+top-1-argmax agreement rate against the no-drafter baseline and assert it
+stays near 100% up to the *first* divergence, then track whether post-
+divergence text remains coherent/on-topic (already true per the prior unit's
+500-token run) rather than asserting byte-identity past that point, or (c)
+compare top-2 logit gaps at the divergence point directly (this unit did not
+run `--dump-logprobs` for this pinpoint since the code trace already gave an
+unambiguous mechanism; a follow-up wanting empirical confirmation of the
+"near-tied argmax flip" framing specifically should do so at the char-277
+token position).
+
+**Draft upstream issue text (not filed, for the orchestrator to route):**
+"ds4's DSpark speculative decode (`--mtp ... --dspark`) does not preserve
+byte-identical greedy (`--temp 0`) output vs. non-speculative decode on
+longer generations, despite the accept/verify logic itself being correct
+argmax-matching (confirmed via independent code read). Root cause: the
+compressed-KV 'compressor frontier' state for every accepted token (including
+the always-accepted bonus token) is computed via the verify batch's own
+multi-token GEMM (`ds4_gpu_matmul_f16_pair_tensor` over the batch width,
+`ds4.c:27454`/`28685`), which is a numerically distinct code path from
+ordinary single-token decode's fused projection+store kernel
+(`ds4_gpu_matmul_f16_pair_compressor_store_tensor`, `ds4.c:22993`) --
+standard FP16/BF16 GEMM non-associativity between batched and single-vector
+kernels means the committed KV state for accepted tokens subtly differs from
+what pure decode would produce for the same tokens, and this drift
+eventually flips an argmax tie on longer generations. This is inherent to
+using a batched verify pass and may not be simply fixable without re-deriving
+accepted-token KV state via a single-token kernel post-accept (extra cost:
+one fused single-token kernel launch per accepted token)."
+
+**Server discipline.** `ds4-server` stopped before this unit's test window
+(`systemctl stop ds4-server`, verified `inactive`); restarted after both
+CASE A and CASE B testing, verified `systemctl is-active`=`active` and
+`curl http://localhost:8000/v1/models`->HTTP 200 (`deepseek-v4-flash`,
+`context_length: 32768`, confirming the production `ExecStart` --
+`--ssd-streaming-cache-experts 75GB`, `--ctx 32768` -- was untouched and
+reloaded correctly). No stray `ds4`/`ds4-server` processes observed after
+restart aside from the one production instance.

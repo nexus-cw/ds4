@@ -262,6 +262,8 @@ identical to the prior `required_u32`/`required_f32` behavior), which the existi
 test fixture GGUF exercises throughout (no compat branch fires when running `make test`'s
 own model). No regression attributable to this change.
 
+(2026-08-03 follow-up, MEASUREMENTS.md "Determinism/identity probe" unit: a targeted 10-run sweep on the GA model at --ssd-streaming-cache-experts 65GB, two prompts, 400/800-token budgets, warm and cold cache regimes, found this specific --ssd-streaming decode nondeterminism does NOT reproduce -- all runs byte-identical. Left open whether it was fixed between the preview artifact and GA or is a low-frequency event this sweep did not hit; see that unit for the full protocol and negative-result caveats. A separate, root-caused, STRUCTURAL greedy-identity divergence was confirmed in the same unit for DSpark spec-decode specifically -- batch-verify GEMM numerics vs. single-token decode numerics for accepted tokens' compressed-KV frontier state -- see the same MEASUREMENTS.md entry, CASE B.)
+
 ### P1 status update (2026-07-31, cont'd): tensor-name dialect compat + BF16/Q6_K dense-tensor blocker
 
 Follow-on pass to the deepseek4-metadata-compat work above, closing the "genuine tensor

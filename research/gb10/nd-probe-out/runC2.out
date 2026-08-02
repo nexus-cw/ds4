@@ -1,0 +1,18 @@
+1.  **Deconstruct the User's Request**:
+    *   Topic: TCP three-way handshake.
+    *   Specific points to cover:
+        *   Detailed explanation of SYN, SYN-ACK, ACK segments.
+        *   Sequence number synchronization.
+        *   What happens if a segment is lost (during handshake).
+        *   How this relates to TCP's reliability guarantees.
+        *   Brief contrast with connection teardown (four-way handshake/FIN).
+    *   Tone: Detailed, explanatory, technical but accessible.
+
+2.  **Initial Brainstorming & Structuring**:
+    *   *Introduction*: Define TCP, connection-oriented, and the purpose of the handshake (synchronization, resource allocation).
+    *   *Step 1: SYN*: Client sends SYN, initial sequence number (ISN), no payload, sets SYN flag.
+    *   *Step 2: SYN-ACK*: Server receives, allocates resources, sends back its own SYN (with its ISN) and ACK (acknowledging client's ISN + 1).
+    *   *Step 3: ACK*: Client sends ACK (acknowledging server's ISN + 1). Connection established.
+    *   *Sequence Number Synchronization*: Explain ISN, why it's random (security, avoiding stale segments), and the +1 rule (consuming the SYN flag as a sequence number).
+    *   *Lost Segment Handling*: What if SYN lost? (Timeout, retransmission). What if SYN-ACK lost? (Client retransmits SYN). What if final ACK lost? (Server retransmits SYN-ACK, client responds with ACK). Mention exponential backoff.
+    *   *Reliability Guarantees*: Connection setup ensures both sides are ready, sequence numbers are aligned for future data ordering, and the handshake itself is

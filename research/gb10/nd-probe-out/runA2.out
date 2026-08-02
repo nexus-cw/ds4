@@ -1,0 +1,16 @@
+1.  **Understand the User's Request**: The user is asking for an explanation of the TCP three-way handshake. This is a fundamental networking concept.
+2.  **Identify the Core Components**:
+    *   What is it? (Connection establishment mechanism for TCP).
+    *   Why is it needed? (To synchronize sequence numbers, establish parameters, and ensure both sides are ready).
+    *   The three steps (SYN, SYN-ACK, ACK).
+    *   What happens after? (Connection established, data transfer).
+    *   Optional but helpful: What about the four-way handshake (termination) to contrast? (Keep it brief, focus on the three-way).
+3.  **Structure the Explanation**:
+    *   **Introduction**: Define the three-way handshake and its purpose.
+    *   **The Steps**: Clearly outline Step 1 (SYN), Step 2 (SYN-ACK), Step 3 (ACK). Include the state changes (LISTEN, SYN-SENT, SYN-RECEIVED, ESTABLISHED).
+    *   **Key Details**: Mention sequence numbers (ISN - Initial Sequence Number) and why they are synchronized.
+    *   **Analogy (optional but helpful)**: Use a simple analogy (e.g., phone call) to make it intuitive.
+    *   **Conclusion**: Summarize the result (reliable connection established).
+4.  **Drafting the Content**:
+    *   *Intro*: The TCP three-way handshake is the process used by TCP to establish a reliable connection between a client and a server before data transmission begins. It ensures both devices are ready to communicate and agree on initial sequence numbers.
+    *   *Step 1 (SYN)*: The client sends a TCP segment with the SYN (synchronize) flag set. It includes an initial sequence number (ISN), say `x`. The client enters the `
