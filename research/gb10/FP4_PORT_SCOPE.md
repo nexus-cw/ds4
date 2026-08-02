@@ -2240,3 +2240,105 @@ compatibility" unit; summary for anyone touching this code next:
 ## Quality battery
 
 Calibration/hallucination probe battery for pre-promotion GA-FP4 checks: see `research/gb10/calibration_probes/` (40-item probes.jsonl across unanswerable/known-fact/trap-premise/tool-precision categories, runner + heuristic scorer, protocol comparing IQ2 baseline vs. GA FP4 vs. GA FP4 with an abstention system prompt).
+
+## GA artifact (`0731`, 156.4 GB) header census + INSPECT: BLOCKED on a new metadata gap (2026-08-02)
+
+**Scope.** GA-0731 swap unit. Artifact:
+`gguf/DeepSeek-V4-Flash-0731-MXFP4_MOE-Q8_0.gguf` (156,378,344,992 bytes = 145.6 GiB /
+156.4 GB, main file; matched drafter `gguf/DeepSeek-V4-Flash-0731-DSpark-Drafter-MXFP4-Q8_0.gguf`,
+10.9 GB, noted present but out of this unit's scope). `ds4-server` (systemd, production
+IQ2XXS) stopped first; restarted and verified (`systemctl is-active`=`active`,
+`GET /v1/models`->HTTP 200) at the end, per protocol, even though this unit stopped at a
+load failure.
+
+**Header census (raw file header, no tensor data loaded), vs. the preview community
+conversion's own header (this doc, `--inspect` summary at line ~479, 2026-08-01 entries
+above):**
+
+| | preview (`.patched.gguf`, community conversion) | GA (`0731-MXFP4_MOE-Q8_0.gguf`) |
+|---|---|---|
+| GGUF version | v3 | v3 |
+| tensor count | 1328 | 1328 (identical) |
+| raw metadata keys in file | 51 | 59 |
+| block_count (layers) | 43 | 43 (identical) |
+| expert_count / used | 256 / 6 | 256 / 6 (identical) |
+| embedding_length / ffn_length | 4096 / 2048 | 4096 / 2048 (identical) |
+| logical params (sum of tensor element counts) | 284.33 B (per `--inspect`) | **284.33 B**, independently computed from the raw header -- byte-for-byte the same architecture, not the ~304 B this unit's brief anticipated |
+| file size | 153.52 GiB | 156.4 GB (145.6 GiB) |
+| dense/attention tensor dtype | mixed BF16 (13) + Q6_K (9 families) | **Q8_0** (365 tensors) -- the Q6_K family is entirely absent from GA |
+| routed-expert dtype | MXFP4 (98 tensors, generic dequant+GEMM family, post BF16/Q6_K/F32 conversion work) | MXFP4 (129 tensors -- higher count because GA also keeps `ffn_gate_inp`/`hc_*`/indexer tensors distinct per the "_exps" grep scope; routed `ffn_{gate,up,down}_exps` themselves: same per-layer MXFP4 as preview) |
+| tensor **naming** dialect | community aliases throughout (`hc_head_*`, `attn_kv_latent.weight`, suffix-dropped `attn_sinks`/`ffn_gate_tid2eid`/hc tensors, `attn_compressor_*`/`indexer_compressor_*`) -- required the full alias-mechanism port (2026-07-31 entries above) | **canonical ds4/llama.cpp names throughout** -- confirmed via header dump (`blk.0.attn_kv.weight`, `blk.0.ffn_gate_tid2eid.weight` with `.weight` suffix, `output_hc_base/fn/scale.weight`) and via the `--inspect` run below emitting **zero** tensor-name-alias compat notices, only dtype-dequant notices |
+
+**The 8 metadata keys the preview's compat layer had to derive
+(`attention.output_lora_rank`, `attention.output_group_count`, `hash_layer_count`,
+`hyper_connection.count`, `hyper_connection.sinkhorn_iterations`, `hyper_connection.epsilon`,
+`attention.compress_rope_freq_base`, `attention.compress_ratios`) are all natively present
+in GA's raw header** (verified directly: `deepseek4.attention.output_lora_rank = 1024`,
+`...output_group_count = 8`, `deepseek4.hash_layer_count = 3`,
+`deepseek4.hyper_connection.count = 4`, `...sinkhorn_iterations = 20`, `...epsilon =
+9.999999974752427e-07`, `deepseek4.attention.compress_rope_freq_base = 160000.0`,
+`deepseek4.attention.compress_ratios = (5, 46)` array present) -- exactly the `59 - 51 = 8`
+key-count delta. **GA is a materially different, more standard conversion than the preview's
+community one**: it uses ds4's/llama.cpp's own canonical tensor names and includes all the
+keys the preview's converter dropped. The BF16/Q6_K dense-tensor dequant-at-load compat
+mechanism (ported 2026-08-01, `model_convert_dense_bf16_q6k` /
+`tensor_is_dense_conversion_candidate`) still fires for GA -- 13 tensor families (BF16
+`token_embd.weight`, `ffn_gate_inp.weight`x43, `output.weight`, plus BF16/F32
+compressor/indexer/hc tensors) get dequantized-to-F16-at-load notices in the `--inspect` log
+below, confirming that prior port's work generalizes to this artifact too, not just the
+preview one.
+
+**`--inspect` result: NEW blocker, a genuine metadata gap not seen on the preview artifact.**
+Command: `./ds4 -m gguf/DeepSeek-V4-Flash-0731-MXFP4_MOE-Q8_0.gguf --cuda --ssd-streaming
+--ssd-streaming-cold --ssd-streaming-cache-experts 8GB --inspect`, `timeout 480`. Full log:
+
+```
+ds4: Linux cuda backend set oom_score_adj=1000
+ds4: tensor family token_embd.weight (bf16, 1 tensor) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.ffn_gate_inp.weight (bf16, 43 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.hc_attn_fn.weight (f32, 43 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.hc_ffn_fn.weight (f32, 43 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.attn_compressor_ape.weight (f32, 41 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.attn_compressor_gate.weight (bf16, 41 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.attn_compressor_kv.weight (bf16, 41 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.indexer_compressor_ape.weight (f32, 21 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.indexer_compressor_gate.weight (bf16, 21 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.indexer_compressor_kv.weight (bf16, 21 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.indexer.proj.weight (bf16, 21 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family output_hc_fn.weight (f32, 1 tensor) dialect compat: dequantized to f16 at load
+ds4: tensor family output.weight (bf16, 1 tensor) dialect compat: dequantized to f16 at load
+ds4: required metadata key is missing: deepseek4.vocab_size
+```
+
+Exit code 1. GPU was idle before and after (`nvidia-smi` shows no process, 0 MiB); no stray
+`ds4` process left running.
+
+**Diagnosis (measurement/report only, no code changed, per this unit's explicit
+instruction to stop and document rather than chase a new gap).** `deepseek4.vocab_size` is
+`required_u32(m, "deepseek4.vocab_size")` at `ds4.c:6300`, validated against `DS4_N_VOCAB`
+at `ds4.c:6374`. GA's raw header has **no key matching `vocab` anywhere** (confirmed via a
+full metadata-key grep of the header dump: zero hits) -- unlike the preview artifact, whose
+converter apparently included this key (it is not in the preview's list of 8 missing keys
+from the 2026-07-31 entry above), GA's converter dropped it. The value is very likely
+tensor-derivable, mirroring the existing compat-layer pattern for the other 8 keys: GA's own
+`tokenizer.ggml.tokens` array has exactly 129280 entries and `token_embd.weight`/
+`output.weight` both have a `129280`-sized dimension, all three agreeing with
+`DS4_N_VOCAB`'s expected value. This is flagged as the probable fix (same shape/tensor-count
+derivation pattern already used for `hash_layer_count`/`hyper_connection.count` above) for
+whoever picks this up next -- **not implemented this unit**, per the ticket's explicit
+"stop at that failure, document precisely, commit, report" instruction for new gaps.
+
+**Consequence.** This blocks every downstream step in this unit's protocol (smoke, warm
+baseline, quality battery, decision prep) -- the model cannot load at all yet, on any
+backend or flag combination, since `config_validate_deepseek4_model()` fails before any
+GPU/CUDA-specific code path is reached. Steps 3-6 of this unit were **not attempted** (would
+fail identically -- same required-key check runs on every load path, `--inspect` and normal
+generation alike). The 0731 GA promotion decision cannot be made until this one-key gap is
+closed; recommend the next unit either extend the metadata compat layer with the
+tensor-derived fallback above (small, same-shape fix as the existing 8-key mechanism) or, if
+`--vocab-size`-style override flag exists, use that as a stopgap to unblock smoke-level
+manual verification while the proper fix lands.
+
+**Server discipline.** `ds4-server` (systemd, port 8000, production IQ2XXS model) stopped
+before this unit's `--inspect` attempt; restarted and verified (`systemctl is-active`=
+`active`, `GET /v1/models`->HTTP 200) after, per protocol -- mandatory even on failure.

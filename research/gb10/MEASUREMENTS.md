@@ -1837,3 +1837,63 @@ memory-unified hardware -- worth a note in the PR description that the
 **Server discipline.** `ds4-server` (systemd, port 8000, production IQ2XXS
 model) stopped at the start of this unit, restarted and verified
 (`systemctl is-active`=`active`, `GET /v1/models` -> HTTP 200) at the end.
+
+## GA-0731 swap unit: BLOCKED at INSPECT on a new metadata gap, decision deferred (2026-08-02)
+
+**Scope of this unit.** Swap `gguf/DeepSeek-V4-Flash-0731-MXFP4_MOE-Q8_0.gguf` (156.4 GB,
+GA main artifact) in for the preview `.patched.gguf` used throughout this doc's prior
+entries, run the full census -> inspect -> smoke -> warm-baseline -> quality-battery ->
+decision-prep sequence. `ds4-server` (systemd, production IQ2XXS) stopped first; restarted
+and verified active/200 at the end.
+
+**Result: stopped at step 2 (INSPECT).** Full header-census diff and the exact `--inspect`
+failure/log are recorded in `FP4_PORT_SCOPE.md`'s new "GA artifact... BLOCKED" section
+(2026-08-02) -- summarized here:
+
+- Header census: GA is **architecturally identical** to the preview artifact (43 layers,
+  256 experts/6 used, 4096 embd, 2048 ffn, 1328 tensors, **284.33 B logical params measured
+  independently from both files' raw headers, not the ~304 B this unit's brief
+  anticipated**). GA is a materially cleaner conversion: canonical (not community-alias)
+  tensor names throughout (zero tensor-name dialect-compat notices fired), and all 8
+  metadata keys the preview's compat layer had to derive are natively present in GA's raw
+  header (59 raw keys vs. preview's 51 -- exact 8-key delta). Dense tensors are Q8_0 (not
+  the preview's BF16/Q6_K mix) except `token_embd`/`output`/`ffn_gate_inp`/hc/indexer
+  tensors, still BF16/F32 -- the existing BF16/Q6_K/F32-to-F16 dequant-at-load compat
+  mechanism (ported 2026-08-01) fires correctly for these 13 tensor families and is not the
+  blocker.
+- **New blocker**: `required metadata key is missing: deepseek4.vocab_size` -- a key not
+  among the preview's 8 previously-documented gaps, and absent from GA's header under any
+  name (grepped the full key list: zero `vocab` hits). This is the dialect-compat layer's
+  second real-world test surfacing a genuinely new gap, exactly as this unit's brief
+  anticipated could happen. Not fixed this unit (explicit "stop and document" instruction
+  for new gaps); the value is almost certainly tensor-derivable (`tokenizer.ggml.tokens`
+  count and `token_embd.weight`/`output.weight`'s vocab-sized dimension all independently
+  agree on 129280 = `DS4_N_VOCAB`), same pattern as the existing 8-key compat mechanism.
+
+**Consequence for this unit's remaining steps.** Steps 3 (smoke), 4 (warm baseline), 5
+(quality battery: ds4-eval subset + calibration probes), and 6 (decision-prep recommendation
+block) were **not attempted** -- the missing-key check runs on every model load
+(`config_validate_deepseek4_model()`), before any backend-specific or generation code path,
+so every one of those steps would fail identically and immediately. No GA-vs-preview
+performance/quality numbers are available this unit.
+
+**Production recommendation: DEFERRED, not a "stay IQ2" call.** This is a load-time
+metadata-completeness gap in a still-loadable-once-fixed artifact, not a finding about GA's
+quality or performance -- there is no data yet to weigh against IQ2-resident. Recommend a
+small follow-up unit close the one-key gap (see `FP4_PORT_SCOPE.md` for the exact
+tensor-derivation fix candidate), after which this unit's full protocol (steps 2-6) should
+be re-run from where it stopped, including re-confirming INSPECT completes cleanly before
+proceeding to smoke/warm/eval. The drafter artifact
+(`gguf/DeepSeek-V4-Flash-0731-DSpark-Drafter-MXFP4-Q8_0.gguf`, 10.9 GB) was not touched or
+tested this unit -- confirmed present on disk only, per the ticket's scope note.
+
+**Memory/plan check.** Not reached -- no model load succeeded, so the planned 100GB-cache /
+156GB-streamed memory budget was never exercised against the 121GB box. GPU/host memory was
+confirmed idle before and after (`free -g` showed 117 GiB available pre-attempt;
+`nvidia-smi` 0 MiB / no process post-attempt).
+
+**Server discipline.** `ds4-server` (systemd, port 8000, production IQ2XXS model) stopped
+before this unit's attempt; restarted and verified `systemctl is-active`=`active`,
+`curl http://localhost:8000/v1/models`->HTTP 200, after -- mandatory per protocol even on a
+failed/blocked unit. No stray `ds4`/`ds4-eval` processes left running (`ps aux` checked
+post-attempt).
