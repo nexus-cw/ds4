@@ -3405,3 +3405,30 @@ verified (`systemctl is-active`=`active`, `GET /v1/models`->HTTP 200,
 `deepseek-v4-flash`/`context_length: 32768` present, confirming the
 production `ExecStart` -- `--ssd-streaming-cache-experts 75GB --ctx 32768`
 -- untouched) after.
+
+### Upstream pair filed (2026-08-03)
+
+Fix verified end-to-end on `upstream/main` too (branch `dspark-greedy-identity`,
+based on upstream `54b36ed`): upstream already loads this DSpark drafter GGUF
+natively (its `mtp.*`-named tensors plus `dspark.*` metadata are both parsed by
+current upstream `main`), so the same byte-identical drafter-vs-no-drafter test
+(two prompts, 400 and 800 tokens) ran directly on upstream, not just on this fork.
+Also confirmed the bug reproduces on *unpatched* upstream `main` before applying
+the fix (drafter-enabled TCP-handshake response diverges from no-drafter within
+the first couple of sentences) -- so this is not fork-specific.
+
+- Issue: https://github.com/antirez/ds4/issues/658
+- PR: https://github.com/antirez/ds4/pull/659 (`nexus-cw:dspark-greedy-identity` ->
+  `antirez/ds4:main`)
+- Cross-link comment on the issue: https://github.com/antirez/ds4/issues/658#issuecomment-5160350475
+
+**Server discipline (upstream verification window).** Building/testing the
+`dspark-greedy-identity` branch and the pre-fix upstream reproduction both used
+this same checkout (`~/src/ds4`), which is also `ds4-server`'s
+`WorkingDirectory`/binary source -- `ds4-server` was stopped for the entire
+window (multiple checkouts: upstream/main pre-fix, `dspark-greedy-identity`
+post-fix, back to `research/gb10`), and `research/gb10` was rebuilt
+(`make clean && make cuda-spark`, clean, zero warnings) and the server
+restarted + verified (`systemctl is-active`=`active`, `GET /v1/models`->200,
+`deepseek-v4-flash`/`context_length: 32768`, confirming the production
+`ExecStart` was untouched) before any GitHub API calls were made.

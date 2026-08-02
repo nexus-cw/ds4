@@ -2437,3 +2437,15 @@ found and flagged for follow-up, not root-caused this unit -- distinct from this
 already-documented `--ssd-streaming`+`--temp 0` FP-reduction-order non-determinism note
 above (that one reproduces with **zero** drafter code involved; this one only appears with
 the drafter enabled, in **resident**, non-streaming mode).
+
+## DSpark greedy-identity fix + upstream issue/PR pair (2026-08-03)
+
+Cross-reference only -- not an FP4/MXFP4 CUDA kernel change, full writeup lives in
+`MEASUREMENTS.md`'s "DSpark greedy-identity fix" and "Upstream pair filed" entries.
+Fixed on `research/gb10` (commit `ae80554`) and ported to a minimal upstream branch
+(`dspark-greedy-identity`, based on upstream `main`): DSpark speculative decode's
+accept-commit path re-derives every accepted token's KV/compressor-frontier state via
+the same single-token decode kernel plain greedy decode uses, instead of a full-accept
+fast path that committed batch-verify-derived state directly -- fixes a `--temp 0`
+greedy-identity violation. Issue: https://github.com/antirez/ds4/issues/658. PR:
+https://github.com/antirez/ds4/pull/659.
