@@ -3432,3 +3432,67 @@ post-fix, back to `research/gb10`), and `research/gb10` was rebuilt
 restarted + verified (`systemctl is-active`=`active`, `GET /v1/models`->200,
 `deepseek-v4-flash`/`context_length: 32768`, confirming the production
 `ExecStart` was untouched) before any GitHub API calls were made.
+
+## posix_fadvise A/B on the SSD-streaming read path (2026-08-02)
+
+New env knob `DS4_STREAM_FADVISE` (commit adds it to `ds4_cuda.cu`), default unset =
+behavior unchanged. `random` -> `POSIX_FADV_RANDOM` once when the streaming fd is
+registered (`ds4_gpu_set_model_fd`); `dontneed`/`all` -> RANDOM at open **plus**
+`POSIX_FADV_DONTNEED` on each buffered pread's page-rounded range immediately after the
+read completes (`cuda_model_stage_read`). Both guarded on `POSIX_FADV_*` presence so
+non-Linux builds compile unchanged.
+
+**Hypothesis (stated before the run).** At the warm 96% expert-cache hit rate, the OS page
+cache may be silently serving the rare warm *misses* that would otherwise hit RAM; so
+`DONTNEED` (which evicts just-read pages) could *hurt* warm-miss latency, while `RANDOM`
+(disabling readahead) might help cold scattered reads. Test whether either moves cold TTFT,
+warm tok/s, or the page-cache footprint.
+
+**Protocol.** Same 8-turn long-session REPL protocol as the GA-0731 warm-baseline unit
+(`research/gb10/session_prompts.txt`, `-n 350`, `--cuda --ssd-streaming
+--ssd-streaming-cache-experts 75GB --nothink`), model
+`gguf/DeepSeek-V4-Flash-0731-MXFP4_MOE-Q8_0.gguf`, `ds4-server` stopped. Page cache dropped
+(`echo 3 > drop_caches`) before every arm so each starts equal; `free -h` + `/proc/meminfo`
+captured before/after with a 2s background sampler. `DS4_CUDA_STREAM_STATS=1` set but, as
+in prior long-session units, that counter is not wired into the REPL/stdin path (only the
+one-shot `-p` path) -- no direct hit-rate counter available; not re-derived here since the
+arms are same-model same-budget and the question is a *delta*, not an absolute. Cold metric =
+turn-1 (post-drop) decode t/s; a discrete sub-token TTFT was not separately instrumented
+(turn-1 prefill/decode stands in, consistent with earlier units). A vs C came out <5% apart
+on warm tok/s, so both were re-run once (A2, C2) to bound noise.
+
+| arm | DS4_STREAM_FADVISE | cold turn-1 decode t/s | warm steady t/s (turns 6-8 mean) | turns 2-8 mean | Cached after (GB) | MemAvailable after (GB) |
+|---|---|---|---|---|---|---|
+| A  | unset (baseline) | 4.87 | 5.69 | 5.71 | 14.3 | 117.5 |
+| A2 | unset (baseline) | 5.02 | 5.51 | 5.63 | 13.0 | 117.4 |
+| B  | random | 5.26 | 5.58 | 5.65 | 13.8 | 117.4 |
+| C  | random,dontneed | 5.18 | 5.54 | 5.62 | 13.3 | 117.4 |
+| C2 | random,dontneed | 5.00 | 5.59 | 5.65 | 13.9 | 117.3 |
+
+Baseline (A) pre-drop Cached was ~0.27 GB in every arm; the "Cached after" column is the
+page cache the session leaves resident. Cold prefill was 0.5-0.7 t/s across all arms
+(indistinguishable). Warm-steady means: baseline 5.60 (mean of A,A2), random 5.58, both
+5.565 (mean of C,C2) -- a spread of <1% across all three conditions, smaller than the ~3%
+run-to-run noise visible within the baseline pair alone (5.69 vs 5.51).
+
+**Verdict: no measurable effect, in throughput OR page-cache footprint.** RANDOM and
+RANDOM+DONTNEED move warm tok/s by less than the baseline's own rep-to-rep noise, and the
+page cache the session retains at exit is ~13-14 GB in *every* arm including baseline --
+DONTNEED did not shrink it. The pre-registered "DONTNEED hurts warm misses" hypothesis is
+**not confirmed** (no warm regression), but neither hint helps.
+
+**Mechanistic reason (the real finding).** The hints are largely inert because the
+production streaming read path does not primarily go through the buffered fd they target.
+`ds4_gpu_set_model_fd` opens a second `O_DIRECT` fd (`g_model_direct_fd`) and
+`cuda_model_stage_read` prefers it; `O_DIRECT` bypasses the page cache entirely, so the
+buffered `pread(g_model_fd, ...)` fallback -- the only path where our `POSIX_FADV_DONTNEED`
+fires -- runs rarely, and `POSIX_FADV_RANDOM` on a cache that O_DIRECT already sidesteps
+does nothing. The ~14 GB the session leaves cached is dominated by touched mmap'd
+model-view pages (the `posix_madvise(DONTNEED)` on the *mapping* already handles those),
+not the pread buffer. More fundamentally: at 75GB budget the warm 96% hit rate is served by
+the **in-process device-side expert LRU**, not the OS page cache, so page-cache tuning via
+fadvise is orthogonal to warm-hit performance here. Page cache is *not* the load-bearing
+tier at this budget; fadvise hints on this path are a no-op and can be left default-off.
+
+**Server restored:** `sudo systemctl start ds4-server`, `systemctl is-active`=active,
+`curl localhost:8000/v1/models`=200 confirmed before finishing.
