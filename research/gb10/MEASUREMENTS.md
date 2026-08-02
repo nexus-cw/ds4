@@ -1663,3 +1663,177 @@ manual servers were launched and restarted at the end; confirmed `systemctl is-a
 8001) and the manual resident-model control server (port 8001, second launch) were both
 terminated by this unit before the systemd restart; `nvidia-smi` confirmed 0% GPU utilization
 and no matching process before restart.
+
+## ds4#605 transport eval, live A/B completed: pipelining REGRESSES on GB10 unified memory, plain-copy default is neutral -- NOT FOLDED (2026-08-02)
+
+**Goal.** Resume the blocked unit above (2026-08-02, commit `b4816a3`, branch
+`eval/605-transport`): the box is now free (no port-8001 interference process,
+production `ds4-server` was the only other consumer and was stopped for this
+unit), so this pass runs the full A/B protocol that unit could not.
+
+**Setup.** `sudo systemctl stop ds4-server` first (was `active`, running the
+IQ2XXS production model). Two worktrees: `~/src/ds4` at `research/gb10` HEAD
+`0cbfeec` (baseline; the previously-used `ds4-baseline` worktree was found
+stale at `54b36ed`, 35 commits behind, and was not used), and a fresh
+`~/src/ds4-605` worktree at `eval/605-transport` HEAD `b4816a3` (unchanged
+from the prior unit). Both built clean via `make cuda-spark`, zero warnings.
+Model: `gguf/DeepSeek-V4-Flash-MXFP4_MOE.patched.gguf` (the MXFP4 preview
+artifact, same as all prior numbers in this doc; the GA file on disk was not
+touched, per instruction -- that is a separate ticket's business).
+
+**Byte-identity gate.** `--temp 0`, same photosynthesis prompt, both branches:
+`-n 60` and `-n 200` generations came back **byte-identical** text on both
+lengths, at `--ssd-streaming-cache-experts 100GB`. Not additionally checked at
+the 8GB budget (where sampling arms below use non-zero temp and vary run-to-run
+by design, which is expected, not a regression). **Identity gate: PASS** for
+the lengths tested.
+
+**Arm results** (mean generation t/s unless noted; all runs `--nothink`,
+`gguf/DeepSeek-V4-Flash-MXFP4_MOE.patched.gguf`, `--cuda --ssd-streaming`):
+
+*Arm A -- warm multi-turn, 100GB budget, `DS4_CUDA_STREAM_STATS=1`,
+`research/gb10/multiturn.txt` (8 turns), steady state = mean of last 3 turns,
+single session per branch (n=1, no reps -- an 8-turn session takes ~10 min and
+a repeat run was not feasible this unit's time budget; flagged honestly, not
+padded with false reps):*
+
+| branch | turn 1 | turn 2 | turn 3 | turn 4 | turn 5 | turn 6 | turn 7 | turn 8 | last-3 mean |
+|---|---|---|---|---|---|---|---|---|---|
+| research/gb10 (baseline) | 2.99 | 4.18 | 3.76 | 4.54 | 4.38 | 4.47 | 4.43 | 4.42 | **4.44** |
+| eval/605-transport | 2.67 | 4.05 | 2.08 | 4.21 | 3.90 | 4.30 | 4.31 | 4.40 | **4.34** |
+
+Baseline's steady state (4.44 t/s) matches this doc's earlier long-session
+locality-convergence entry (4.39-4.48 t/s range) almost exactly -- a useful
+cross-check that this run's methodology reproduces prior results. The ~2.3%
+gap to eval's 4.34 t/s is well within the turn-to-turn variance visible in
+both trajectories (baseline's own turns 3 and 4 differ by 0.78 t/s) and with
+n=1 per branch cannot be resolved from noise. **Verdict: NOISE, not a
+resolvable difference**, at the 100GB budget where hit rate is already
+96-98% and the miss path this patch touches is rarely exercised.
+
+*Arm B -- cold turn-1 decode + wall clock, page cache dropped first (`sync;
+echo 3 | sudo tee /proc/sys/vm/drop_caches`), `-n 60`, 2 reps each, both a
+100GB and an 8GB budget:*
+
+| budget | branch | rep1 wall | rep2 wall | rep1 gen t/s | rep2 gen t/s |
+|---|---|---|---|---|---|
+| 100GB | research/gb10 | 56.04s | 56.62s | 2.86 | 2.91 |
+| 100GB | eval/605-transport | 64.04s | 61.75s | 2.49 | 2.62 |
+| 8GB | research/gb10 | 103.21s | 102.56s | 0.98 | 0.98 |
+| 8GB | eval/605-transport | 124.11s | 124.41s | 0.77 | 0.76 |
+
+At 100GB: eval is **11-14% slower** wall-clock (mean 62.9s vs 56.3s), **11%
+slower** decode t/s (mean 2.56 vs 2.89), both reps non-overlapping in both
+directions. At 8GB: eval is **21% slower** wall-clock (mean 124.3s vs
+102.9s), **22% slower** decode t/s (mean 0.765 vs 0.98), again fully
+non-overlapping across both reps. **Verdict: REAL REGRESSION**, both
+budgets, more severe at 8GB -- exactly where PR#605's transport pipelining
+was supposed to help most.
+
+*Arm C -- miss-heavy, 8GB budget, fixed photosynthesis prompt `-n 100`,
+4 reps each (rep1 not discarded as "warming" since each rep is a fresh
+process with no persistent device-cache -- OS page cache warms across reps,
+but the CUDA streaming expert cache does not, so every rep is effectively a
+cold-device-cache miss-heavy run by this test's own design):*
+
+| branch | rep1 | rep2 | rep3 | rep4 | mean | range |
+|---|---|---|---|---|---|---|
+| research/gb10 | 1.01 | 1.00 | 1.01 | 1.01 | **1.0075** | [1.00, 1.01] |
+| eval/605-transport | 0.76 | 0.76 | 0.76 | 0.75 | **0.7575** | [0.75, 0.76] |
+
+**Zero overlap across all 8 data points** (4 baseline reps all >= 1.00,
+4 eval reps all <= 0.76) -- eval is **~25% slower**, consistently, every
+single rep. This is the clearest, highest-confidence signal in this unit:
+the gap (0.25 t/s) is roughly 25x any single rep's own run-to-run spread
+(~0.01 t/s), comfortably beyond a 3-sigma noise floor. **Verdict: REAL
+REGRESSION**, high confidence.
+
+*Arm D -- prefill, `research/gb10/prose_prompt.txt` (55 words / 18 prompt
+tokens per `ds4`'s own tokenizer count -- shorter than the ~300-token target
+this unit's brief specified; this is the only prefill prompt staged from the
+prior unit and was used as-is per the resume note's "already in place for
+this" pointer, flagged here rather than silently treated as 300 tokens),
+100GB budget, `-n 20`, 3 reps each:*
+
+| branch | rep1 | rep2 | rep3 | mean |
+|---|---|---|---|---|
+| research/gb10 | 1.51 | 1.49 | 1.48 | **1.493** |
+| eval/605-transport | 1.49 | 1.49 | 1.49 | **1.490** |
+
+<0.3% apart, within noise. **Verdict: NO CHANGE**, as expected -- prefill at
+a 100GB budget rarely touches the miss path (confirmed by inspection in the
+prior unit: layer-major prefill is unaffected by this diff by construction).
+
+**Isolation mini-arm: which of the two ported changes causes the Arm C/B
+regression?** `DS4_CUDA_STREAM_MISS_PLAIN_COPY=0` on `eval/605-transport`
+forces the *old* pread-then-async-upload path (disabling `5930a3f`'s
+plain-copy default) while leaving `1c055bb`'s pipelining (persistent
+ring-cursor, grouped 3-tensor async upload) active. 3 reps, 8GB budget, same
+prompt as Arm C:
+
+| config | rep1 | rep2 | rep3 | mean |
+|---|---|---|---|---|
+| eval/605-transport, plain-copy forced OFF | 0.75 | 0.75 | 0.75 | **0.75** |
+| eval/605-transport, default (plain-copy ON) | -- | -- | -- | 0.7575 (Arm C) |
+| research/gb10 baseline | -- | -- | -- | 1.0075 (Arm C) |
+
+Forcing plain-copy off does **not** recover baseline performance (0.75 t/s,
+same as the 0.7575 t/s default) -- it stays regressed. This isolates the
+Arm B/C regression to **`1c055bb` (the upload pipelining change)**, not
+`5930a3f` (the plain-copy default). The plain-copy default itself is
+neutral-to-slightly-negative here, not the driver of the loss.
+
+**GB10 unified-memory analysis.** The prior unit flagged this as the open
+question and it is now answered: PR#605's pipelining -- a persistent
+4-buffer ring cursor shared across grouped tensor uploads, deferring
+`cudaStreamSynchronize` until a caller-specified flush point -- **helps on
+a discrete PCIe card by hiding host-read latency behind in-flight PCIe DMA
+across chunk/tensor boundaries**. On GB10, host and device memory are the
+same physical DRAM over NVLink-C2C: there is no PCIe DMA to hide anything
+behind, so the extra bookkeeping (ring-cursor state, deferred-sync grouping
+logic) is close to pure overhead with no corresponding latency to mask,
+and Arm C's 25% loss suggests it is worse than pure overhead -- plausibly
+because deferring sync across 3 grouped tensor uploads delays the point at
+which the expert data is actually usable by the compute kernel relative to
+issuing and syncing each upload eagerly, on hardware where the upload is
+cheap enough that the old per-tensor-sync path was already close to optimal.
+Not verified further with a profiler this unit (out of scope/time budget);
+flagged as the natural follow-up if this branch or its individual commits
+are revisited. The plain-copy default (`5930a3f`) is the commit most
+naively expected to be architecture-sensitive (pageable-transfer-beats-
+pread-bounce is itself a PCIe-driver-specific claim) but measures as
+neutral here -- the regression is not where the naive prediction would have
+placed it.
+
+**Fold decision: NOT FOLDED.** Per protocol ("fold if any arm shows a real
+win with no regression elsewhere"): no arm shows a win. Arm A is noise, Arm D
+is flat, and Arms B and C show a real, reproducible, high-confidence
+regression (11-25% slower depending on budget/state) with zero overlap
+across every rep pair collected. `research/gb10` is unchanged.
+`eval/605-transport` (commit `b4816a3`) is left as-is, pushed, for
+reference/upstream-comment purposes -- not merged.
+
+**Value of this result.** This is exactly the kind of negative result the
+original unit flagged as valuable regardless of direction: PR#605's own
+~3x claim on a discrete RTX PRO 6000 does not transfer to GB10's unified
+memory, and for the specific transport-pipelining half of the PR, the
+mechanism actively *reverses* on this hardware. It also tells upstream
+their PR's benefit is very likely PCIe-DMA-specific, not a generic
+"streamed-expert-upload" win.
+
+**Draft comment for a possible upstream note on ds4#605** (drafted here for
+the orchestrator's review; not posted by this unit): "We independently
+ported the transport half of this PR (the streamed-upload pipelining and
+plain-copy default, not the resident-cache redesign, which duplicates
+functionality we already have) onto an NVIDIA GB10 (unified CPU/GPU memory
+over NVLink-C2C) + custom MXFP4 expert-LRU stack, and measured a
+consistent 11-25% regression from the pipelining change specifically
+(isolated via an env toggle; the plain-copy default alone was neutral).
+Our read is that the pipelining's benefit comes from hiding host-read
+latency behind PCIe DMA, which doesn't exist as a mechanism on
+memory-unified hardware -- worth a note in the PR description that the
+~3x number is likely discrete-PCIe-card-specific rather than general."
+
+**Server discipline.** `ds4-server` (systemd, port 8000, production IQ2XXS
+model) stopped at the start of this unit, restarted and verified
+(`systemctl is-active`=`active`, `GET /v1/models` -> HTTP 200) at the end.
