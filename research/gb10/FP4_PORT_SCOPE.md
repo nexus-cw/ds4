@@ -2236,3 +2236,7 @@ compatibility" unit; summary for anyone touching this code next:
   from the long-session unit in `MEASUREMENTS.md` to amortize the extra per-step expert
   fetch). **A full warm multi-turn with/without-drafter trajectory was not completed within
   this unit's time budget** -- the natural next step for whoever picks this up.
+
+## Quality battery
+
+Calibration/hallucination probe battery for pre-promotion GA-FP4 checks: see `research/gb10/calibration_probes/` (40-item probes.jsonl across unanswerable/known-fact/trap-premise/tool-precision categories, runner + heuristic scorer, protocol comparing IQ2 baseline vs. GA FP4 vs. GA FP4 with an abstention system prompt).
