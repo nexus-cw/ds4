@@ -3322,3 +3322,86 @@ CASE A and CASE B testing, verified `systemctl is-active`=`active` and
 `--ssd-streaming-cache-experts 75GB`, `--ctx 32768` -- was untouched and
 reloaded correctly). No stray `ds4`/`ds4-server` processes observed after
 restart aside from the one production instance.
+
+## DSpark greedy-identity fix: re-derive accepted-token KV via single-token replay, always (2026-08-03)
+
+**Scope.** Implements the fix scoped by the prior unit's identity probe
+("Determinism/identity probe: two temp-0 violations root-caused", CASE B,
+verdict b2 STRUCTURAL): the DSpark accept-commit path
+(`ds4_session_eval_dspark_speculative_argmax`, `ds4.c`) had a fast path for
+full accepts (`commit_drafts == draft_n`) that committed the verify batch's
+own compressor-frontier writes (`ds4_gpu_matmul_f16_pair_tensor`, the
+batched multi-token GEMM) directly, instead of re-deriving that state through
+the fused single-token kernel
+(`ds4_gpu_matmul_f16_pair_compressor_store_tensor`) that ordinary greedy
+decode uses. The partial-accept path already had a rollback+replay
+mechanism (roll checkpoint/frontier back to the pre-verify snapshot, then
+re-decode each accepted token one at a time via
+`metal_graph_eval_token_raw_swa`, the exact function plain single-token
+decode calls) -- the fix removes the full-accept fast path entirely
+(`ds4.c`, was ~62231-62281) so every accept, full or partial, falls through
+to that same rollback+replay path unconditionally. This guarantees the
+post-accept KV/compressor-frontier state -- and the logits read off it -- are
+bit-identical to what plain sequential decode would have produced for the
+same tokens, since it is now the literal same code path. Scoped to the
+DSpark accept-commit function only; no change to `--mtp` native-drafter code,
+no dialect/FP4 changes. Zero effect when no drafter is configured (the
+caller returns before `draft_n` is reached).
+
+**Build.** `make clean && make cuda-spark`: clean rebuild, zero warnings.
+
+**Tests.** `make test`: `ds4 tests: 2 failure(s)` -- both on the documented
+pre-existing flaky list: `tool-call-quality` (`tests/ds4_test.c:6375`) and
+`logprob-vectors` (`tests/ds4_test.c:5285`, the exact same assertion line
+cited in the P3c-1-take-4 unit's "6 failure(s)" baseline). No new failing
+test names; no regression attributable to this diff.
+
+**Greedy-identity verification.** Resident IQ2XXS +
+`DeepSeek-V4-Flash-DSpark-support.gguf` (`--mtp <support.gguf> --dspark`),
+`--cuda --temp 0`, three cases, drafter-enabled vs no-drafter, byte-for-byte
+`diff`:
+1. `-p "Explain the TCP three-way handshake." -n 400` (the CASE B
+   reproducer, previously diverged at char 277): **BYTE_IDENTICAL**, 1902
+   bytes both sides (matches the pre-existing no-drafter baseline byte count
+   exactly). Confirmed on two independent drafter-enabled runs, including one
+   with `DS4_DSPARK_SPEC_LOG=1` (accept-depth histogram: 334x1, 9x2, 13x3,
+   5x4, 6x5, 2x6, 1x7, 1x8, 1x9, 8x0-miss -- spread up to depth 9 still
+   present, confirming the fix does not flatten acceptance, per c860c9a's
+   "spread" finding).
+2. `-p "What is the capital of France? Explain its history briefly." -n
+   400`: **BYTE_IDENTICAL**, 649 bytes both sides (short EOS-terminated
+   completion).
+3. `--prompt-file prose_prompt.txt -n 800` (the ~55-word TCP-handshake essay
+   prompt, CASE A's original preview-artifact-era trigger, pushed to 800
+   tokens): **BYTE_IDENTICAL**, 3693 bytes both sides.
+
+No divergence observed in any of the three cases, including the one known to
+reproduce the bug pre-fix. Raw logs under
+`research/gb10/fix-verify-out/`.
+
+**Overhead.** Generation-phase t/s, single runs each (not a full statistical
+sweep -- directional, not final):
+| case | no-drafter | drafter (post-fix) |
+|---|---|---|
+| TCP-handshake, n=400 | 17.02 t/s | 14.30 / 14.31 t/s (2 runs) |
+| France, n=400 | 16.96 t/s | 14.04 t/s |
+| prose, n=800 | 16.93 t/s | 14.63 t/s |
+
+Average drafter-vs-no-drafter overhead post-fix: ~15.6% slower generation
+(vs. the pre-fix drafter case, which per the ticket's own numbers was only
+~4.7% slower on this same resident pairing -- "16.87->16.07 default"). This
+is the expected, honestly-reported cost of always paying the single-token
+replay for every accepted token (not just partial accepts): correctness
+requires it, and it makes DSpark's already-marginal resident throughput case
+more clearly net-loss on this pairing/hardware. Not attempting a
+targeted-smaller-kernel-only optimization (re-deriving just the compressor
+projection instead of the full forward pass) in this unit -- out of scope
+per the ticket, and the full-replay approach is the one already proven
+correct and in production use for partial accepts.
+
+**Server discipline.** `ds4-server` stopped (`systemctl stop`, verified
+`inactive`) before the build/test/verification window; restarted and
+verified (`systemctl is-active`=`active`, `GET /v1/models`->HTTP 200,
+`deepseek-v4-flash`/`context_length: 32768` present, confirming the
+production `ExecStart` -- `--ssd-streaming-cache-experts 75GB --ctx 32768`
+-- untouched) after.
