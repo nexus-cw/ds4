@@ -1,0 +1,31 @@
+ds4: Linux cuda backend set oom_score_adj=1000
+ds4: tensor family token_embd.weight (bf16, 1 tensor) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.ffn_gate_inp.weight (bf16, 43 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.hc_attn_fn.weight (f32, 43 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.hc_ffn_fn.weight (f32, 43 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.attn_compressor_ape.weight (f32, 41 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.attn_compressor_gate.weight (bf16, 41 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.attn_compressor_kv.weight (bf16, 41 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.indexer_compressor_ape.weight (f32, 21 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.indexer_compressor_gate.weight (bf16, 21 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.indexer_compressor_kv.weight (bf16, 21 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.indexer.proj.weight (bf16, 21 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family output_hc_fn.weight (f32, 1 tensor) dialect compat: dequantized to f16 at load
+ds4: tensor family output.weight (bf16, 1 tensor) dialect compat: dequantized to f16 at load
+ds4: metadata key deepseek4.vocab_size missing -- dialect compat, using tokenizer.ggml.tokens array length (cross-checked against token_embd.weight/output.weight's vocab dimension) = 129280
+ds4: CUDA backend initialized on NVIDIA GB10 (sm_121) dev=0
+ds4: cuda SSD streaming total expert budget 75.00 GiB = 6.38 GiB prefill headroom + 68.62 GiB dynamic cache (5511 experts, 12.75 MiB each)
+ds4: SSD streaming initial cuda model map restricted to token embedding (1 spans, 0.99 GiB tensor span)
+ds4: CUDA host registration skipped: operation not supported
+ds4: CUDA preparing model tensor mappings
+ds4: CUDA startup model preparation covered 0.99 GiB of tensor spans in 0.000s
+ds4: cuda backend initialized for graph diagnostics
+ds4: memory: KV 0.78 GiB (raw 0.36 + compressed 0.42) + buffers 0.25 GiB + resident model 0.99 GiB + expert cache 68.62 GiB + prefill expert reserve 6.38 GiB = 77.01 GiB planned
+ds4: memory detail: ctx=32768 prefill_cap=4096 raw_kv_rows=4352 compressed_kv_rows=8194 backend=cuda
+ds4: memory: KV 0.78 GiB (raw 0.36 + compressed 0.42) + buffers 0.25 GiB = 1.03 GiB context
+ds4: memory detail: ctx=32768 prefill_cap=4096 raw_kv_rows=4352 compressed_kv_rows=8194 backend=cuda
+ds4: using GPU graph generation with graph prefill
+ds4: CUDA loading model tensors into device cache
+ds4: gpu streaming prefill token 1/17ds4: gpu streaming prefill token 2/17ds4: gpu streaming prefill token 3/17ds4: gpu streaming prefill token 4/17ds4: gpu streaming prefill token 5/17ds4: gpu streaming prefill token 6/17ds4: gpu streaming prefill token 7/17ds4: gpu streaming prefill token 8/17ds4: gpu streaming prefill token 9/17ds4: gpu streaming prefill token 10/17ds4: gpu streaming prefill token 11/17ds4: gpu streaming prefill token 12/17ds4: gpu streaming prefill token 13/17ds4: gpu streaming prefill token 14/17ds4: gpu streaming prefill token 15/17ds4: gpu streaming prefill token 16/17ds4: CUDA loading model tensors 5.63 GiB cached
+ds4: gpu streaming prefill token 17/17
+ds4: prefill: 1.18 t/s, generation: 2.56 t/s

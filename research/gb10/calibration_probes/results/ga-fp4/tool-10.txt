@@ -1,0 +1,18 @@
+To attach an interactive TTY session to a running container using `kubectl exec`, you would add the following flags:
+
+```
+kubectl exec -it <pod-name> -- <command>
+```
+
+- `-i` (or `--stdin`): Keep stdin open for the container, allowing you to send input.
+- `-t` (or `--tty`): Allocate a pseudo-TTY, which enables terminal features like command editing and proper output formatting.
+
+For example:
+```
+kubectl exec -it my-pod -- /bin/bash
+```
+
+If the pod has multiple containers, you also need to specify the container with `-c` (or `--container`):
+```
+kubectl exec -it my-pod -c my-container -- /bin/bash
+```

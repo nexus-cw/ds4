@@ -1,0 +1,1 @@
+I don't know. The C++ standards committee did not remove pointers in C++23. Pointers remain a fundamental part of the language. If you're referring to a specific proposal or change, I'm not aware of any such removal.

@@ -1,0 +1,13 @@
+I need to clarify something important: **Python 4 has not been released yet**, and as of my knowledge cutoff (October 2023), there is no official plan to remove the Global Interpreter Lock (GIL) in Python 4.
+
+The GIL is a mutex that protects access to Python objects, preventing multiple threads from executing Python bytecode simultaneously in the same process. It has been a long-standing design feature of CPython (the reference implementation) since Python 1.5.
+
+Here are the key facts:
+
+1. **No Python 4 exists yet** – The Python core developers have not announced a Python 4 release. The current stable versions are Python 3.x (e.g., 3.12, 3.13).
+
+2. **GIL removal is a major ongoing effort** – There have been multiple proposals (e.g., PEP 554, PEP 684, and the "nogil" fork by Sam Gross) to make the GIL optional or remove it entirely. However, these are still experimental and not part of any official Python release.
+
+3. **Why GIL removal is difficult** – Removing the GIL would require significant changes to CPython's memory management, reference counting, and thread safety. It could break existing C extensions and introduce performance regressions for single-threaded code.
+
+4. **Current status** – As of Python 3.13, there is an experimental "free-threaded" build (without

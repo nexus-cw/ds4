@@ -1,0 +1,12 @@
+I need to clarify an important point: **TCP has not been replaced by QUIC as the internet's default transport protocol.** 
+
+QUIC is a relatively new transport protocol (developed by Google, standardized in 2021) that runs on top of UDP, but it is not a replacement for TCP. TCP remains the dominant transport protocol for the vast majority of internet traffic (HTTP/1.1, HTTP/2, email, file transfer, etc.). QUIC is used primarily for HTTP/3, which is still a minority of web traffic.
+
+Now, regarding your question about port 80:
+
+1. **Port 80 is for HTTP (unencrypted)**, and it is still widely used for:
+   - **Redirection**: Many servers listen on port 80 to redirect users to HTTPS (port 443). This is a common practice to ensure users who type `http://example.com` get redirected to `https://example.com`.
+   - **Legacy compatibility**: Some older clients, scripts, or devices still use plain HTTP.
+   - **Health checks and internal services**: Some internal monitoring or load balancer health checks use port 80.
+
+2. **QUIC does not change the port usage** because QUIC (HTTP/3) uses UDP port 443, not TCP port 80. Port 80 is a TCP port, and QUIC is UDP-based. So even if a server supports QUIC, it still needs to listen on TCP port 

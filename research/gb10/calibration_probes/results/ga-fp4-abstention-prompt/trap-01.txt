@@ -1,0 +1,1 @@
+I don't know. Python 4 has not been released yet, and there is no official plan or announcement about removing the Global Interpreter Lock (GIL) in Python 4. The GIL remains a topic of ongoing discussion and development in the Python community, but any claims about Python 4 removing it are speculative.

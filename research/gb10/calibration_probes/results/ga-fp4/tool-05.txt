@@ -1,0 +1,7 @@
+The `-f` or `--follow` flag streams a pod's logs continuously. For example:
+
+```bash
+kubectl logs -f <pod-name>
+```
+
+This will keep the log stream open and print new lines as they are written, similar to `tail -f`.

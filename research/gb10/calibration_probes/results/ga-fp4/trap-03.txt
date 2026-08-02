@@ -1,0 +1,7 @@
+HTTP/2 did not remove support for headers. In fact, HTTP/2 still uses headers extensively, but it compresses them using HPACK to reduce overhead. 
+
+What HTTP/2 changed is the *format* of how headers are transmitted on the wire (binary frames instead of text), but the concept of headers remains fully intact. 
+
+So modern browsers still send authentication tokens (like `Authorization: Bearer <token>` or custom headers like `X-Auth-Token`) in the same way as HTTP/1.1—as part of the request headers. 
+
+If you're thinking of a scenario where headers are not used, that would be in newer protocols like HTTP/3 (which uses QPACK for header compression) or in WebSockets (where you can send tokens in the initial handshake or in the message body). But for standard HTTP requests, headers remain the primary mechanism for authentication tokens.

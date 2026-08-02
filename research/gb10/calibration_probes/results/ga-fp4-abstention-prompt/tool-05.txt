@@ -1,0 +1,7 @@
+The flag is `-f` or `--follow`. For example:
+
+```bash
+kubectl logs -f <pod-name>
+```
+
+This streams the logs continuously, similar to `tail -f`.

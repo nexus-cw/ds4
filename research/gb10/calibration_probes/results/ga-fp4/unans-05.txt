@@ -1,0 +1,18 @@
+In PyTorch 2.3, the `torch.nn.functional.sparse_gelu` function takes the following parameters:
+
+```python
+torch.nn.functional.sparse_gelu(input, *, approximate='none')
+```
+
+**Parameters:**
+- **input** (*Tensor*) – The input tensor on which the sparse GELU activation is applied.
+- **approximate** (*str, optional*) – The approximation method to use for the GELU function. Can be `'none'` (default) or `'tanh'`. 
+  - `'none'`: Uses the exact mathematical definition of GELU (Gaussian Error Linear Unit).
+  - `'tanh'`: Uses the tanh approximation, which is faster but slightly less accurate.
+
+**Returns:**
+- A tensor with the same shape as the input, with the sparse GELU activation applied.
+
+**Note:** This function is part of the "sparse" family of activations in PyTorch, which are designed to be used with sparse tensors (though it can also be applied to dense tensors). It applies the GELU activation but with a special handling for sparse gradients during backpropagation, which can be more efficient for models with sparse activations.
+
+The function is equivalent to `torch.nn.SparseGELU` (the module version) when called with the same arguments.

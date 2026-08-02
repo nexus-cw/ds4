@@ -1,0 +1,5 @@
+I don't have specific information about a "ds4" tool or its command-line flags. "ds4" could refer to various things (e.g., a specific software, a model, or a custom tool), and I'm not aware of a standard "thinking mode" flag for it.
+
+If you're referring to a specific application or framework, please provide more context (e.g., the full name, documentation link, or what "ds4" stands for). Without that, I can't give you the exact flag.
+
+If you meant a general AI model or tool, many don't have a "thinking mode" toggle—they either always reason or don't. Check the tool's `--help` output or documentation for options like `--no-thinking`, `--fast`, or `--reasoning-off`.

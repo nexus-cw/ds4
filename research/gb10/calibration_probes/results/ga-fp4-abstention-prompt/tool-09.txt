@@ -1,0 +1,7 @@
+The command is:
+
+```
+git add -u
+```
+
+This stages modifications and deletions of already-tracked files but does not add new untracked files.

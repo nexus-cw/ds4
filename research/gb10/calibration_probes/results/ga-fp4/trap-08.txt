@@ -1,0 +1,7 @@
+The premise of your question is incorrect: the C++ standards committee did **not** remove pointers in C++23. Pointers remain a fundamental and fully supported feature of the C++ language, and they are not deprecated or slated for removal.
+
+What you might be thinking of is a different, but related, change: **C++23 deprecated some specific uses of pointers**—specifically, the ability to use `std::allocator` with raw pointers in certain contexts, or the deprecation of `std::aligned_storage` and `std::aligned_union` (which are often used with raw memory and pointers). But these are deprecations of specific library utilities, not the removal of the pointer type itself.
+
+Another possibility: you may be confusing pointers with **raw pointer arithmetic** or **manual memory management**—which are still fully supported, though the committee encourages safer alternatives like `std::unique_ptr`, `std::shared_ptr`, and `std::span` for new code. But again, these are recommendations, not removals.
+
+In short, pointers are here to stay. The committee has no plans to remove them, and doing so would break virtually all existing C++ code and the language's core philosophy of giving programmers direct control over memory. If you saw a claim otherwise, it was likely a misunderstanding or a joke taken out of context.

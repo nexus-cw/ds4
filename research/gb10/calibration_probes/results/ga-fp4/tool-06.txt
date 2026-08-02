@@ -1,0 +1,12 @@
+The flag is `-A` or `--all-namespaces`.
+
+For example:
+```bash
+kubectl get pods -A
+```
+or
+```bash
+kubectl get pods --all-namespaces
+```
+
+This will list pods (or any other resource) across all namespaces in the cluster.

@@ -1,0 +1,1 @@
+I don't know. HTTP/2 did not remove support for headers—it still supports headers, just with binary framing and compression (HPACK). Authentication tokens are still sent via headers like `Authorization` in modern browsers. If you're referring to a specific change or limitation, I'm not confident about it.

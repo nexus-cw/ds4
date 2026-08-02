@@ -1,0 +1,15 @@
+The command you're looking for is:
+
+```
+git add -u
+```
+
+or its longer form:
+
+```
+git add --update
+```
+
+This stages modifications and deletions of files that are already tracked by Git, but it does **not** stage new untracked files. 
+
+If you want to stage all changes (including new files), you would use `git add -A` or `git add .` instead.

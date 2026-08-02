@@ -1,0 +1,11 @@
+Git did **not** deprecate the `merge` command in favor of `rebase`. Both commands are fully supported and serve different purposes in Git's workflow. They are not interchangeable, and neither has been deprecated.
+
+Here’s the key distinction:
+
+- **`git merge`** is used to integrate changes from one branch into another while preserving the complete history of both branches. It creates a new "merge commit" that has two parents, showing exactly where the branches diverged and merged. This is the default and safest way to combine work, especially for shared branches.
+
+- **`git rebase`** is used to rewrite commit history by moving or "replaying" commits from one branch onto the tip of another. This results in a linear, cleaner history, but it rewrites the existing commits (changing their hashes). It is generally recommended only for local, unpublished branches, because rewriting shared history can cause confusion and conflicts for other collaborators.
+
+The confusion may arise from some teams or tutorials preferring `rebase` for a tidy, linear history, but Git itself has never deprecated `merge`. In fact, `merge` is still the default behavior for `git pull` (unless configured otherwise) and is essential for integrating work in collaborative environments.
+
+So, to answer directly: **Git did not deprecate `merge`—both commands are alive and well, and you should choose based on your workflow and whether you need to preserve or rewrite history.**

@@ -1,0 +1,11 @@
+The flag is `--all-namespaces` (or `-A` for short). For example:
+
+```bash
+kubectl get pods --all-namespaces
+```
+
+or
+
+```bash
+kubectl get pods -A
+```

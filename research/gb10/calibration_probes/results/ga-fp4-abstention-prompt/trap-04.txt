@@ -1,0 +1,6 @@
+Git did **not** deprecate the `merge` command in favor of `rebase`. Both commands are still fully supported and serve different purposes in Git.
+
+- `git merge` is used to combine branches while preserving the history of both branches (creating a merge commit).
+- `git rebase` is used to rewrite history by moving or combining a sequence of commits onto a new base, resulting in a linear history.
+
+They are complementary tools, not replacements. Some teams prefer rebasing for cleaner history, but merging is still widely used and recommended for public or shared branches. If you saw a deprecation notice, it might have been from a specific tool or workflow, not from Git itself.

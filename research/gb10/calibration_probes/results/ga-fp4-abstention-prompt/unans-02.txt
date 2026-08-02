@@ -1,0 +1,1 @@
+I don't know what the `--expert-pin` flag does in `ds4`. I'm not familiar with a tool or command called `ds4` that has this specific flag, and I don't have enough context to guess. If you can provide more details about what `ds4` refers to (e.g., a specific software, library, or command-line tool), I might be able to help further.

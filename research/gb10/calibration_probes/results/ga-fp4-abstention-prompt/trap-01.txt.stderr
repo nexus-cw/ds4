@@ -1,0 +1,35 @@
+ds4: Linux cuda backend set oom_score_adj=1000
+ds4: tensor family token_embd.weight (bf16, 1 tensor) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.ffn_gate_inp.weight (bf16, 43 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.hc_attn_fn.weight (f32, 43 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.hc_ffn_fn.weight (f32, 43 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.attn_compressor_ape.weight (f32, 41 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.attn_compressor_gate.weight (bf16, 41 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.attn_compressor_kv.weight (bf16, 41 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.indexer_compressor_ape.weight (f32, 21 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.indexer_compressor_gate.weight (bf16, 21 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.indexer_compressor_kv.weight (bf16, 21 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.indexer.proj.weight (bf16, 21 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family output_hc_fn.weight (f32, 1 tensor) dialect compat: dequantized to f16 at load
+ds4: tensor family output.weight (bf16, 1 tensor) dialect compat: dequantized to f16 at load
+ds4: metadata key deepseek4.vocab_size missing -- dialect compat, using tokenizer.ggml.tokens array length (cross-checked against token_embd.weight/output.weight's vocab dimension) = 129280
+ds4: CUDA backend initialized on NVIDIA GB10 (sm_121) dev=0
+ds4: cuda SSD streaming total expert budget 75.00 GiB = 6.38 GiB prefill headroom + 68.62 GiB dynamic cache (5511 experts, 12.75 MiB each)
+ds4: SSD streaming initial cuda model map restricted to token embedding (1 spans, 0.99 GiB tensor span)
+ds4: CUDA host registration skipped: operation not supported
+ds4: CUDA preparing model tensor mappings
+ds4: CUDA startup model preparation covered 0.99 GiB of tensor spans in 0.000s
+ds4: cuda backend initialized for graph diagnostics
+ds4: memory: KV 0.78 GiB (raw 0.36 + compressed 0.42) + buffers 0.25 GiB + resident model 0.99 GiB + expert cache 68.62 GiB + prefill expert reserve 6.38 GiB = 77.01 GiB planned
+ds4: memory detail: ctx=32768 prefill_cap=4096 raw_kv_rows=4352 compressed_kv_rows=8194 backend=cuda
+ds4: memory: KV 0.78 GiB (raw 0.36 + compressed 0.42) + buffers 0.25 GiB = 1.03 GiB context
+ds4: memory detail: ctx=32768 prefill_cap=4096 raw_kv_rows=4352 compressed_kv_rows=8194 backend=cuda
+ds4: using GPU graph generation with graph prefill
+ds4: CUDA loading model tensors into device cache
+ds4: gpu prefill layer 1/43ds4: gpu prefill layer 2/43ds4: gpu prefill layer 3/43ds4: gpu prefill layer 4/43ds4: gpu prefill layer 5/43ds4: gpu prefill layer 6/43ds4: gpu prefill layer 7/43ds4: gpu prefill layer 8/43ds4: CUDA loading model tensors 1.08 GiB cached
+ds4: gpu prefill layer 9/43ds4: gpu prefill layer 10/43ds4: gpu prefill layer 11/43ds4: gpu prefill layer 12/43ds4: gpu prefill layer 13/43ds4: gpu prefill layer 14/43ds4: gpu prefill layer 15/43ds4: gpu prefill layer 16/43ds4: gpu prefill layer 17/43ds4: CUDA loading model tensors 2.30 GiB cached
+ds4: gpu prefill layer 18/43ds4: gpu prefill layer 19/43ds4: gpu prefill layer 20/43ds4: gpu prefill layer 21/43ds4: gpu prefill layer 22/43ds4: gpu prefill layer 23/43ds4: gpu prefill layer 24/43ds4: gpu prefill layer 25/43ds4: CUDA loading model tensors 3.49 GiB cached
+ds4: gpu prefill layer 26/43ds4: gpu prefill layer 27/43ds4: gpu prefill layer 28/43ds4: gpu prefill layer 29/43ds4: gpu prefill layer 30/43ds4: gpu prefill layer 31/43ds4: gpu prefill layer 32/43ds4: gpu prefill layer 33/43ds4: gpu prefill layer 34/43ds4: CUDA loading model tensors 4.59 GiB cached
+ds4: gpu prefill layer 35/43ds4: gpu prefill layer 36/43ds4: gpu prefill layer 37/43ds4: gpu prefill layer 38/43ds4: gpu prefill layer 39/43ds4: gpu prefill layer 40/43ds4: gpu prefill layer 41/43ds4: gpu prefill layer 42/43ds4: CUDA loading model tensors 5.79 GiB cached
+ds4: gpu prefill layer 43/43
+ds4: prefill: 0.59 t/s, generation: 3.44 t/s

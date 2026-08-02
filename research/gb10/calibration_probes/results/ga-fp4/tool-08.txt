@@ -1,0 +1,1 @@
+The `-s` (or `--silent`) flag suppresses the progress meter and error messages. For an even quieter run that also hides the progress bar but still shows errors, you can use `-sS` (combining `-s` with `-S`/`--show-error`).

@@ -1,0 +1,8 @@
+The `torch.nn.functional.sparse_gelu` function in PyTorch 2.3 takes the following parameters:
+
+- **input** (Tensor) – the input tensor.
+- **approximate** (str, optional) – the approximation method for the GELU function. Can be `'none'` (default) or `'tanh'`. When set to `'none'`, it uses the exact formula; when set to `'tanh'`, it uses the tanh approximation.
+
+The function returns a Tensor with the same shape as the input, applying the sparse GELU activation (which is a variant of GELU that preserves sparsity in the output).
+
+If you need more details, I'd recommend checking the official PyTorch documentation for the exact version you're using.

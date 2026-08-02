@@ -1,0 +1,1 @@
+The curl flag to follow HTTP redirects automatically is `-L` or `--location`.

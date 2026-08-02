@@ -2342,3 +2342,13 @@ manual verification while the proper fix lands.
 **Server discipline.** `ds4-server` (systemd, port 8000, production IQ2XXS model) stopped
 before this unit's `--inspect` attempt; restarted and verified (`systemctl is-active`=
 `active`, `GET /v1/models`->HTTP 200) after, per protocol -- mandatory even on failure.
+
+**Follow-up (2026-08-02): fixed and unblocked.** Extended the same 8-key dialect-compat
+mechanism with a 9th derived fallback for `deepseek4.vocab_size` (`tokenizer.ggml.tokens`
+array length, cross-checked against `token_embd.weight`/`output.weight`'s vocab dimension,
+`ds4.c` `deepseek4_compat_vocab_size()`/`deepseek4_tensor_dim1()`). GA now loads and
+`--inspect`s cleanly; full protocol (smoke, warm baseline, eval, calibration, decision prep)
+completed -- see `MEASUREMENTS.md`'s "GA-0731 swap unit: UNBLOCKED" entry for the complete
+writeup, including a real memory-thrashing incident found at the preview-precedent 100GB
+cache budget (corrected to 75GB for this artifact) and the resulting GA-promotion
+recommendation.

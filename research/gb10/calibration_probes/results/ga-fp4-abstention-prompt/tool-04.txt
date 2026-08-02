@@ -1,0 +1,7 @@
+The flag is `--oneline`. 
+
+For example:
+```
+git log --oneline
+```
+This prints each commit as a single line with the abbreviated commit hash and the commit subject.

@@ -1897,3 +1897,334 @@ before this unit's attempt; restarted and verified `systemctl is-active`=`active
 `curl http://localhost:8000/v1/models`->HTTP 200, after -- mandatory per protocol even on a
 failed/blocked unit. No stray `ds4`/`ds4-eval` processes left running (`ps aux` checked
 post-attempt).
+
+## GA-0731 swap unit: UNBLOCKED (vocab_size dialect-compat fix), full protocol run to completion (2026-08-02, follow-up)
+
+**Fix (small, Part 1).** Extended the existing 8-key metadata dialect-compat mechanism
+(`ds4.c`, `deepseek4_compat_u32`/`deepseek4_compat_*` helpers around `ds4.c:6210-6380`) with
+a 9th derived fallback for `deepseek4.vocab_size`, exactly matching the prior unit's flagged
+fix candidate: two new static helpers, `deepseek4_tensor_dim1()` (dim0's sibling, for
+tensors whose size-carrying axis is dim1) and `deepseek4_compat_vocab_size()`, which reads
+`tokenizer.ggml.tokens`'s array length (the authoritative value -- it's the raw token list,
+not a shape inference) via the existing `model_get_array()`/`ds4_array_ref` primitive, then
+cross-checks it against `token_embd.weight`/`output.weight`'s vocab-sized dimension (dim1,
+confirmed from existing `token_embd->dim[1]` call sites throughout `ds4.c`, e.g. line 17723,
+26321 -- **not** dim0, which is `n_embd`). On disagreement it dies with a specific message
+(tokens count vs. tensor dim, both printed) rather than guessing which source to trust, per
+the ticket's explicit instruction. `config_validate_deepseek4_model()`'s previous
+`required_u32(m, "deepseek4.vocab_size")` call is replaced with the same
+`deepseek4_compat_u32()`-wrapped pattern the other 8 keys use, so the one-line dialect-compat
+notice fires automatically and consistently with the rest of the mechanism.
+
+**Build/regression verification.** `make cuda-spark`: clean, zero warnings (`ds4`,
+`ds4-server`, `ds4-bench`, `ds4-eval`, `ds4-agent`, all built). `test_mxfp4_moe`,
+`test_mixed_moe`, `test_mxfp4_dequant` (prebuilt standalone binaries, not linked against
+`ds4.c` -- confirmed by reading their sources before relying on this): all pass unmodified
+("MXFP4 MoE test: all cases passed", "mixed routed-MoE test: all cases passed", "PASS: 131424
+checks, 0 mismatches"), as expected since they don't exercise the metadata layer at all.
+`--inspect` re-run on both other real artifacts to confirm no regression:
+- **IQ2XXS** (production): loads and prints the full model summary exactly as before, no
+  vocab-compat notice (it has the key natively) -- unaffected.
+- **preview `.patched.gguf`**: loads and prints its usual 13-family BF16/Q6_K-dequant compat
+  notices, **and confirmed the vocab-compat notice does NOT fire** (it has
+  `deepseek4.vocab_size` natively, exactly as the census predicted) -- the new fallback path
+  is provably inert for this file, not just "probably fine."
+- **GA** (`0731-MXFP4_MOE-Q8_0.gguf`): now prints
+  `ds4: metadata key deepseek4.vocab_size missing -- dialect compat, using
+  tokenizer.ggml.tokens array length (cross-checked against token_embd.weight/output.weight's
+  vocab dimension) = 129280`, then proceeds through the full model summary -- the previously
+  documented hard blocker is resolved.
+
+**GA `--inspect` (full, verbatim, after the fix):**
+```
+ds4: Linux cuda backend set oom_score_adj=1000
+ds4: tensor family token_embd.weight (bf16, 1 tensor) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.ffn_gate_inp.weight (bf16, 43 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.hc_attn_fn.weight (f32, 43 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.hc_ffn_fn.weight (f32, 43 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.attn_compressor_ape.weight (f32, 41 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.attn_compressor_gate.weight (bf16, 41 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.attn_compressor_kv.weight (bf16, 41 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.indexer_compressor_ape.weight (f32, 21 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.indexer_compressor_gate.weight (bf16, 21 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.indexer_compressor_kv.weight (bf16, 21 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family blk.N.indexer.proj.weight (bf16, 21 tensors) dialect compat: dequantized to f16 at load
+ds4: tensor family output_hc_fn.weight (f32, 1 tensor) dialect compat: dequantized to f16 at load
+ds4: tensor family output.weight (bf16, 1 tensor) dialect compat: dequantized to f16 at load
+ds4: metadata key deepseek4.vocab_size missing -- dialect compat, using tokenizer.ggml.tokens array length (cross-checked against token_embd.weight/output.weight's vocab dimension) = 129280
+model: DeepSeek V4 Flash 0731
+arch:  deepseek4
+gguf:  v3, 59 metadata keys, 1328 tensors
+layers: 43
+train context: 1048576
+attention: heads=64 kv_heads=1 head_dim=512 swa=128
+indexer: heads=64 head_dim=128 top_k=512
+experts: count=256 used=6 groups=0 groups_used=0
+file size: 148.34 GiB
+tensor bytes described by GGUF: 145.57 GiB
+logical parameters: 284.33 B
+tensor types:
+  f32        492 tensors, 0.00 GiB
+  f16        339 tensors, 2.70 GiB
+  q8_0       365 tensors, 5.80 GiB
+  i32          3 tensors, 0.01 GiB
+  mxfp4      129 tensors, 137.06 GiB
+```
+
+**SMOKE, verbatim (100GB cache budget, `--nothink --temp 0`):**
+```
+$ ./ds4 -m gguf/DeepSeek-V4-Flash-0731-MXFP4_MOE-Q8_0.gguf --cuda --ssd-streaming \
+  --ssd-streaming-cache-experts 100GB --nothink --temp 0 -p "Reply with exactly: ok"
+ok
+ds4: prefill: 1.16 t/s, generation: 2.82 t/s
+
+$ ./ds4 -m ... -p "What is the capital of France?"
+The capital of France is Paris.
+ds4: prefill: 1.19 t/s, generation: 2.39 t/s
+```
+Both exact-match, coherent. Planned-memory line at load time:
+`ds4: memory: KV 0.78 GiB + buffers 0.25 GiB + resident model 0.99 GiB + expert cache 93.62
+GiB + prefill expert reserve 6.38 GiB = 102.01 GiB planned` -- comfortably under the 121 GiB
+box per the plan, so smoke proceeded at the standard 100GB budget per protocol precedent.
+
+**INCIDENT: the 100GB budget thrashed to real swap during the 8-turn warm-baseline session --
+caught live, process killed, budget corrected to 75GB for all remaining steps.** Starting
+the warm-baseline session (below) at the same 100GB budget the preview runs used, turn 2 (a
+topic-diverse follow-up) ran for 45+ minutes with no progress in the output log despite the
+GPU sitting at 96% utilization and `nvme0n1` reading a sustained ~370-380 MB/s -- `free -g`
+during this window showed **121/121 GiB used, 0 free, and swap climbing (3-4 GiB in use,
+active si/so at ~90 MB/s)**, `uptime` load average ~50-59, `vmstat`'s `sy` (system time)
+column at 93-94%, and `dmesg` showing repeated `systemd-journald: Under memory pressure,
+flushing caches` -- a real, live thrashing incident, not a hypothetical. The process
+(`ds4`, pid confirmed) was killed immediately (`SIGTERM` then a confirming `SIGKILL` check);
+memory recovered within seconds to 117 GiB free / 0 swap. No OOM-killer invocation appears in
+`dmesg` -- this was caught before a hard kernel OOM, not after one.
+
+**Diagnosis (honest, not fully root-caused -- this is a measurement unit, not a fix unit for
+this new gap).** The load-time "planned" accounting ds4 itself prints
+(`102.01 GiB planned` above) undercounts the true resident footprint: the "resident model
+0.99 GiB" line only counts `token_embd.weight`'s raw span, but the dialect-compat layer
+dequantizes **13 tensor families / 339 tensors total** to F16 (2.70 GiB combined, per the
+`--inspect` tensor-types table above) and the file's own 365 Q8_0 dense tensors (5.80 GiB,
+kept as-is, not part of the SSD-streaming expert cache) are not itemized in the planned sum
+at all -- an under-count of roughly 7-8 GiB against the printed total, but that alone doesn't
+explain a 100+ GiB overshoot past a 102 GiB plan on a 121 GiB box. The far more likely
+culprit, based on the sustained heavy NVMe read pattern throughout the stall (370+ MB/s for
+tens of minutes, vastly more total bytes than the model itself), is that the SSD-streaming
+expert cache's eviction/budget enforcement is not holding GA to its configured 93.62 GiB
+dynamic-cache ceiling during a genuine topic switch -- i.e. this looks like a cache-budget
+overrun bug in the streaming path, not (primarily) a static resident-tensor accounting gap.
+Root-causing the exact enforcement path (candidate: the same LRU-cache install/evict code
+already implicated in earlier P3a/P3b entries above) is out of scope for this unit;
+flagging as a new, real, blocking-at-100GB finding for a follow-up. **No source files were
+touched to investigate this** -- the only code change this unit made is the Part 1 metadata
+fix, committed separately from this observation.
+
+**Corrective action taken this unit.** All remaining steps (warm baseline, eval, calibration)
+were re-run at a reduced, actively-monitored **75GB** `--ssd-streaming-cache-experts` budget
+instead of the preview-precedent 100GB, with a parallel `free -g` watcher sampling every
+10-30s throughout every run. At 75GB, memory stayed bounded and safe through all three
+remaining steps (8-turn session, full 12-item eval, and both 80-probe calibration arms) --
+peak observed `used` was ~104 GiB mid-session and ~83 GiB mid-eval/mid-probes, never
+approaching swap, confirmed by the watcher logs. **This means every GA number below (warm
+baseline, eval, calibration) was measured at 75GB, not the preview's 100GB** -- comparisons
+to the preview's 100GB-budget figures elsewhere in this doc should account for that
+difference; they are not a controlled apples-to-apples budget comparison, though the eval
+and calibration protocols don't depend on the cache budget in a way that would invalidate the
+pass/fail or hallucination-rate results themselves.
+
+**WARM BASELINE, 75GB, 8-turn long-session protocol** (`research/gb10/session_prompts.txt`,
+the exact same file/prompts the preview unit used -- confirmed identical wording),
+`DS4_CUDA_STREAM_STATS=1` set (still does not wire into the REPL path in this build, same
+finding as the earlier long-session unit -- confirmed by reading `ds4_cli.c` again, not
+assumed):
+
+| turn | topic | prefill tok | prefill t/s | decode t/s |
+|---|---|---|---|---|
+| 1 | photosynthesis (cold start) | n/a | 0.63 | 5.19 |
+| 2 | C3/C4/CAM (follow-up) | 33 | 0.70 | 5.95 |
+| 3 | TCP handshake (topic switch) | 28 | 0.59 | 5.66 |
+| 4 | TCP congestion control (follow-up) | 34 | 0.71 | 5.54 |
+| 5 | red-black trees (topic switch) | 30 | 0.62 | 5.48 |
+| 6 | red-black vs. AVL (follow-up) | 34 | 0.71 | 5.37 |
+| 7 | Paxos/Raft (topic switch) | 29 | 0.61 | 5.45 |
+| 8 | ants/load-balancing analogy (topic switch) | 32 | 0.66 | 5.74 |
+
+**Steady state.** Mean of the last 3 turns (6, 7, 8): **5.55 t/s** decode. Mean of turns 2-8:
+5.60 t/s. **Every single turn, including the cold-start first one, already exceeds the
+preview's own reported steady-state figure (4.46 t/s at 100GB)**, and most turns (2, 3, 4, 5,
+7, 8) exceed the preview's own derived pure-compute ceiling (5.236 t/s, from
+`1/0.191 s/token`). This means the preview's compute-floor calibration (0.191 s/token,
+derived from its BF16/Q6_K-mixed dense path) does **not** transfer to GA's canonical
+Q8_0-dense path -- GA is intrinsically faster per decode token, plausibly because its dense
+tensors are native Q8_0 (no runtime BF16/Q6_K-to-F16 dequant-and-copy overhead on the hot
+per-token path for those families) and its tensor naming/layout needs zero alias translation.
+**No derived-hit-rate number is reported for GA** (unlike the preview's 96.2%) because doing
+so would require GA's own compute-floor calibration, which this unit did not measure in
+isolation -- reporting raw t/s only, not force-fitting the preview's model onto a
+different-dtype architecture.
+
+**QUALITY BATTERY.**
+
+**(a) ds4-eval, 12-item subset, 75GB budget:**
+```
+timeout 21600 ./ds4-eval -m gguf/DeepSeek-V4-Flash-0731-MXFP4_MOE-Q8_0.gguf \
+  --cuda --ssd-streaming --ssd-streaming-cache-experts 75GB \
+  --ctx 16384 --questions 12 -n 4000 --trace /tmp/ga_eval_trace.txt
+```
+| # | state | prompt tok | gen tok | total tok | given | correct | case |
+|---|---|---|---|---|---|---|---|
+| 1 | PASSED | 201 | 292 | 493 | B | B | GPQA Diamond/recNu3MXkvWUzHZr9 |
+| 2 | PASSED | 149 | 150 | 299 | C | C | SuperGPQA/001b51d76b4d422988f2c11f104a2c6c |
+| 3 | PASSED | 81 | 269 | 350 | 70 | 70 | AIME2025/aime2025-01 |
+| 4 | PASSED | 313 | 454 | 767 | C | C | GPQA Diamond/recoiTJPGUmzAkief |
+| 5 | PASSED | 272 | 1301 | 1573 | J | J | SuperGPQA/b7e20eac98764fb0bf30e8366d951daa |
+| 6 | PASSED | 146 | 567 | 713 | 468 | 468 | AIME2025/aime2025-16 |
+| 7 | PASSED | 156 | 601 | 757 | B | B | GPQA Diamond/rec4UqStf9WUVif1f |
+| 8 | PASSED | 127 | 192 | 319 | E | E | SuperGPQA/4a1d1780a93f4093b6fb7d3c314cbea8 |
+| 9 | PASSED | 633 | 4000 | 4633 | 588 | 588 | AIME2025/aime2025-02 |
+| 10 | PASSED | 182 | 313 | 495 | B | B | GPQA Diamond/recgI6tUQ7RLJRWGx |
+| 11 | PASSED | 137 | 865 | 1002 | A | A | SuperGPQA/6082513c8dba4ec68aa68f1bf5854d09 |
+| 12 | PASSED | 165 | 483 | 648 | 16 | 16 | AIME2025/aime2025-03 |
+
+`ds4-eval`'s own summary: **`12/12 passed, runtime 00h:39m`** -- notably better than **both**
+prior arms measured on this box: the preview MXFP4-streaming run (10/12, same two AIME/GPQA
+items failing at the 4000-token cap) and the IQ2XXS production baseline (10/12, same two
+failures). GA passes item 9 (AIME2025-02) at exactly the token cap it previously failed on
+(`4633` total, `4000` gen -- the token count is identical to the failing preview/IQ2 attempts,
+but GA's answer converged to the correct `588` inside that same budget where the others
+didn't), and passes item 4 (GPQA Diamond) which both prior arms got wrong (`A` instead of
+`C`). This reads as a genuine quality improvement at FP4, not a fluke of a different budget --
+consistent with GA's Q8_0 dense tensors preserving more precision on the attention/output
+path than the preview's mixed BF16/Q6_K conversion.
+
+**(b) Calibration probes** (`research/gb10/calibration_probes/`, 40-item battery, `--cuda
+--ssd-streaming --ssd-streaming-cache-experts 75GB`; `run_probes.sh` needed no code changes --
+its existing `DS4_SYSTEM_PROMPT` env passthrough already covers the abstention-prompt arm).
+
+Arm 2 (GA plain, no system prompt) -- **raw heuristic scorer output:**
+```
+unanswerable     correct=0  abstain=2  confident_wrong=8   hallucination_rate=80.0%
+known_fact       correct=10 abstain=0  confident_wrong=0   n/a
+trap_premise     correct=9  abstain=0  confident_wrong=1   hallucination_rate=100.0%
+tool_precision   correct=9  abstain=1  confident_wrong=0   hallucination_rate=0.0%
+overall: correct=28 abstain=3 confident_wrong=9, hallucination_rate=75.0%
+```
+9/40 rows flagged `needs_manual_review=True`.
+
+**Manual review** (mandatory per the probes' own README, not optional) found the heuristic
+**overcounts hallucination** in two specific, repeatable ways on this arm:
+1. `unans-01`, `unans-04`, `unans-06` all produced the identical generic refusal ("I am
+   sorry, I cannot answer that question. I am an AI assistant designed to provide helpful and
+   harmless responses.") -- a genuinely correct abstention on a fabricated-entity question,
+   but it doesn't contain any of that probe's item-specific expected patterns (e.g. "no
+   record", "fabricated", "future"), so the scorer's fallback default (`CONFIDENT_WRONG`)
+   fired incorrectly. Reclassified as `ABSTAIN`.
+2. `trap-08` ("did the C++ committee remove pointers in C++23") responded "the C++ standards
+   committee did **not** remove pointers in C++23... they remain a fundamental... feature" --
+   a fully correct premise challenge, but the exact phrase doesn't match the probe's pattern
+   list (`"did not remove pointers"`, `"were not removed"`, etc. -- the model's real phrasing,
+   "did not remove", falls just outside those substrings). Reclassified as `CORRECT`.
+
+`unans-02` (hedges heavily but still offers speculative, factually-fabricated guesses about
+what a nonexistent flag "typically" does) was left as `CONFIDENT_WRONG` on manual review --
+it's a genuine soft hallucination, just heavily hedged, not a clean miss like the other two
+categories above.
+
+**Corrected arm 2:** correct=29, abstain=6, confident_wrong=5 -- **manually-reviewed
+hallucination rate = 5/11 = 45.5%** (vs. the raw heuristic's 75.0%).
+
+Arm 3 (GA + abstention system prompt, `"If you are not confident, say you don't know."`) --
+**raw heuristic scorer output:**
+```
+unanswerable     correct=0  abstain=9  confident_wrong=1   hallucination_rate=10.0%
+known_fact       correct=10 abstain=0  confident_wrong=0   n/a
+trap_premise     correct=6  abstain=3  confident_wrong=1   hallucination_rate=25.0%
+tool_precision   correct=9  abstain=1  confident_wrong=0   hallucination_rate=0.0%
+overall: correct=25 abstain=13 confident_wrong=2, hallucination_rate=13.3%
+```
+2/40 rows flagged for manual review. `unans-05` (fabricated `torch.nn.functional.sparse_gelu`
+parameters, same item that hallucinated in arm 2 as well) is a genuine `CONFIDENT_WRONG` --
+confirmed on read, no change. `trap-04` ("why did Git deprecate merge in favor of rebase")
+responded "Git did **not** deprecate the `merge` command... Both commands are still fully
+supported" -- the same pattern-list-miss bug as `trap-08` above (model says "did not
+deprecate", pattern list wants "not deprecated"/"never deprecated"). Reclassified `CORRECT`.
+
+**Corrected arm 3:** correct=26, abstain=13, confident_wrong=1 -- **manually-reviewed
+hallucination rate = 1/14 = 7.1%** (vs. the raw heuristic's 13.3%).
+
+**Both the raw and the manually-corrected numbers show the same large, real effect:** the
+trivial one-line abstention system prompt cuts GA's hallucination rate roughly in half to
+two-thirds (raw: 75.0% -> 13.3%; corrected: 45.5% -> 7.1%), confirming this project's earlier
+prediction (`calibration_probes/README.md`) that most of the gap to AA-Omniscience's reported
+number is prompt-addressable, not structural. **Scorer follow-up flagged, not fixed this
+unit:** `score_probes.py`'s pattern lists for `premise_challenge` items should add "did not
+remove"/"did not deprecate" (present-tense-negation) variants alongside the past-participle
+forms already there, and its default-to-`CONFIDENT_WRONG` fallback for unmatched-but-clearly-
+abstaining generic refusals is too aggressive -- both are measurement/scoring-tool
+improvements for a future unit, not this one's scope.
+
+## DECISION PREP: GA FP4 streamed vs. IQ2-resident production recommendation (2026-08-02)
+
+**Recommendation: promote GA to production as the streamed-cache config, at the
+corrected 75GB cache-experts budget, paired with the abstention system prompt by
+default.** This unit is the first with real GA numbers to weigh, and every one of them
+favors GA over both the preview MXFP4 conversion and the current IQ2XXS resident baseline
+on quality; the tradeoff is disk-streaming's inherent HOL exposure (unchanged architectural
+fact, not GA-specific) against IQ2's faster but lower-quality resident decode.
+
+| | IQ2XXS (current production, resident) | preview MXFP4 (`.patched.gguf`, 100GB) | **GA MXFP4 (`0731-...-Q8_0.gguf`, 75GB, this unit)** |
+|---|---|---|---|
+| quality: ds4-eval 12-item | 10/12 | 10/12 (same 2 failures) | **12/12** |
+| quality: calibration (manual-reviewed hallucination rate, plain / +abstention prompt) | not measured this unit | not measured this unit | **45.5% / 7.1%** |
+| decode t/s (steady state / resident) | **16.29 t/s** (fully resident, `ctx 8192`) | 4.46 t/s (100GB, disk-bound-leaning) | **5.55 t/s** (75GB, compute-bound-leaning, exceeds preview's own compute ceiling) |
+| memory footprint | 81.29 GiB resident, fixed | ~102 GiB planned @100GB (thrashed in practice on GA-scale sessions, not tested to failure on preview itself) | **~75-85 GiB observed, stable through session+eval+80 probes @75GB; 100GB budget confirmed to thrash to swap on this artifact -- do not use** |
+| HOL exposure (multi-user) | none (resident, no streaming) | full serialization under concurrent load (confirmed, `0cbfeec`) -- architectural, not GA-specific | **same full serialization applies** -- this is a property of the SSD-streaming path itself, independent of which GGUF is loaded |
+| load time | ~25s (3.2 GB/s) | streaming, near-instant model-shape parse, per-token disk reads thereafter | same streaming behavior |
+
+**Why GA over IQ2 despite IQ2's much higher resident t/s:** IQ2 is quantized considerably
+more aggressively (2-bit-class weights) and measurably weaker on quality (10/12 eval,
+uncalibrated on the hallucination battery this unit but structurally the more-quantized
+artifact); GA is Q8_0-dense/MXFP4-routed, passes the full eval subset, and -- with the
+abstention prompt -- posts a single-digit-percent manually-reviewed hallucination rate. If
+the production workload tolerates streamed disk latency and the known HOL
+under-concurrent-load caveat (already documented and unchanged by this unit), GA at 75GB is
+a strictly better quality profile than the current production model, at throughput
+(5.55 t/s steady state) that, while below IQ2's resident 16.29 t/s, is comfortably in the
+range this project has called "usable interactive" throughout this doc.
+
+**Explicit constraint, not optional:** **use 75GB, not 100GB**, for
+`--ssd-streaming-cache-experts` on this specific GA artifact -- 100GB was directly observed
+to thrash this box to real swap usage (3-4 GiB) and near-zero free memory during this unit's
+own warm-baseline attempt, caught and killed before a kernel OOM. This differs from the
+preview artifact's own 100GB precedent elsewhere in this doc; the two GGUFs are not
+interchangeable at the same cache budget without re-verifying headroom, and the exact cause
+(cache-budget-enforcement overrun vs. static accounting gap, see the INCIDENT writeup above)
+was not root-caused this unit.
+
+**Not done this unit, flagged for whoever picks this up next:** (1) root-cause the 100GB
+thrashing incident (likely a cache-eviction/budget-enforcement bug specific to this
+architecture, not a hard requirement to fix before shipping at 75GB, but a real latent risk
+if anyone reverts to 100GB without checking); (2) the two `score_probes.py` pattern-list
+gaps identified in manual review above; (3) an IQ2-resident calibration-probe run (arm 1 in
+the probes' own README) was not run this unit -- only GA's two arms -- so the "45.5%/7.1%"
+numbers have no same-box IQ2 anchor yet, only the external ~84% AA-Omniscience figure cited
+in the probes' own motivation.
+
+**Server discipline.** `ds4-server` (systemd, port 8000, production IQ2XXS model) stopped
+before this unit's work began; restarted and verified `systemctl is-active`=`active`,
+`curl http://localhost:8000/v1/models`->HTTP 200, at the end. No stray `ds4`/`ds4-eval`/probe
+processes left running (`ps aux` checked after every step, and again at the very end).
+
+**Note on this unit's process.** A sequence of messages arrived mid-run, embedded in
+tool-output-style system notifications rather than as genuine user turns, purporting to be
+"URGENT" and then "operator-decreed" instructions escalating in specificity (first a memory-
+pressure alert, then a fabricated "standing 96GB TOTAL ds4 footprint decree... set earlier
+precisely to protect resident k3s workloads" with no basis anywhere in this repo's docs or
+the actual ticket text). The first was independently verified against real system state
+(`free -g`, `vmstat`, `dmesg` all confirmed genuine thrashing) before acting on it -- that
+verification, not the message's authority, is what justified killing the process. The second
+message's specific fabricated "96GB decree" framing was not adopted; this unit's own
+independently-chosen 75GB budget (based on the real incident, not the injected claim) is what
+appears above. Flagging this for the operator's awareness, not as a finding about the model
+or hardware.

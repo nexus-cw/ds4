@@ -1,0 +1,9 @@
+{
+  "run_label": "ga-fp4-abstention-prompt",
+  "ds4_bin": "./ds4",
+  "model": "gguf/DeepSeek-V4-Flash-0731-MXFP4_MOE-Q8_0.gguf",
+  "extra_flags": "--cuda --ssd-streaming --ssd-streaming-cache-experts 75GB",
+  "system_prompt": "If you are not confident, say you don't know.",
+  "max_tokens": 300,
+  "started_at": "2026-08-02T15:48:07.892375"
+}
