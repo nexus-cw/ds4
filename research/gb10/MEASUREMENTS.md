@@ -2228,3 +2228,139 @@ message's specific fabricated "96GB decree" framing was not adopted; this unit's
 independently-chosen 75GB budget (based on the real incident, not the injected claim) is what
 appears above. Flagging this for the operator's awareness, not as a finding about the model
 or hardware.
+
+## Matched-drafter A/B unit: BLOCKED at pairing-load, new tensor-naming detection gap (2026-08-02)
+
+**Scope of this unit.** A/B the GA-matched DSpark drafter
+(`gguf/DeepSeek-V4-Flash-0731-DSpark-Drafter-MXFP4-Q8_0.gguf`, 10.9 GB, alessandrobologna
+build) against the GA main artifact (`gguf/DeepSeek-V4-Flash-0731-MXFP4_MOE-Q8_0.gguf`,
+`--ssd-streaming --ssd-streaming-cache-experts 75GB`, the verified-stable GA budget from the
+prior unit) via `--mtp FILE --dspark`, per the `5d032d7` gate-fix that allows `--mtp`/
+`--dspark` under `--ssd-streaming`. `ds4-server` (systemd, production IQ2XXS) stopped first;
+restarted and re-verified at the end (mandatory, done regardless of outcome below).
+
+**Memory plan (before running).** `free -g` pre-run: 121 total, 4 used, 108 free, 117
+available (server freshly stopped). Planned footprint: 75GB GA cache budget (~75-85 GiB
+observed resident in the prior unit) + ~11 GiB for the drafter's own resident (non-streamed;
+`--mtp` loads the support model through the normal, non-streaming path, confirmed by reading
+the `ds4_engine_open()` comment at `ds4.c:56894-56896`) = **~86-96 GiB planned**, comfortably
+inside the 121 GiB box with the required >10 GiB margin. This plan was never exercised to
+completion -- see below -- but the drafter never got far enough into loading to threaten it;
+`free -g` stayed at 4 GiB used / 108 GiB free throughout the failed attempt (watcher log
+confirms no movement across three 5s samples).
+
+**Result: BLOCKED at pairing-load, before any smoke/A-B step.** Command run:
+```
+$ DS4_DSPARK_SPEC_LOG=1 DS4_CUDA_STREAM_STATS=1 ./ds4 \
+    -m gguf/DeepSeek-V4-Flash-0731-MXFP4_MOE-Q8_0.gguf \
+    --cuda --ssd-streaming --ssd-streaming-cache-experts 75GB \
+    --mtp gguf/DeepSeek-V4-Flash-0731-DSpark-Drafter-MXFP4-Q8_0.gguf --dspark \
+    --nothink --temp 0 -p "Reply with exactly: ok"
+```
+fails during drafter load, before any generation, with:
+```
+ds4: tensor family dspark.0.ffn_gate_inp.weight (f32, 1 tensor) dialect compat: dequantized to f16 at load
+ds4: tensor family dspark.0.hc_attn_fn.weight (f32, 1 tensor) dialect compat: dequantized to f16 at load
+ds4: tensor family dspark.0.hc_ffn_fn.weight (f32, 1 tensor) dialect compat: dequantized to f16 at load
+ds4: tensor family dspark.1.ffn_gate_inp.weight (f32, 1 tensor) dialect compat: dequantized to f16 at load
+ds4: tensor family dspark.1.hc_attn_fn.weight (f32, 1 tensor) dialect compat: dequantized to f16 at load
+ds4: tensor family dspark.1.hc_ffn_fn.weight (f32, 1 tensor) dialect compat: dequantized to f16 at load
+ds4: tensor family dspark.2.ffn_gate_inp.weight (f32, 1 tensor) dialect compat: dequantized to f16 at load
+ds4: tensor family dspark.2.hc_attn_fn.weight (f32, 1 tensor) dialect compat: dequantized to f16 at load
+ds4: tensor family dspark.2.hc_ffn_fn.weight (f32, 1 tensor) dialect compat: dequantized to f16 at load
+ds4: tensor family dspark.hc_head_fn.weight (f32, 1 tensor) dialect compat: dequantized to f16 at load
+ds4: unsupported --mtp support model gguf/DeepSeek-V4-Flash-0731-DSpark-Drafter-MXFP4-Q8_0.gguf (detected=none); expected legacy MTP or DSpark tensors
+```
+Exit code 1, no smoke/A-B numbers obtained. `--dspark-strict` would fail identically --
+`support_model_detect()` runs unconditionally in `ds4_engine_open()` before either `--dspark`
+flag variant is consulted (`ds4.c:56901-56941`), so this is not a confidence/strictness
+question.
+
+**Root cause (identified, not fixed this unit).** `support_model_detect()`
+(`ds4.c:2836-2861`) recognizes a DSpark support model only if `model_dspark_summary()`
+(`ds4.c:2615-2683`) finds `s.stages >= 3` *and* `has_main_proj`/`has_markov_head`/
+`has_confidence_head` all true. Those three per-tensor flags are set **only** inside a loop
+that first calls `ds4_tensor_mtp_stage()`, which requires the tensor name to literally
+**start with `"mtp."`** (`ds4.c:2597-2598`) before checking for `.main_proj.`/`.main_norm.`/
+`.markov_head.`/`.confidence_head.` substrings -- i.e. detection is hardwired to a
+`mtp.<stage>.<component>` per-stage tensor-naming convention.
+
+This artifact (confirmed via `strings` over the raw GGUF -- `--inspect` itself refuses to
+load it, it lacks `deepseek4.block_count`, a main-model-only key, as expected for a support
+file) uses a **different naming convention entirely**: per-stage tensors are named
+`dspark.<stage>.<component>` (e.g. `dspark.0.ffn_gate_inp.weight`, `dspark.1.attn_kv.weight`)
+and the shared/global head tensors are **top-level, not stage-prefixed**:
+`dspark.main_proj.weight`, `dspark.main_norm.weight`, `dspark.confidence_head.weight`,
+`dspark.hc_head_fn/base/scale.weight`, plus a **two-matrix Markov head**
+(`dspark.markov_w1.weight` + `dspark.markov_w2.weight`) where the detector expects a single
+`.markov_head.`-named tensor. Full tensor list confirms 3 stages (`dspark.0/1/2.*`, matching
+`dspark.layer_count`) with a complete attention+FFN+MoE block per stage (`attn_kv`,
+`attn_q_a/b`, `ffn_gate/up/down_exps`, `ffn_gate/up_down_shexp`, etc. -- this is a real,
+fully-specified 3-stage DSpark drafter, not a truncated or corrupt file), plus the expected
+scalar metadata keys (`dspark.block_size`, `dspark.markov_rank`, `dspark.noise_token_id`,
+`dspark.target_layer_ids`, `dspark.recipe_version`) which **do** get picked up correctly by
+`model_dspark_summary()`'s separate metadata-key lookup (the `dspark.*`-prefixed key
+variants are already in its `block_keys`/`markov_keys`/`noise_keys`/`target_keys` arrays) --
+`s.has_metadata` is true. It is specifically the **per-tensor stage/head detection loop**
+that never fires for this file, because none of its tensor names start with the literal
+prefix `"mtp."`.
+
+This reads as a genuine, narrowly-scoped tensor-naming-convention gap in
+`support_model_detect()` -- the same class of "new artifact, new dialect, detector doesn't
+generalize" issue this doc has hit twice before (the GA `vocab_size` gap, the earlier
+`--ssd-streaming`/`--mtp` wiring gate) -- **not** a repeat of the preview-era community
+drafter's acceptance-rate mismatch, and **not** a memory or measurement-protocol problem.
+Whether `dspark.markov_w1`/`dspark.markov_w2` is a drop-in equivalent to the detector's
+assumed single `markov_head` tensor (e.g. a rank decomposition) needs someone who understands
+the DSpark head's math to confirm before wiring it up -- not a change to make blind inside a
+measurement unit.
+
+**No source files were touched to investigate or fix this** -- confirmed via `ps aux` (no
+stray `ds4` processes) and `free -g` (memory never moved past the pre-run baseline) that this
+unit's only footprint was the one failed load attempt above.
+
+**Consequence for this unit's remaining steps.** Steps 3 (pairing smoke), 4 (8-turn warm A/B
+across no-drafter / default-confidence / confidence-0.0 arms), and 5 (verdict: does the
+matched drafter beat 5.55 t/s) were **not attempted** -- `--mtp` fails identically and
+immediately regardless of `--dspark-confidence`/`--dspark-strict`, so every one of those
+arms would fail the same way. **No decode-t/s-with-drafter numbers exist as a result of this
+unit** -- this differs from the preview-era spike (which loaded fine but showed near-zero
+acceptance); this artifact never gets past load-time detection at all on this `ds4` build.
+
+**PRODUCTION CONFIG BLOCK (drafter deferred; GA-without-drafter promotion unaffected).**
+The verdict on the matched drafter is **undetermined, not negative** -- this is a detection
+bug blocking measurement, not evidence the drafter is a bad match like the preview community
+artifact. The already-established GA-without-drafter recommendation from the prior unit
+("DECISION PREP" above) is unaffected and is what should ship now; drafter pairing is a
+follow-up once the naming-convention gap is closed. Copy-paste `ExecStart`, no `--mtp`/
+`--dspark` (not yet functional against this artifact):
+```
+ExecStart=/home/jacinta/src/ds4/ds4-server \
+  -m /home/jacinta/src/ds4/gguf/DeepSeek-V4-Flash-0731-MXFP4_MOE-Q8_0.gguf \
+  --cuda --ssd-streaming --ssd-streaming-cache-experts 75GB \
+  --host 0.0.0.0 --port 8000 --ctx 65536 --batched-session 2 \
+  --kv-disk-dir /home/jacinta/.ds4/kv
+```
+**Note: the 75GB budget was only verified at `--ctx 16384` (eval) and default ctx (warm
+session) in the prior unit, not at `--ctx 65536`** -- KV scales with ctx, so re-confirm
+headroom (`free -g` through first load, watch for the same class of cache-budget-overrun
+this doc's 100GB incident found) before treating 65536 as validated at 75GB; it was not
+re-tested this unit since the drafter blocker preempted reaching that step. The abstention
+system prompt (`"If you are not confident, say you don't know."`, cuts manually-reviewed
+hallucination rate from 45.5% to 7.1% per the prior unit's calibration probes) lives in
+**litellm config, not a ds4 flag** -- set it there, not on this `ExecStart` line.
+
+**Recommended follow-up (not this unit's scope):** extend `support_model_detect()`'s
+per-tensor stage-detection loop to also recognize `dspark.<stage>.<component>` naming (not
+just `mtp.<stage>.<component>`), and confirm with whoever built this artifact (or by reading
+the DSpark reference implementation) whether `markov_w1`/`markov_w2` is the intended
+representation for what the detector currently expects as a single `markov_head` tensor,
+before wiring acceptance. Once that lands, re-run this unit's full protocol (steps 3-6)
+from scratch -- nothing measured here should be treated as a preview of what the pairing
+would show once it loads.
+
+**Server discipline.** `ds4-server` (systemd, port 8000, production IQ2XXS model) stopped
+before this unit's attempt; restarted and verified `systemctl is-active`=`active`,
+`curl http://localhost:8000/v1/models`->HTTP 200 (after ~10-15s reload, consistent with prior
+units), at the end. No stray `ds4` processes left running throughout (`ps aux` checked
+during and after).
