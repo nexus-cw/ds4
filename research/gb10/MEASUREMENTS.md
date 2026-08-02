@@ -2364,3 +2364,92 @@ before this unit's attempt; restarted and verified `systemctl is-active`=`active
 `curl http://localhost:8000/v1/models`->HTTP 200 (after ~10-15s reload, consistent with prior
 units), at the end. No stray `ds4` processes left running throughout (`ps aux` checked
 during and after).
+
+## PROMOTION EXECUTED: GA-0731 MXFP4 streamed is now production (2026-08-02)
+
+Carried out the "PRODUCTION CONFIG BLOCK" recommendation above (drafter still
+deferred, unaffected by this unit -- see the matched-drafter-A/B section).
+`ds4-server` on robo-dog now runs the GA-0731 MXFP4 streamed-cache config in
+place of the resident IQ2XXS quant.
+
+**Final `ExecStart`** (systemd unit at `/etc/systemd/system/ds4-server.service`,
+also tracked at `hosts/robo-dog/ds4-server.service` in the `carriedworld-cloud`
+IaC repo):
+```
+ExecStart=/home/jacinta/src/ds4/ds4-server \
+  -m /home/jacinta/src/ds4/gguf/DeepSeek-V4-Flash-0731-MXFP4_MOE-Q8_0.gguf \
+  --cuda --ssd-streaming --ssd-streaming-cache-experts 75GB \
+  --host 0.0.0.0 --port 8000 --ctx 32768 --batched-session 2 \
+  --kv-disk-dir /home/jacinta/.ds4/kv
+```
+
+**Deviation from this doc's own recommendation, deliberate:** `--ctx 32768`,
+not the `65536` shown above. That number was explicitly flagged in this doc
+as *not re-tested* at 75GB (only 16384/default-ctx were verified stable) --
+raising context is deferred to a follow-up unit that re-validates headroom at
+75GB before using 65536 in production. 32768 still comfortably covers
+agentic sessions and only adds ~1.5GB KV/session over the verified 16384
+baseline.
+
+**Memory watch through load + two test generations:** `free -g` sampled every
+2-5s from `daemon-reload`+`restart` through both generations. System-wide
+free memory never dropped below **40GB** (low point 40GB free / 52GB
+available, after the first generation warmed the streaming cache; it sat at
+96GB free immediately after restart since the streamed model doesn't front-
+load into RAM). This is comfortably above the required >10GB floor -- **no
+rollback to a 70GB cache budget was needed.**
+
+**End-to-end verification:**
+- `GET /v1/models` -> HTTP 200, served model id **`deepseek-v4-flash`**
+  (`deepseek-v4-pro` is also listed as an alias to the same backend),
+  `context_length: 32768` confirming the `--ctx` flag took effect.
+- Chat completion, prompt "Reply with exactly: ok", `temperature=0`:
+  first call (`max_tokens=50`, cold streaming cache) hit the token cap mid-
+  reasoning without reaching the final answer (finish_reason `length`) --
+  expected, not a bug, just an undersized cap for this model's reasoning
+  style; second call (`max_tokens=200`) completed cleanly: `reasoning_content`
+  held the chain-of-thought, `content` held exactly `"ok"`, `finish_reason`
+  `stop`. **`reasoning_content`/`content` separation confirmed working** on
+  the GA config.
+- **Timing:** second (warm-cache) call: 57 completion tokens in 9.69s wall
+  time = **~5.88 t/s effective decode**, in line with the 5.55 t/s steady-
+  state figure this doc measured for the same 75GB config above. First
+  (cold-cache) call: 50 tokens in 26.36s (~1.9 t/s) -- slower, consistent
+  with streaming-cache warm-up cost on the very first request after restart,
+  not a steady-state number.
+
+**litellm (dMon, `model-stack` namespace): NOT updated this unit, flagging a
+premise mismatch rather than guessing.** The ticket for this promotion
+assumed a `code`/`general`/`control`/`ds4-flash` set of litellm aliases
+already pointed at `ds4-server` (`http://100.92.111.3:8000/v1`). Checked the
+live `litellm-config` ConfigMap (backed up to
+`/tmp/litellm-config-preGA.yaml.bak` on dMon before checking) and the
+tracked `hosting/services/litellm.yaml` in `carriedworld-cloud`: neither has
+any alias referencing port 8000 or a model named `ds4-flash`;
+`code`/`general`/`control` currently route to `vllm-ornith` on a different
+NodePort (30801), and `git log -p` on `litellm.yaml` shows port 8000/`ds4`
+were never referenced in this repo's history either. Whether to add a new
+alias, repoint an existing one, and how to wire the abstention system prompt
+(`"If you are not confident, say you don't know."`, cuts the manually-
+reviewed hallucination rate from 45.5% to 7.1% per the DECISION PREP unit
+above) into litellm is a routing/config decision outside a promotion unit's
+scope -- left for the operator/orchestrator, not guessed at here. litellm
+itself was left running unmodified; no restart performed.
+
+**Server discipline.** `ds4-server` (systemd, port 8000) stopped before the
+unit-file swap, `daemon-reload`d, restarted on the new `ExecStart`; verified
+`systemctl is-active`=`active` and `curl http://localhost:8000/v1/models`->
+200 throughout. The prior IQ2XXS resident config and its gguf file were left
+untouched on disk; the new unit file documents the one-line `ExecStart`
+rollback inline. No stray `ds4`/probe processes observed (`ps aux` clean
+after the run).
+
+**IaC.** `carriedworld-cloud` (dMon, branch
+`infra/sovereign-data-node-2026-07-04`): added `hosts/robo-dog/ds4-server.service`
+(no prior host-level-unit tracking convention existed in this repo, so also
+added `hosts/robo-dog/README.md` documenting that these files are DR/
+reference tracking only, not auto-synced) and committed as `ee5c976`
+("Track the robo-dog ds4-server systemd unit and promote it to the GA-0731
+streamed MXFP4 config"). The litellm ConfigMap was not changed, so no litellm
+IaC diff exists this unit. Not pushed, per instructions -- operator pushes
+that repo.
