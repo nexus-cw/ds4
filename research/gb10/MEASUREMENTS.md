@@ -3690,3 +3690,70 @@ RELATIVE, same-protocol -- promote a smaller budget when the warm-steady cost is
 <= 3 percent per ~5 GiB freed under the manual-REPL protocol, with an absolute
 floor of 5.2 t/s warm-steady. The 70GB result (-1.4 percent, 5.35 t/s, 5.4 GiB
 freed) passes; 70GB PROMOTED to production 2026-08-03 (authority commit ae73291).
+
+## Task 18: expert-cache budget under-accounting -- audit, byte-enforcement fix, self-report (2026-08-03)
+
+**Bug evidence reconciled.** Two divergences, one accounting gap:
+
+- The "63.61 GiB / 5109 experts" figure at the 70GB setting is the boot-time
+  PLAN line (`ds4.c:55179`), not a measurement: 70 GiB = 6.38 GiB prefill
+  headroom + 63.61 GiB dynamic cache. It sits below nominal by construction
+  (headroom subtracted), so it was never evidence the cache fits.
+- The 2026-08-02 GA-thrash incident (100GB setting -> ~121GB observed) is the
+  count-only enforcement overshooting: the byte budget is converted to an
+  expert COUNT using the dominant slab size class
+  (`ds4.c:5328 ds4_streaming_cache_experts_for_byte_budget`, class chosen at
+  `ds4.c:5208`), but the CUDA LRU (`ds4_cuda.cu`, commit 416533c) deliberately
+  caches EVERY routed layer at its actual per-expert size -- including
+  off-slab-class ("boosted"/bypass) layers with larger quants -- while the
+  eviction loop (`cuda_stream_expert_cache_prune_global`) compared only
+  `entry_count > budget_experts`. N larger-than-class entries = more bytes
+  than N * class_bytes. On top of that, the P3b pool (ac01189) parked freed
+  device buffers on per-size free lists with no accounting at all, and
+  system-level subtraction also swept in non-cache categories (pinned-host
+  staging pools, KV arenas) that were never part of the cache budget.
+
+**AUDIT table (byte sources in the CUDA streaming-cache path, 70GB setting):**
+
+| source | file:line (research/gb10 654840c) | counted before | actual | disposition |
+|---|---|---|---|---|
+| LRU entry device buffers (gate/up/down per (layer,expert)) | ds4_cuda.cu `cuda_stream_expert_cache_install` | entry COUNT only (vs count budget) | sum of actual per-entry bytes; off-class layers > slab class | now charged at actual bytes vs byte budget |
+| P3b pool free lists (parked evicted buffers) | ds4_cuda.cu `cuda_stream_expert_pool_free/alloc` | not counted | real cudaMalloc'd device memory | now counted as `pool_parked`, inside budget |
+| cudaMalloc granularity/alignment per buffer | driver | not counted | <=512B per multi-MiB buffer, negligible (<0.01%) | documented, not charged |
+| host-side entry metadata table | ds4_cuda.cu `g_cuda_expert_cache` (80x384 entries) | not counted | ~3 MiB host RAM, static | documented, not charged |
+| pinned staging: model upload pool (4x), selected-expert pool (4x), xdev bounce | ds4_cuda.cu `g_model_stage_raw` / `g_stream_selected_stage_raw` / `g_xdev_bounce` | not counted anywhere | 0.500 GiB measured at 70GB | separate category, reported as `pinned_host` |
+| same-call packed staging (`g_stream_selected_cache`) | ds4_cuda.cu | not counted | bounded by per-call selected set | transient working buffer, not cache budget |
+| prefill headroom / full-layer prefix / KV arenas | ds4.c budget plan / kvstore | planned separately | separate | correctly outside "dynamic cache"; belongs to the 70GB total plan, not the LRU |
+
+**FIX (commits 64c7dd7 + 654840c, research/gb10):** valid entries are charged
+at actual gate+up+down bytes; pool free-list bytes are counted as parked; the
+nominal byte budget is `budget_experts * slab_bytes` (exactly the planned
+"dynamic cache" GiB); installs make room BEFORE allocating, trimming parked
+pool buffers first, then evicting LRU, so `counted + parked <= budget` at all
+times. Parked bytes up to the incoming request are treated as reusable slack --
+the first cut double-counted them and reintroduced the P3b malloc/free churn
+at cap (measured ~3.7 t/s manual-protocol vs 4.5 expected; 654840c fixes it).
+The count cap remains as a secondary bound.
+
+**OBSERVABILITY:** `DS4_CUDA_STREAM_STATS=1` now self-reports every 4096 fetch
+calls (~90 decode tokens):
+`ds4: CUDA streaming expert-cache memory: budget=63.613 GiB counted=63.613 GiB
+pool_parked=0.000 GiB device_total=63.613 GiB pinned_host=0.500 GiB entries=5109`
+
+**VERIFY at 70GB (manual instance, robo-dog, this model MXFP4-uniform):**
+device_total held exactly at budget (63.613 GiB) across all samples, entries
+pinned at 5109, hit rate 0.86 -> 0.92 warming, MemAvailable steady ~34-36 GB.
+Warm turns 4.39-4.54 t/s END-TO-END (elapsed incl. prefill); back-computed
+decode-only ~5.35 t/s (128 tok: 23.9s decode at 5.35 + ~4.5s prefill = 28.4s
+observed) -- consistent with the A/B baseline, no regression. Note the uniform
+model exercises the accounting but not the off-class overshoot itself; a mixed
+quant (the incident's config) is where actual would previously exceed nominal.
+
+**PR #647 (cuda-expert-lru) assessment:** the branch carries the same
+count-only enforcement and unaccounted pool -- the bug exists upstream. A
+cherry-pick of 64c7dd7 does NOT apply cleanly (conflicts in the stats block
+and the pinned-host reporting, which references gb10-only staging globals);
+a small manual backport is needed. Not pushed upstream per task scope.
+
+Production restored after measurement: service active, `/v1/models` 200, chat
+smoke OK, 70GB budget unchanged.
