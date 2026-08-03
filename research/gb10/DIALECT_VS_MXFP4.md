@@ -93,6 +93,25 @@ PR. Separately, plan a re-derivation (not rebase) of the DSpark
 greedy-identity fix on top of upstream's replay-free verifier before
 ds4f-mxfp4 reaches main. No filings made; analysis only.
 
+## Filed upstream (2026-08-03)
+
+The two-PR series from (b) is filed against antirez/ds4 base ds4f-mxfp4:
+
+- Issue 1 metadata and tensor-name compat: https://github.com/antirez/ds4/issues/661
+- PR 1 branch dialect-compat-metadata, picks 9c4b760 99e7f1a f7ec45f:
+  https://github.com/antirez/ds4/pull/662
+- Issue 2 dense tensor types: https://github.com/antirez/ds4/issues/663
+- PR 2 branch dialect-compat-dense-types stacked on PR 1, picks 3106c3c
+  0528b32 6a4644e: https://github.com/antirez/ds4/pull/664
+
+Deviation from the table above: 6a4644e no longer applies clean -- the
+ds4f-mxfp4 tip 4893e0c already guards the single-token decode-graph qkv
+dispatch, with explicit Q8_0 type checks on the fused pair kernel and
+metal_graph_matmul_dense_quant_tensor for the non-pair path, so the hazard
+in (c) is fixed upstream on this branch and the guard half of 6a4644e was
+dropped; only the dequantize_row_q6_K per-block offset fix is carried.
+Both branches build make cpu clean with no new warnings.
+
 ## Follow-up: 74e8f11 greedy-identity analysis (2026-08-03)
 
 Read 74e8f11 in full plus the surrounding verify path on the ds4f-mxfp4 tip
