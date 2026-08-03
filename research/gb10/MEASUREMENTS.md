@@ -3811,3 +3811,17 @@ unit, deferred. Mixed prefill+decode batches
 (`ds4_sessions_eval_batch_with_prefill`) exist in the library but are not
 wired into the server -- also deferred; interleaving already bounds prefill
 stalls to one 128-token quantum.
+
+### Cross-session router-overlap probe (2026-08-04, task #25 go/no-go)
+
+Method: aligned decode steps from the three routing traces treated as three
+concurrent sessions; per (step, layer), compare summed per-session expert
+selections vs the distinct union — the weight-read saving a fused
+multi-sequence decode kernel could capture.
+
+Result: batch-3 dedup saving 5.3 percent; batch-2 pairs 2.3-3.4 percent.
+Chance-level pairwise collision at k~6 of 256 is ~2.3 percent, so
+cross-session overlap is chance plus a sliver of popularity skew. Verdict:
+fused multi-sequence decode is a NO-GO (~5 percent ceiling vs the 2x bar);
+the task-12 flat aggregate is architectural. Remaining aggregate levers:
+per-stream speculative decode (post-658) or additional hardware.
