@@ -3679,3 +3679,14 @@ gate against the manual-REPL methodology (a relative gate, or an absolute ~5.3,
 would flip this to PROMOTE). Service file UNCHANGED (still 75GB); production
 restarted and verified (`systemctl is-active`=active, `GET /v1/models`=200, chat
 smoke OK).
+
+### Gate re-ratification (operator, 2026-08-03)
+
+The original promote gate (steady >= 5.5 t/s) was anchored to the 5.88 t/s
+batched-server figure -- a hotter methodology than the manual-REPL protocol the
+A/B actually uses, making the absolute number unreachable by either arm (the
+75GB control itself measured 5.42). Re-ratified gate for cache-budget decisions:
+RELATIVE, same-protocol -- promote a smaller budget when the warm-steady cost is
+<= 3 percent per ~5 GiB freed under the manual-REPL protocol, with an absolute
+floor of 5.2 t/s warm-steady. The 70GB result (-1.4 percent, 5.35 t/s, 5.4 GiB
+freed) passes; 70GB PROMOTED to production 2026-08-03 (authority commit ae73291).
