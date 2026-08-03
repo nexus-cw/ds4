@@ -3757,3 +3757,57 @@ a small manual backport is needed. Not pushed upstream per task scope.
 
 Production restored after measurement: service active, `/v1/models` 200, chat
 smoke OK, 70GB budget unchanged.
+
+## Task 12 -- concurrent-session scheduling (prefill interleave + batched decode)
+
+**Commit:** 33e2b3d (`DS4_SCHED_BATCH_DECODE` kill switch). Audit finding first:
+the "server fully serializes requests" claim had drifted -- at ecebda5 batched
+mode (`--batched-session N`) already round-robins prefill quanta across slots
+with decode priority (`server_session_sync` / `server_prefill_enter`,
+ds4_server.c) and coalesces concurrent decodes into one model pass
+(`decode_worker_main` -> `ds4_sessions_eval_batch`; the CUDA path encodes each
+session's exact one-token kernels in a single command submission, so greedy
+identity holds by construction). Task 12 added only the missing A/B kill
+switch and then measured.
+
+**Protocol:** robo-dog, manual instance (service stopped), production model +
+flags but `--batched-session 3`, temp-0 chat completions, 3 distinct ~60-token
+agent-style prompts, 512 completion tokens per session, expert cache warmed
+before each measured leg (fresh process per config). Driver: 3 concurrent
+OpenAI clients. `DS4_SERVER_BATCH_LOG=1` for batch-size histograms.
+
+| leg | config | per-session wall (s) | agg wall (s) | agg tok/hr |
+|---|---|---|---|---|
+| a | solo (batched-session 3, 1 client), per-prompt | 139.1 / 140.2 / 143.1 | 139-143 | 13,145-13,478 |
+| b | serialized 3-way (no --batched-session) | 140.4 / 284.3 / 423.3 | 423.3 | 13,062 |
+| c | interleave only (bs=3, DS4_SCHED_BATCH_DECODE=0) | 290.8 / 341.8 / 431.8 | 431.8 | 12,806 |
+| d | interleave + batched decode (bs=3) | 436.6 / 437.3 / 437.8 | 437.8 | 12,631 |
+
+Batch histogram for leg d: 507 batches of 3, 5 of 2 (i.e. decode batching
+engaged for essentially every step). Greedy identity: all 3 sessions'
+temp-0 outputs byte-identical solo vs batched-3. KV: 3x32k sessions fit
+(self-report: KV 0.78 GiB total in the 72 GiB plan); no slot eviction fights.
+MemAvailable min across all 3-way legs: 20.6 GiB (abort threshold 8 GiB never
+approached).
+
+**VERDICT vs the 2x bar: NOT MET.** Aggregate tokens/hour is flat (~12.6-13.1k)
+across serialized, interleaved, and batched-decode configs -- within noise of
+solo (~13.2k). The GB10 is decode-throughput-saturated: the batched CUDA path
+runs each session's own one-token kernels back-to-back in one submission
+(correct, identity-preserving) but shares no weight reads between sessions, so
+a batch-3 step costs ~3.16x a solo step (0.855 s vs 0.271 s). The
+shared-expert-fetch physics hypothesis does not pay at ~94% warm hit because
+decode time is dominated by expert GEMV compute/bandwidth on cached weights,
+not by residual SSD fetches. Honest concurrent capacity: 3 sessions run
+concurrently with per-session wall ~= 3.1x solo (fair, simultaneous progress,
+byte-identical outputs) -- aggregate ~1.0x. Per-session bar (<=1.5x solo) is
+likewise not met by any config.
+
+**What 2x would actually need:** fused multi-sequence kernels -- batched
+expert GEMV that processes all sessions' tokens per (layer,expert) in one
+kernel with per-sequence KV, deduplicating weight reads across the batch
+(the a627e80 grouped-prefill trick applied to decode). That is a kernel-level
+unit, deferred. Mixed prefill+decode batches
+(`ds4_sessions_eval_batch_with_prefill`) exist in the library but are not
+wired into the server -- also deferred; interleaving already bounds prefill
+stalls to one 128-token quantum.
