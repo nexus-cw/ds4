@@ -4,6 +4,10 @@
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
 #include "rax.h"
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+/* CUDA-only expert-cache byte counters for /v1/capabilities. */
+#include "ds4_gpu.h"
+#endif
 
 /* OpenAI/Anthropic compatible local server.
  *
