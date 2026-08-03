@@ -3496,3 +3496,62 @@ tier at this budget; fadvise hints on this path are a no-op and can be left defa
 
 **Server restored:** `sudo systemctl start ds4-server`, `systemctl is-active`=active,
 `curl localhost:8000/v1/models`=200 confirmed before finishing.
+
+## O_DIRECT engagement verification (2026-08-03)
+
+**Question.** Does the O_DIRECT read path actually engage on the unaligned MXFP4 GGUF
+(general.alignment = 32, tensor offsets essentially never 512B-aligned), or does it
+silently fall back to buffered reads?
+
+**Verdict: (a) O_DIRECT engages, via correct read-widening.**
+
+**Code trace (ds4_cuda.cu @ 573cb1c).**
+- `ds4_gpu_set_model_fd` (ds4_cuda.cu:4234) reopens the model via
+  `/proc/self/fd/N` with `O_RDONLY|O_DIRECT` (ds4_cuda.cu:4258); on open failure it
+  leaves `g_model_direct_fd=-1` and the path cleanly degrades to buffered.
+  Alignment = `st_blksize`, floored to 512 (ds4_cuda.cu:4247,4261). Opt-out env:
+  `DS4_CUDA_NO_DIRECT_IO` (ds4_cuda.cu:4255).
+- `cuda_model_stage_read` (ds4_cuda.cu:2035) does read-widening: rounds the offset
+  down and the length up to the alignment (ds4_cuda.cu:2041-2043), preads the widened
+  range into the staging buffer, and returns `payload = stage + delta`
+  (ds4_cuda.cu:2050) -- a pointer-offset bounce, no extra copy.
+- Guards before the direct pread (ds4_cuda.cu:2044-2046): widened read must fit the
+  staging buffer and must not extend past EOF; otherwise the read silently uses the
+  buffered fd (ds4_cuda.cu:2069). On EINVAL/EFAULT/ENOTSUP from the direct pread the
+  direct fd is closed and direct I/O permanently disabled for the process
+  (ds4_cuda.cu:2055-2061) -- logged only under `DS4_CUDA_WEIGHT_CACHE_VERBOSE`; there
+  is NO counter for either fallback.
+- Staging buffers are `cudaMallocHost` (page-aligned) plus `cuda_align_ptr` to the
+  direct alignment (ds4_cuda.cu:2008, 2115), and are sized chunk + align
+  (ds4_cuda.cu:2154-2155) so the widened read always fits. Buffer alignment is
+  therefore always satisfied.
+
+**Runtime proof (robo-dog, ext4, kernel 6.17.0-1021-nvidia, production flags).**
+- fdinfo of ds4-server pid 1844871: fd 4 flags 0400000 = O_RDONLY|O_LARGEFILE
+  (buffered), fd 34 flags 0600000 = +O_DIRECT (arm64 O_DIRECT = 0200000).
+- strace attach (`-f -e trace=pread64`) over one 120-token streaming generation:
+  **16995 preads on fd 34 (O_DIRECT), every one with offset AND length 512-aligned,
+  zero errors; exactly 1 pread on buffered fd 4.** Read sizes on fd 34: 4096 to
+  35655680 bytes (expert-tensor chunks).
+- The single fd-4 pread (16384 bytes at 156378328608) ends exactly at EOF
+  (file size 156378344992): the widened read would cross EOF, so the
+  ds4_cuda.cu:2046 tail guard correctly routed it to the buffered fd. Working as
+  designed, not a silent-fallback bug.
+- EINVAL probe: standalone O_DIRECT open of the same gguf on the same fs/kernel;
+  preads at 512-aligned offsets succeed, preads at offsets mod 512 = 33 and 64 fail
+  with errno 22 EINVAL. The alignment constraint is real here; the widening is what
+  makes the path work.
+
+**Implications.**
+- Task #22 tiers: the O_DIRECT tier is already real on the current unaligned GGUF --
+  no dependency on alignment for correctness or engagement. Widening overhead is at
+  most align-1 = 511 bytes per edge, negligible against multi-MB expert reads.
+- Task #14 4KB-alignment repack: not needed to make O_DIRECT engage (it already
+  does). Its remaining value is eliminating the up-to-511B-per-edge waste and
+  enabling a larger (4KB) direct alignment cleanly, not unlocking tier 2.
+- Caveat worth remembering: both fallback paths (guard-miss and EINVAL-disable) are
+  silent with no counter; only `DS4_CUDA_WEIGHT_CACHE_VERBOSE` surfaces the disable
+  event. A one-word stats counter would make future regressions visible.
+
+**Server state:** verification used strace attach on the live service (no stop);
+`curl localhost:8000/v1/models` = 200 after detach.
