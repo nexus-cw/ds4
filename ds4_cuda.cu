@@ -564,13 +564,23 @@ static void cuda_stream_expert_cache_enforce_bytes(uint64_t incoming) {
     const uint64_t budget_bytes = cuda_stream_expert_cache_budget_bytes();
     if (budget_bytes == 0) return;
     for (;;) {
-        const uint64_t used =
-            g_cuda_expert_cache_device_bytes +
-            g_cuda_expert_pool_parked_bytes;
-        if (used + incoming <= budget_bytes) break;
-        const uint64_t over = used + incoming - budget_bytes;
-        if (g_cuda_expert_pool_parked_bytes > 0) {
-            cuda_stream_expert_pool_trim(over);
+        /* Parked pool buffers up to `incoming` bytes are treated as
+         * reusable slack: the incoming install will pop them back off the
+         * free lists instead of cudaMalloc'ing, so charging them AND the
+         * incoming bytes would double-count and force a trim-then-malloc
+         * churn cycle on every miss at cap -- exactly the P3b thrash
+         * regression this pool exists to prevent (measured 5.35 -> ~3.7
+         * t/s when this enforcement first double-counted). Size-class
+         * mismatch can make this reuse assumption optimistic by at most
+         * one entry's bytes for one install; the next enforcement call
+         * sees the real totals and corrects. */
+        const uint64_t parked = g_cuda_expert_pool_parked_bytes;
+        const uint64_t reusable = parked < incoming ? parked : incoming;
+        const uint64_t predicted =
+            g_cuda_expert_cache_device_bytes + incoming + (parked - reusable);
+        if (predicted <= budget_bytes) break;
+        if (parked > incoming) {
+            cuda_stream_expert_pool_trim(parked - incoming);
             continue;
         }
         if (!cuda_stream_expert_cache_evict_lru_one()) break;
