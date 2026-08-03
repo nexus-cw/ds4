@@ -3555,3 +3555,70 @@ silently fall back to buffered reads?
 
 **Server state:** verification used strace attach on the live service (no stop);
 `curl localhost:8000/v1/models` = 200 after detach.
+
+## Task #16 — system-prompt KV pinning + fresh-session prefix restore (2026-08-03)
+
+**Finding first: design items (a) and (c) already exist upstream and work.**
+The #11 audit claim ("a NEW session does not consult the disk store") is stale.
+Verified in code and on the wire:
+- Restore-before-prefill: `generate_job` (ds4_server.c:11081) calls
+  `kv_cache_try_load` on every request whose live-cache probes miss (cached==0);
+  `ds4_kvstore_find_text_prefix` (ds4_kvstore.c:1190) picks the longest stored
+  byte-prefix by SHA1 and restores it before prefill. Cold checkpoints are
+  anchored at the chat task boundary (`ds4_kvstore_chat_anchor_pos`, last user
+  marker before first assistant, commit f074c7b) — exactly the shared
+  system-prompt + tool-schema prefix.
+- Slot affinity: `job_slot_score` (ds4_server.c:12070) already routes each job
+  to the idle slot with the longest live common token prefix; explicit live
+  tool-state bindings force their slot. Nothing to add at --batched-session 2.
+- What was actually missing: (b) a pinning policy protecting hot anchor
+  checkpoints from budget eviction. Implemented, commit e83d95d (see
+  KV_PINNING.md).
+
+**Protocol.** claude CLI from croft, fresh session each time (no --continue),
+ANTHROPIC_BASE_URL=http://100.92.111.3:8000, empty --strict-mcp-config, trivial
+one-word prompts. ~25.2k-token first request (system + tool schemas + CLAUDE.md
+reminder + prompt).
+
+| run | conditions | result |
+|---|---|---|
+| session 1 (baseline, no matching prefix stored) | fresh; store had only foreign-config prefixes | full prefill 25242 tok @ ~28.3 t/s avg = **990.7 s**; CLI timeout+retry doubled the pain; wall ~15-16.5 min |
+| cold anchor store (end of session 1) | — | tokens=24136 trimmed=1106 reason=cold, 339.78 MiB, save=336 ms |
+| session 2 (fresh, different prompt) | server still busy with session-1 retry | hit: restored 24136 tok in **1059 ms**, tail 1106 tok prefill 136 s; wall 539 s (queueing + duplicate request contamination) |
+| **service restart** then session 3 (fresh, different prompt) | idle server, store reloaded from disk after `systemctl restart` | hit: restored 24136 tok in **211 ms**, tail 1107 tok in 132.9 s @ 8.3 t/s; **total wall 144 s**, rc=0, correct output |
+
+**Acceptance vs target.** First-token wall clock dropped ~16.5 min → ~140 s
+(7x). The <60 s target was NOT met: the restore itself is negligible
+(211-1059 ms for a 24k-token / 340 MiB checkpoint), and all remaining time is
+the ~1.1k-token tail prefill (the per-session CLAUDE.md system-reminder + user
+message that lives after the anchor) running at ~8 t/s. Small-tail prefill is
+throughput-bound by per-chunk expert streaming, not by KV restore. Getting
+under 60 s needs faster short-prefill (task #14/#22 territory), not more KV
+machinery.
+
+**Journal evidence (session 3).**
+```
+14:17:50 kv cache hit text tokens=24136 text=100545 quant=2 key=token-text load=211.0 ms file=.../e69ada33....kv
+14:17:50 chat ctx=24136..25243:1107 TOOLS prompt start
+14:20:03 chat ctx=24136..25243:1107 TOOLS prompt done 132.850s
+```
+
+**Regressions checked.**
+- No-stored-prefix request: unchanged path (session 1 behaved exactly as
+  baseline; miss log + full prefill + anchored cold store).
+- OpenAI path: /v1/chat/completions smoke 200 with sane usage accounting.
+- Env unset: pinning defaults off; `ds4_server_test` suite passes incl. new
+  `test_kv_cache_pinning_predicate`; CPU build clean on croft.
+- Restart persistence: store survives `systemctl restart` (on-disk, rescanned
+  at open; shutdown checkpoints of live slots are also written). Session 3's
+  hit was served by the post-restart process.
+
+**Memory discipline (128 GB box, ~15 GB margin).** MemAvailable sampled every
+10 s through session 3: 113 GB right after restart, settling to 15.9-16.4 GB as
+the 75 GB expert LRU re-warmed; never below 15.8 GB during restore or tail
+prefill. The restore path adds no resident footprint beyond the slot's arena.
+
+**Store pressure note.** /home/jacinta/.ds4/kv is at 3.7 GiB of the 4096 MiB
+budget with 12 entries; budget eviction will start choosing victims soon.
+That is exactly the scenario DS4_KV_PIN_MIN_HITS exists for; enabling it in
+production (e.g. =2) plus a larger --kv-disk-space-mb is the operator's call.
