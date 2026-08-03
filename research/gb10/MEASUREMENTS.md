@@ -3825,3 +3825,57 @@ cross-session overlap is chance plus a sliver of popularity skew. Verdict:
 fused multi-sequence decode is a NO-GO (~5 percent ceiling vs the 2x bar);
 the task-12 flat aggregate is architectural. Remaining aggregate levers:
 per-stream speculative decode (post-658) or additional hardware.
+
+## Task 10: honest capability endpoint -- GET /v1/capabilities (2026-08-03)
+
+**Commits:** 26490ec + 294cc41 (research/gb10). Endpoint mounted at
+`/v1/capabilities` and `/capabilities` (plain GET, JSON, standard-client
+readable). Static facts are snapshotted once at startup
+(`ds4_engine_capabilities()`, ds4.c) from the loaded GGUF metadata and the
+POST-LOAD tensor table (i.e. quantization actually served, including load-time
+dense dequant); dynamic figures are O(1) counter reads (task-18 expert-cache
+byte accounting, exported from ds4_cuda.cu). No GPU work per request; safe to
+poll. CPU/Metal/ROCm builds serve the endpoint without the CUDA-only counters.
+
+The honest-context centerpiece, live from robo-dog: the GGUF declares
+`context_length=1048576` (RoPE-stretched, factor 16) but
+`rope.scaling.original_context_length=65536` -- the endpoint reports
+`configured=32768`, `trained=65536`, with both raw metadata values under
+`rope`. Throughput is NOT reported unless the operator supplies measured
+numbers via `DS4_CAPS_THROUGHPUT_JSON` (a JSON object passed through
+verbatim); the server never benchmarks at request time and never fabricates
+a figure.
+
+Live sample (robo-dog production, cache warming; abbreviated quantization):
+
+```json
+{"schema_version": 1,
+ "model": {"name": "DeepSeek V4 Flash 0731", "architecture": "deepseek4",
+   "parameters": 284334567511, "file_bytes": 156378344992,
+   "quantization": [
+     {"category": "routed_experts", "quants": "mxfp4", "tensors": 129, "bytes": 147169738752},
+     {"category": "attention", "quants": "q8_0+f16+f32", "tensors": 806, "bytes": 5730582308},
+     {"category": "embeddings", "quants": "f16+f32", "tensors": 6, "bytes": 2118270996},
+     {"category": "shared_experts", "quants": "q8_0", "tensors": 129, "bytes": 1149763584},
+     {"category": "router", "quants": "f16+f32", "tensors": 83, "bytes": 90218496},
+     {"category": "other", "quants": "f16+i32+f32", "tensors": 175, "bytes": 43833892}]},
+ "context": {"configured": 32768, "trained": 65536,
+   "rope": {"original_context_length": 65536, "declared_context_length": 1048576,
+            "scaling_factor": 16, "freq_base": 10000}},
+ "serving": {"ssd_streaming": true, "ssd_streaming_cold": false,
+   "batched_mode": true, "batched_sessions": 2,
+   "session_context_buffer_bytes_estimated": 1104933888,
+   "expert_cache": {"budget_bytes": 68303978496, "live_budget_bytes": 68303978496,
+     "counted_bytes": 37474271232, "pool_parked_bytes": 0,
+     "device_total_bytes": 37474271232, "entries": 2803, "configured_experts": 5109},
+   "kv_disk_store": {"enabled": true, "budget_bytes": 17179869184,
+     "pinning": true, "pin_min_hits": 2, "entries": 15}},
+ "apis": {"openai_chat_completions": true, "openai_completions": true,
+   "openai_responses": true, "anthropic_messages": true, "count_tokens": false,
+   "sse_streaming": true,
+   "speculative": {"mtp": false, "mtp_active": false, "mtp_draft_tokens": 1, "dspark": false}}}
+```
+
+Verified: `/v1/models` 200, chat smoke OK, service ACTIVE; budget 63.613 GiB
+matches the task-18 self-report plan for the 70GB setting; counted bytes climb
+toward budget as the cache warms (entries 2803 -> cap 5109).
