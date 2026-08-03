@@ -10854,6 +10854,16 @@ static long server_decode_coalesce_us(void) {
     return us;
 }
 
+/* Batched decode kill switch.  DS4_SCHED_BATCH_DECODE=0 forces the decode
+ * worker to step one session at a time (batch size 1) while keeping the
+ * prefill-quantum interleaving intact.  Default is on in batched mode; the
+ * switch exists for A/B measurement and as an operator opt-out. */
+static bool server_batch_decode_enabled(void) {
+    const char *env = getenv("DS4_SCHED_BATCH_DECODE");
+    if (env && env[0] && !strcmp(env, "0")) return false;
+    return true;
+}
+
 static void timespec_add_us(struct timespec *ts, long us) {
     if (!ts || us <= 0) return;
     ts->tv_nsec += (us % 1000000L) * 1000L;
@@ -10865,7 +10875,8 @@ static void *decode_worker_main(void *arg) {
     server *s = arg;
     ds4_decode_item *items = xmalloc((size_t)s->slot_count * sizeof(*items));
     server_slot **members = xmalloc((size_t)s->slot_count * sizeof(*members));
-    const long coalesce_us = server_decode_coalesce_us();
+    const bool batch_enabled = server_batch_decode_enabled();
+    const long coalesce_us = batch_enabled ? server_decode_coalesce_us() : 0;
     const bool log_batches = getenv("DS4_SERVER_BATCH_LOG") != NULL;
 
     pthread_mutex_lock(&s->model_mu);
@@ -10906,6 +10917,7 @@ static void *decode_worker_main(void *arg) {
             items[count].session = slot->session;
             items[count].token = slot->decode_token;
             count++;
+            if (!batch_enabled) break;
         }
         if (count == 0) continue;
         s->model_busy = true;
@@ -13002,11 +13014,12 @@ int main(int argc, char **argv) {
     }
     if (s.batched_mode) {
         server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: batched mode enabled resident_sessions=%d prefill_quantum=%d mixed_prefill_quantum=%d decode_coalesce_us=%ld",
+                   "ds4-server: batched mode enabled resident_sessions=%d prefill_quantum=%d mixed_prefill_quantum=%d decode_coalesce_us=%ld batch_decode=%d",
                    s.slot_count,
                    server_prefill_quantum_for(false),
                    server_prefill_quantum_for(true),
-                   server_decode_coalesce_us());
+                   server_decode_coalesce_us(),
+                   server_batch_decode_enabled() ? 1 : 0);
         if (ds4_engine_has_mtp(engine)) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: MTP speculative decoding is disabled while native session batching is active");
