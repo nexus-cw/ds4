@@ -3622,3 +3622,60 @@ prefill. The restore path adds no resident footprint beyond the slot's arena.
 budget with 12 entries; budget eviction will start choosing victims soon.
 That is exactly the scenario DS4_KV_PIN_MIN_HITS exists for; enabling it in
 production (e.g. =2) plus a larger --kv-disk-space-mb is the operator's call.
+
+
+## expert-cache budget 75 vs 70 (2026-08-03)
+
+A/B of `--ssd-streaming-cache-experts 75GB` (production) vs `70GB` on robo-dog,
+motivation: free ~5GB RAM for future multi-session work if the throughput cost
+matches the locality_sim prediction. **Prediction** (locality_sim sweep over
+captured traces, 2026-08-03): 70GB ~= 93.9% decode hit vs 94.9% at 75GB, ~-3.9%
+throughput, ~5.65 t/s vs a 5.88 batched-server effective baseline. **Decision
+rule** (operator-ratified): promote 70GB if its warm steady-state >= 5.5 t/s,
+else revert to 75GB.
+
+**Protocol.** Exact fadvise-A/B methodology (the most recent comparable): server
+STOPPED, manual `./ds4` REPL, `research/gb10/session_prompts.txt` (8-turn
+long-session), `-n 350 --cuda --ssd-streaming --nothink`, model
+`gguf/DeepSeek-V4-Flash-0731-MXFP4_MOE-Q8_0.gguf`, `DS4_CUDA_STREAM_STATS=1`
+(still not wired into the REPL path, no direct hit counter -- same finding as
+prior long-session units). Page cache dropped (`echo 3 > drop_caches`) before
+every arm for arm-equality. Budget lines confirmed each arm: 75GB = 68.62 GiB
+dynamic cache / 5511 experts; 70GB = 63.61 GiB / 5109 experts (delta 5.01 GiB /
+402 experts). Warm steady = mean of turns 6-8. Memory = per-2s background
+MemAvailable sampler, MINIMUM (in-flight steady footprint); post-run free is
+useless (process already exited). Ran 2 reps of the 70GB arm (decision was near
+the boundary).
+
+| arm | budget | cold t1 | t2 | t3 | t4 | t5 | t6 | t7 | t8 | steady 6-8 | 2-8 mean | in-flight min MemAvail (GiB) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 75GB    | 75GB | 4.94 | 5.98 | 5.64 | 5.61 | 5.20 | 5.51 | 5.25 | 5.51 | **5.42** | 5.53 | 18.62 |
+| 70GB r1 | 70GB | 5.05 | 5.63 | 5.41 | 5.44 | 5.39 | 5.11 | 5.35 | 5.47 | **5.31** | 5.40 | 24.03 |
+| 70GB r2 | 70GB | 4.99 | 5.51 | 5.49 | 5.51 | 5.36 | 5.07 | 5.49 | 5.59 | **5.38** | 5.43 | 23.98 |
+
+70GB warm-steady mean over the two reps = **5.35 t/s**. Cold prefill was
+0.58-0.72 t/s across all arms (indistinguishable).
+
+**Memory freed:** in-flight MemAvailable rose from 18.62 GiB (75GB) to ~24.0 GiB
+(70GB, both reps) = **~5.4 GiB freed**, matching the ~5GB prediction and the
+5.01 GiB dynamic-cache-budget delta.
+
+**Throughput cost:** 70GB (5.35) vs 75GB (5.42) in the SAME protocol = **-1.4%**,
+SMALLER than the predicted -3.9%. Popularity skew held: dropping 402 experts
+(5.01 GiB) cost almost nothing because those marginal GBs hold rarely-selected
+experts.
+
+**Decision: REVERT to 75GB (rule-faithful).** Both 70GB reps (5.31, 5.38; mean
+5.35) fall BELOW the operator-ratified 5.5 t/s gate. Note, however, that the
+**75GB control arm also measured 5.42 < 5.5 under this single-session manual-REPL
+protocol** -- the 5.5 threshold was anchored to the 5.88 t/s *batched-server
+effective-decode* figure, a different methodology that runs ~0.4-0.5 t/s hotter
+than a single-session REPL (consistent with the fadvise unit's 5.55-5.60 at
+75GB). So the absolute gate is effectively unreachable in the comparable
+protocol, and the *relative* cost of 70GB (-1.4%) beat prediction while freeing
+the predicted ~5.4 GiB. Reverting is the conservative, rule-literal action and
+leaves the promote decision with the operator, who may wish to re-ratify the
+gate against the manual-REPL methodology (a relative gate, or an absolute ~5.3,
+would flip this to PROMOTE). Service file UNCHANGED (still 75GB); production
+restarted and verified (`systemctl is-active`=active, `GET /v1/models`=200, chat
+smoke OK).
