@@ -92,3 +92,31 @@ layers), flagging the decode-graph type-guard hazard from (c) in the second
 PR. Separately, plan a re-derivation (not rebase) of the DSpark
 greedy-identity fix on top of upstream's replay-free verifier before
 ds4f-mxfp4 reaches main. No filings made; analysis only.
+
+## Follow-up: 74e8f11 greedy-identity analysis (2026-08-03)
+
+Read 74e8f11 in full plus the surrounding verify path on the ds4f-mxfp4 tip
+(4893e0c). Verdict: the replay-free partial-accept commit carries the same
+greedy-identity mechanism as our #658. The verify batch still projects
+compressor KV/score with the batched matrix-matrix GEMM
+`ds4_gpu_matmul_f16_tensor` over n_tokens rows (ds4.c:27473/27485 on the
+branch tip); 74e8f11 forces the per-token compressor stepping loop (adds
+`!g->spec_capture_prefixes` to aligned_chunk, ds4.c:27601), but that loop
+consumes the batch-GEMM rows via `ds4_gpu_compressor_update_tensor`
+(ds4.c:27724, FP8 quantize at 27752) — decode order restored, decode input
+numerics not. Plain decode uses the fused
+`ds4_gpu_matmul_f16_pair_compressor_store_tensor` (ds4.c:22062); upstream's
+own comment near ds4.c:26490 concedes the accumulation orders differ. The
+prefix snapshots (ds4.c:27770/28066) thus hold verify-GEMM-derived frontiers,
+and the new no-replay block (ds4.c:61391-61417 via
+`spec_frontier_commit_prefix`, ds4.c:49739) commits them directly. Static
+analysis only (Metal-primary branch, cannot run here); high confidence since
+the mechanism is the one empirically confirmed on main for #658.
+
+Reported upstream on the issue (one comment, evidence-first, with the temp-0
+A/B repro and an offer to re-derive #659 atop the prefix-slot verifier):
+https://github.com/antirez/ds4/issues/658#issuecomment-5161160100
+
+PR #659 status at time of writing: OPEN, MERGEABLE/CLEAN against its base
+(main), no maintainer comments; conflict with ds4f-mxfp4 remains guaranteed
+when that branch merges (same function rewritten), per (d) above.
