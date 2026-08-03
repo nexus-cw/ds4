@@ -16457,6 +16457,33 @@ static void test_kv_cache_chat_anchor_ignores_multiturn_tail(void) {
     ds4_tokens_free(&prompt);
 }
 
+static void test_kv_cache_pinning_predicate(void) {
+    kv_disk_cache kc = {0};
+    kc.opt = kv_cache_default_options();
+    ds4_kvstore_entry cold = {0};
+    cold.reason = DS4_KVSTORE_REASON_COLD;
+    cold.hits = 3;
+    ds4_kvstore_entry cont = {0};
+    cont.reason = DS4_KVSTORE_REASON_CONTINUED;
+    cont.hits = 100;
+
+    /* Default: pinning disabled, nothing is pinned. */
+    TEST_ASSERT(!ds4_kvstore_entry_pinned(&kc, &cold));
+    TEST_ASSERT(!ds4_kvstore_entry_pinned(&kc, &cont));
+
+    kc.pin_min_hits = 3;
+    TEST_ASSERT(ds4_kvstore_entry_pinned(&kc, &cold));
+    cold.hits = 2;
+    TEST_ASSERT(!ds4_kvstore_entry_pinned(&kc, &cold));
+    /* Continued waypoints are never pinned regardless of hits. */
+    TEST_ASSERT(!ds4_kvstore_entry_pinned(&kc, &cont));
+
+    ds4_kvstore_entry evict = {0};
+    evict.reason = DS4_KVSTORE_REASON_EVICT;
+    evict.hits = 3;
+    TEST_ASSERT(ds4_kvstore_entry_pinned(&kc, &evict));
+}
+
 static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -17506,6 +17533,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_store_len_uses_configured_boundary();
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
+    test_kv_cache_pinning_predicate();
     test_kv_cache_continued_uses_aligned_frontiers();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();

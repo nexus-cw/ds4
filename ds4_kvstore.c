@@ -15,6 +15,7 @@
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -54,6 +55,14 @@
  * survive comparable continued entries, while still allowing pressure and poor
  * density to evict them. */
 #define KV_CACHE_ANCHOR_REASON_SCORE_FACTOR 2.0
+/* Pinning (env DS4_KV_PIN_MIN_HITS): an anchor checkpoint (cold/evict/
+ * shutdown) whose raw hit count has reached the threshold is a recognized hot
+ * prefix -- typically a shared system-prompt + tool-schema prefix that
+ * restore-before-prefill depends on.  Pinned entries are never chosen as
+ * budget-eviction victims; raw hits are used deliberately (no half-life decay)
+ * because the whole point is surviving idle days.  0 (default) disables
+ * pinning and preserves the existing eviction behavior exactly. */
+#define KV_CACHE_PIN_MIN_HITS_ENV "DS4_KV_PIN_MIN_HITS"
 
 typedef struct {
     char *ptr;
@@ -529,6 +538,12 @@ static bool kv_cache_reason_is_anchor(uint8_t reason) {
            reason == DS4_KVSTORE_REASON_SHUTDOWN;
 }
 
+bool ds4_kvstore_entry_pinned(const ds4_kvstore *kc, const ds4_kvstore_entry *e) {
+    if (!kc || !e || kc->pin_min_hits <= 0) return false;
+    if (!kv_cache_reason_is_anchor(e->reason)) return false;
+    return e->hits >= (uint32_t)kc->pin_min_hits;
+}
+
 double ds4_kvstore_entry_eviction_score(
         const ds4_kvstore_entry *e,
         const ds4_tokens *live,
@@ -569,21 +584,34 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
     for (int i = 0; i < kc->len; i++) total += kc->entry[i].file_size;
     const uint64_t target = kc->budget_bytes - extra_bytes;
     while (total > target && kc->len > 0) {
-        int victim = 0;
-        double victim_score =
-            ds4_kvstore_entry_eviction_score(&kc->entry[0], live, now,
-                                             incoming);
-        for (int i = 1; i < kc->len; i++) {
+        int victim = -1;
+        double victim_score = 0.0;
+        for (int i = 0; i < kc->len; i++) {
+            if (ds4_kvstore_entry_pinned(kc, &kc->entry[i])) continue;
             double score =
                 ds4_kvstore_entry_eviction_score(&kc->entry[i], live, now,
                                                  incoming);
-            if (score < victim_score ||
+            if (victim < 0 ||
+                score < victim_score ||
                 (score == victim_score &&
                  kc->entry[i].last_used < kc->entry[victim].last_used))
             {
                 victim = i;
                 victim_score = score;
             }
+        }
+        if (victim < 0) {
+            /* Every remaining entry is pinned.  Persistence wins over the
+             * budget: keep the pinned prefixes and report the overage instead
+             * of deleting a hot restore anchor. */
+            kv_logf(kc, DS4_KVSTORE_LOG_WARNING,
+                    "%s: kv cache over budget by %.2f MiB but all %d remaining entries are pinned (%s=%d); not evicting",
+                    kv_log_name(kc),
+                    (double)(total - target) / (1024.0 * 1024.0),
+                    kc->len,
+                    KV_CACHE_PIN_MIN_HITS_ENV,
+                    kc->pin_min_hits);
+            break;
         }
         ds4_kvstore_entry e = kc->entry[victim];
         if (unlink(e.path) == 0) {
@@ -628,6 +656,19 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
     kc->budget_bytes = budget_mb * 1024ull * 1024ull;
     kc->reject_different_quant = reject_different_quant;
     kc->opt = opt;
+    kc->pin_min_hits = 0;
+    const char *pin_env = getenv(KV_CACHE_PIN_MIN_HITS_ENV);
+    if (pin_env && *pin_env) {
+        char *end = NULL;
+        long v = strtol(pin_env, &end, 10);
+        if (end && *end == '\0' && v > 0 && v <= INT_MAX) {
+            kc->pin_min_hits = (int)v;
+        } else {
+            kv_logf(kc, DS4_KVSTORE_LOG_WARNING,
+                    "%s: ignoring invalid %s=%s (want a positive integer)",
+                    kv_log_name(kc), KV_CACHE_PIN_MIN_HITS_ENV, pin_env);
+        }
+    }
     ds4_kvstore_evict(kc, NULL, 0, NULL);
     kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
             "%s: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d, hit_half_life=%llus)",
@@ -641,6 +682,11 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
             kc->opt.boundary_trim_tokens,
             kc->opt.boundary_align_tokens,
             (unsigned long long)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS);
+    if (kc->pin_min_hits > 0) {
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                "%s: KV disk cache pinning enabled: anchor checkpoints with hits>=%d are never evicted (%s)",
+                kv_log_name(kc), kc->pin_min_hits, KV_CACHE_PIN_MIN_HITS_ENV);
+    }
     return true;
 }
 

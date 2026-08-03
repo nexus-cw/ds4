@@ -70,6 +70,8 @@ typedef struct {
     uint64_t budget_bytes;
     bool reject_different_quant;
     ds4_kvstore_options opt;
+    /* DS4_KV_PIN_MIN_HITS; 0 = pinning disabled (default). */
+    int pin_min_hits;
     int continued_last_store_tokens;
     ds4_kvstore_entry *entry;
     int len;
@@ -150,6 +152,7 @@ bool ds4_kvstore_file_size_fits(const ds4_kvstore *kc,
                                 uint64_t trailer_bytes,
                                 uint64_t *file_bytes_out,
                                 uint64_t *required_bytes_out);
+bool ds4_kvstore_entry_pinned(const ds4_kvstore *kc, const ds4_kvstore_entry *e);
 double ds4_kvstore_entry_eviction_score(const ds4_kvstore_entry *e,
                                         const ds4_tokens *live,
                                         uint64_t now,
