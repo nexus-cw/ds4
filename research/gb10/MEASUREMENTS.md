@@ -3879,3 +3879,68 @@ Live sample (robo-dog production, cache warming; abbreviated quantization):
 Verified: `/v1/models` 200, chat smoke OK, service ACTIVE; budget 63.613 GiB
 matches the task-18 self-report plan for the 70GB setting; counted bytes climb
 toward budget as the cache warms (entries 2803 -> cap 5109).
+
+## ctx 65536 headroom validation + promotion (2026-08-03)
+
+Task: validate --ctx 65536 (the model's TRAINED original_context_length --
+the GGUF-declared 1048576 is a 16x RoPE stretch) with the headroom freed by
+the 70GB cache promotion, and promote if it passes. Binary at 2fd0994.
+
+Protocol: production stopped; manual instance from the same binary with the
+identical production flag set except --ctx 65536 (DS4_KV_PIN_MIN_HITS=2 kept).
+A driver built one honest deep session over 8 chat turns (~6k-token chunks of
+real repo text appended each turn) to ~45k tokens, then a second concurrent
+session ran a normal exchange while the deep session took a final turn.
+MemAvailable/SwapFree sampled every 5s throughout.
+
+### Boot plan at ctx 65536 (delta vs 32768)
+
+- Cache split UNCHANGED: 70.00 GiB = 6.38 GiB prefill headroom + 63.61 GiB
+  dynamic cache (5109 experts, 12.75 MiB each). Prefill headroom does not
+  scale with ctx.
+- Per-slot context buffers 1739.75 MiB (raw_kv_rows=4352,
+  compressed_kv_rows=16386, prefill_chunk=4096) vs ~1053 MiB at 32768;
+  capabilities self-report session_context_buffer_bytes_estimated
+  1824257024 (was 1104933888). Total plan 72.67 GiB.
+- /v1/capabilities: configured=65536, trained=65536.
+
+### Memory curve (MemAvailable)
+
+| point                                   | MemAvailable |
+|-----------------------------------------|--------------|
+| after model load, cache empty           | 106.3 GiB    |
+| mid-run, cache warming, ~22k ctx        | 19.1 GiB     |
+| deep turns 4-8 (28k-45k ctx) steady     | ~19.1 GiB    |
+| dual-slot combined peak (45k + slot 2)  | 19.8 GiB     |
+| minimum over whole run (5s sampler)     | 18.6 GiB     |
+
+Swap: SwapFree dipped from 15.7 to 13.5 GiB (~2.2 GiB paged out, cold pages
+making room for the expert cache) and plateaued -- no thrash, MemAvailable
+flat throughout. Floor criterion was 8 GiB; never approached.
+
+### Throughput at depth
+
+- Warm shallow decode: avg 5.36 t/s (baseline 5.35 -- parity).
+- Decode at 41k ctx: 4.37-5.04 t/s; at 45k ctx single slot: 4.78 t/s
+  (-10.7% vs baseline, inside the 15% band).
+- Dual-slot concurrent decode: ~2.4 t/s per slot (~4.8 aggregate) -- batch
+  decode splits fairly, no starvation, both slots functional at depth.
+- Prefill of small continuation chunks at depth is slow (1.5-8 t/s observed)
+  and two turns re-prefilled ~24k after checkpoint-match fell back to a
+  shorter prefix (838s, 1174s walls) -- a latency note, not a memory issue.
+
+### KV disk at 65536
+
+Deep-session anchors on disk: 560-590 MB each (~570 MB per ~45-50k
+checkpoint, matching the ~9 MB/1k-token estimate). The 16384 MiB budget
+holds ~27 such anchors; kv dir stood at 6.9 GiB after the run. Checkpoints
+stored and restored across turns (thinking live checkpoint remembered /
+continuation match lines in the server log).
+
+### Verdict: PASS -- promoted
+
+No OOM, no thrash, no server errors, clean shutdown. Production
+/etc/systemd/system/ds4-server.service patched --ctx 32768 -> 65536 with the
+prudence-deviation comment replaced by the validation record; daemon-reload +
+restart verified (/v1/models 200, capabilities configured=65536, chat smoke).
+Authority copy committed on dMon /opt/carriedworld-cloud (064d3ad, unpushed).
