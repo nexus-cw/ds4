@@ -233,6 +233,41 @@ uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
 int ds4_engine_embd_dim(ds4_engine *e);
 uint64_t ds4_engine_model_bytes(ds4_engine *e);
+
+/* Honest-capability self-description (server /v1/capabilities).  Everything
+ * here is derived once from the loaded GGUF metadata + tensor table and the
+ * engine's configured state -- no GPU work, O(1) to read after the fill. */
+#define DS4_CAP_MAX_QUANT_CATEGORIES 6
+typedef struct {
+    const char *category;   /* routed_experts / attention / embeddings /
+                             * shared_experts / router / other */
+    char quants[64];        /* distinct tensor types, dominant-by-bytes first,
+                             * joined with "+" (e.g. "mxfp4", "q8_0+f32") */
+    uint64_t tensors;
+    uint64_t bytes;
+} ds4_cap_quant_category;
+
+typedef struct {
+    char model_name[128];       /* GGUF general.name (compiled shape name if absent) */
+    char architecture[64];      /* GGUF general.architecture */
+    uint64_t parameters;        /* sum of tensor elements in the served file */
+    uint64_t file_bytes;        /* real on-disk GGUF size */
+    uint64_t trained_context_length;        /* <arch>.context_length; 0 if absent */
+    uint64_t rope_original_context_length;  /* rope.scaling.original_context_length; 0 if absent */
+    float    rope_scaling_factor;           /* rope.scaling.factor; 0 if absent */
+    float    rope_freq_base;                /* rope.freq_base; 0 if absent */
+    int      quant_category_count;
+    ds4_cap_quant_category quant[DS4_CAP_MAX_QUANT_CATEGORIES];
+    bool     ssd_streaming;
+    bool     ssd_streaming_cold;
+    uint64_t expert_cache_budget_bytes;     /* planned dynamic expert cache; 0 if n/a */
+    bool     has_mtp;
+    int      mtp_draft_tokens;
+    bool     dspark;
+} ds4_capabilities;
+
+/* Fill once after ds4_engine_open(); cheap metadata/tensor-table walk. */
+void ds4_engine_capabilities(ds4_engine *e, ds4_capabilities *out);
 int ds4_engine_tp_vocab_split(ds4_engine *e);
 bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
                                         uint32_t layer,

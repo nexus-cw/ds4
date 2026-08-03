@@ -57685,6 +57685,142 @@ uint64_t ds4_engine_model_bytes(ds4_engine *e) {
     return e->model.size;
 }
 
+/* ---- honest capability self-description (see ds4_capabilities in ds4.h) ---- */
+
+static bool cap_str_contains(ds4_str s, const char *needle) {
+    const size_t n = strlen(needle);
+    if (s.len < n) return false;
+    for (size_t i = 0; i + n <= s.len; i++) {
+        if (memcmp(s.ptr + i, needle, n) == 0) return true;
+    }
+    return false;
+}
+
+static bool cap_str_prefix(ds4_str s, const char *prefix) {
+    const size_t n = strlen(prefix);
+    return s.len >= n && memcmp(s.ptr, prefix, n) == 0;
+}
+
+/* Category order mirrors the gb10 quantization breakdown. */
+static const char *const cap_category_names[DS4_CAP_MAX_QUANT_CATEGORIES] = {
+    "routed_experts", "attention", "embeddings",
+    "shared_experts", "router", "other",
+};
+
+static int cap_tensor_category(ds4_str name) {
+    if (cap_str_contains(name, "shexp")) return 3;                  /* shared_experts */
+    if (cap_str_contains(name, "_exps")) return 0;                  /* routed_experts */
+    if (cap_str_contains(name, "ffn_gate_inp") ||
+        cap_str_contains(name, "exp_probs")) return 4;              /* router */
+    if (cap_str_contains(name, "attn") ||
+        cap_str_contains(name, "indexer")) return 1;                /* attention */
+    if (cap_str_contains(name, "token_embd") ||
+        cap_str_prefix(name, "output")) return 2;                   /* embeddings */
+    return 5;                                                       /* other */
+}
+
+void ds4_engine_capabilities(ds4_engine *e, ds4_capabilities *out) {
+    memset(out, 0, sizeof(*out));
+    const ds4_model *m = &e->model;
+
+    ds4_str name = {0};
+    if (model_get_string(m, "general.name", &name) && name.len) {
+        snprintf(out->model_name, sizeof(out->model_name), "%.*s",
+                 (int)name.len, name.ptr);
+    } else {
+        snprintf(out->model_name, sizeof(out->model_name), "%s",
+                 ds4_engine_model_name(e));
+    }
+    ds4_str arch = {0};
+    if (model_get_string(m, "general.architecture", &arch) && arch.len) {
+        snprintf(out->architecture, sizeof(out->architecture), "%.*s",
+                 (int)arch.len, arch.ptr);
+    }
+
+    out->file_bytes = m->file_size;
+
+    /* Per-category quantization summary from the POST-LOAD tensor table --
+     * this reports what is actually served (including any load-time dense
+     * dequantization), not what the file header promised. Track up to 4
+     * distinct types per category, dominant-by-bytes first. */
+    struct {
+        uint32_t type[4];
+        uint64_t bytes[4];
+        int n;
+    } types[DS4_CAP_MAX_QUANT_CATEGORIES];
+    memset(types, 0, sizeof(types));
+
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        out->parameters += t->elements;
+        const int c = cap_tensor_category(t->name);
+        out->quant[c].tensors++;
+        out->quant[c].bytes += t->bytes;
+        int k = 0;
+        for (; k < types[c].n; k++) {
+            if (types[c].type[k] == t->type) break;
+        }
+        if (k == types[c].n && types[c].n < 4) types[c].n++;
+        if (k < 4) {
+            types[c].type[k] = t->type;
+            types[c].bytes[k] += t->bytes;
+        }
+    }
+    out->quant_category_count = DS4_CAP_MAX_QUANT_CATEGORIES;
+    for (int c = 0; c < DS4_CAP_MAX_QUANT_CATEGORIES; c++) {
+        out->quant[c].category = cap_category_names[c];
+        /* sort types by bytes, descending (n <= 4: insertion sort) */
+        for (int a = 1; a < types[c].n; a++) {
+            for (int b = a; b > 0 && types[c].bytes[b] > types[c].bytes[b - 1]; b--) {
+                uint32_t tt = types[c].type[b];
+                uint64_t bb = types[c].bytes[b];
+                types[c].type[b] = types[c].type[b - 1];
+                types[c].bytes[b] = types[c].bytes[b - 1];
+                types[c].type[b - 1] = tt;
+                types[c].bytes[b - 1] = bb;
+            }
+        }
+        size_t off = 0;
+        for (int k = 0; k < types[c].n; k++) {
+            const int r = snprintf(out->quant[c].quants + off,
+                                   sizeof(out->quant[c].quants) - off,
+                                   "%s%s", k ? "+" : "",
+                                   tensor_type_name(types[c].type[k]));
+            if (r < 0 || (size_t)r >= sizeof(out->quant[c].quants) - off) break;
+            off += (size_t)r;
+        }
+    }
+
+    /* Context truth: trained context_length + RoPE scaling metadata. */
+    if (!model_get_u64_compat(m, "deepseek4.context_length",
+                              &out->trained_context_length)) {
+        model_get_u64_compat(m, "glm-dsa.context_length",
+                             &out->trained_context_length);
+    }
+    if (!model_get_u64_compat(m, "deepseek4.rope.scaling.original_context_length",
+                              &out->rope_original_context_length)) {
+        model_get_u64_compat(m, "glm-dsa.rope.scaling.original_context_length",
+                             &out->rope_original_context_length);
+    }
+    if (!model_get_f32_compat(m, "deepseek4.rope.scaling.factor",
+                              &out->rope_scaling_factor)) {
+        model_get_f32_compat(m, "glm-dsa.rope.scaling.factor",
+                             &out->rope_scaling_factor);
+    }
+    if (!model_get_f32_compat(m, "deepseek4.rope.freq_base",
+                              &out->rope_freq_base)) {
+        model_get_f32_compat(m, "glm-dsa.rope.freq_base",
+                             &out->rope_freq_base);
+    }
+
+    out->ssd_streaming = e->ssd_streaming;
+    out->ssd_streaming_cold = e->ssd_streaming_cold;
+    out->expert_cache_budget_bytes = ds4_engine_dynamic_expert_cache_bytes(e);
+    out->has_mtp = ds4_engine_has_mtp(e);
+    out->mtp_draft_tokens = e->mtp_draft_tokens;
+    out->dspark = e->dspark;
+}
+
 int ds4_engine_tp_vocab_split(ds4_engine *e) {
     return e && e->tp.active && e->tp.vocab_split;
 }

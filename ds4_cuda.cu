@@ -29933,6 +29933,21 @@ extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
     return g_cuda_expert_cache_entry_count;
 }
 
+/* Task: honest capability endpoint -- expose the task-18 byte-accounting
+ * self-report figures (same sources as the DS4_CUDA_STREAM_STATS memory
+ * line) as O(1) reads for /v1/capabilities. */
+extern "C" uint64_t ds4_gpu_stream_expert_cache_budget_bytes(void) {
+    return cuda_stream_expert_cache_budget_bytes();
+}
+
+extern "C" uint64_t ds4_gpu_stream_expert_cache_counted_bytes(void) {
+    return cuda_stream_expert_cache_counted_bytes();
+}
+
+extern "C" uint64_t ds4_gpu_stream_expert_cache_parked_bytes(void) {
+    return cuda_stream_expert_pool_parked_bytes_total();
+}
+
 static uint32_t g_cuda_expert_cache_entry_count_getter(void) {
     return g_cuda_expert_cache_entry_count;
 }

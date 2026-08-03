@@ -8294,6 +8294,10 @@ struct server {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+    /* Honest-capability snapshot: computed once at startup from the loaded
+     * GGUF + engine config; served by GET /v1/capabilities. */
+    ds4_capabilities caps;
+    uint64_t session_ctx_bytes;
 };
 
 /* Jobs are stack-owned by the client thread.  A resident-slot worker signals
@@ -12373,6 +12377,126 @@ static bool send_models(server *s, int fd) {
     return ok;
 }
 
+/* GET /v1/capabilities (also /capabilities): machine-readable truth about
+ * what this server actually is -- trained vs configured context, quantization
+ * actually served per tensor category, expert-cache budget vs counted bytes,
+ * KV disk store state, API surface.  Static facts come from the startup
+ * snapshot (s->caps); dynamic figures are O(1) counter reads.  No GPU work,
+ * safe to poll. */
+static bool send_capabilities(server *s, int fd) {
+    const ds4_capabilities *c = &s->caps;
+    buf b = {0};
+
+    buf_puts(&b, "{\"schema_version\":1,\"model\":{\"name\":");
+    json_escape(&b, c->model_name);
+    buf_puts(&b, ",\"architecture\":");
+    json_escape(&b, c->architecture[0] ? c->architecture : "unknown");
+    buf_printf(&b,
+        ",\"parameters\":%llu,\"file_bytes\":%llu,\"quantization\":[",
+        (unsigned long long)c->parameters,
+        (unsigned long long)c->file_bytes);
+    bool first = true;
+    for (int i = 0; i < c->quant_category_count; i++) {
+        if (c->quant[i].tensors == 0) continue;
+        if (!first) buf_putc(&b, ',');
+        first = false;
+        buf_puts(&b, "{\"category\":");
+        json_escape(&b, c->quant[i].category);
+        buf_puts(&b, ",\"quants\":");
+        json_escape(&b, c->quant[i].quants);
+        buf_printf(&b, ",\"tensors\":%llu,\"bytes\":%llu}",
+                   (unsigned long long)c->quant[i].tensors,
+                   (unsigned long long)c->quant[i].bytes);
+    }
+    buf_puts(&b, "]},");
+
+    /* The honest-context centerpiece: "configured" is what --ctx asked for,
+     * "trained" is where the model was actually trained (RoPE original
+     * context if the file declares one, else the declared context_length). */
+    const unsigned long long trained =
+        c->rope_original_context_length ? c->rope_original_context_length
+                                        : c->trained_context_length;
+    buf_printf(&b,
+        "\"context\":{\"configured\":%d,\"trained\":%llu,"
+        "\"rope\":{\"original_context_length\":%llu,"
+        "\"declared_context_length\":%llu,"
+        "\"scaling_factor\":%.6g,\"freq_base\":%.6g}},",
+        s->ctx_size,
+        trained,
+        (unsigned long long)c->rope_original_context_length,
+        (unsigned long long)c->trained_context_length,
+        (double)c->rope_scaling_factor,
+        (double)c->rope_freq_base);
+
+    buf_printf(&b,
+        "\"serving\":{\"ssd_streaming\":%s,\"ssd_streaming_cold\":%s,"
+        "\"batched_mode\":%s,\"batched_sessions\":%d,"
+        "\"session_context_buffer_bytes_estimated\":%llu,"
+        "\"expert_cache\":{\"budget_bytes\":%llu",
+        c->ssd_streaming ? "true" : "false",
+        c->ssd_streaming_cold ? "true" : "false",
+        s->batched_mode ? "true" : "false",
+        s->slot_count,
+        (unsigned long long)s->session_ctx_bytes,
+        (unsigned long long)c->expert_cache_budget_bytes);
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* Task-18 byte-accounting self-report figures (same sources as the
+     * DS4_CUDA_STREAM_STATS memory line). CUDA-only counters. */
+    {
+        const unsigned long long counted =
+            (unsigned long long)ds4_gpu_stream_expert_cache_counted_bytes();
+        const unsigned long long parked =
+            (unsigned long long)ds4_gpu_stream_expert_cache_parked_bytes();
+        buf_printf(&b,
+            ",\"live_budget_bytes\":%llu,\"counted_bytes\":%llu,"
+            "\"pool_parked_bytes\":%llu,\"device_total_bytes\":%llu,"
+            "\"entries\":%u,\"configured_experts\":%u",
+            (unsigned long long)ds4_gpu_stream_expert_cache_budget_bytes(),
+            counted, parked, counted + parked,
+            ds4_gpu_stream_expert_cache_current_count(),
+            ds4_gpu_stream_expert_cache_configured_count());
+    }
+#endif
+    buf_puts(&b, "},\"kv_disk_store\":{");
+    pthread_mutex_lock(&s->kv_mu);
+    buf_printf(&b,
+        "\"enabled\":%s,\"budget_bytes\":%llu,"
+        "\"pinning\":%s,\"pin_min_hits\":%d,\"entries\":%d}},",
+        s->kv.enabled ? "true" : "false",
+        (unsigned long long)s->kv.budget_bytes,
+        s->kv.pin_min_hits > 0 ? "true" : "false",
+        s->kv.pin_min_hits,
+        s->kv.len);
+    pthread_mutex_unlock(&s->kv_mu);
+
+    /* Reference throughput is only reported when the operator supplies
+     * measured numbers (DS4_CAPS_THROUGHPUT_JSON, a JSON object).  The
+     * server never benchmarks at request time and never fabricates a
+     * figure -- absent a real source the field is omitted. */
+    const char *tp = getenv("DS4_CAPS_THROUGHPUT_JSON");
+    if (tp && tp[0] == '{') {
+        buf_puts(&b, "\"throughput\":");
+        buf_puts(&b, tp);
+        buf_putc(&b, ',');
+    }
+
+    buf_printf(&b,
+        "\"apis\":{\"openai_chat_completions\":true,"
+        "\"openai_completions\":true,\"openai_responses\":true,"
+        "\"anthropic_messages\":true,\"count_tokens\":false,"
+        "\"sse_streaming\":true,"
+        "\"speculative\":{\"mtp\":%s,\"mtp_active\":%s,"
+        "\"mtp_draft_tokens\":%d,\"dspark\":%s}}}\n",
+        c->has_mtp ? "true" : "false",
+        (c->has_mtp && !s->batched_mode) ? "true" : "false",
+        c->mtp_draft_tokens,
+        c->dspark ? "true" : "false");
+
+    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
 static void client_done(server *s) {
     pthread_mutex_lock(&s->mu);
     if (s->clients > 0) s->clients--;
@@ -12402,6 +12526,14 @@ static void *client_main(void *arg) {
 
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
         send_models(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") &&
+        (!strcmp(hr.path, "/v1/capabilities") ||
+         !strcmp(hr.path, "/capabilities")))
+    {
+        send_capabilities(s, fd);
         http_request_free(&hr);
         goto done;
     }
@@ -12970,6 +13102,16 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    ds4_engine_capabilities(engine, &s.caps);
+    {
+        const ds4_context_memory cm =
+            ds4_context_memory_estimate_with_prefill_mode(
+                cfg.engine.backend,
+                cfg.ctx_size,
+                ds4_engine_prefill_chunk(engine),
+                cfg.engine.ssd_streaming);
+        s.session_ctx_bytes = cm.total_bytes;
+    }
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
     memset(s.slots, 0, (size_t)slot_count * sizeof(*s.slots));
     if (s.batched_mode) {
