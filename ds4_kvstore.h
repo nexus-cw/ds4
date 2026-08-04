@@ -62,6 +62,14 @@ typedef struct {
     int continued_interval_tokens;
     int boundary_trim_tokens;
     int boundary_align_tokens;
+    /* When true, store a canonical prompt-prefix ("cold") anchor for prompts
+     * that exceed cold_max_tokens too, using the aligned near-full boundary.
+     * The key is the incoming request's rendered prompt text, which is already
+     * the API-visible, thinking-stripped, template-normalized (canonical) form,
+     * so a later re-send or shared-prefix request content-addresses and
+     * restores it.  Bounded by the disk budget + eviction + pinning.
+     * DS4_KV_DEEP_COLD_ANCHOR=0 disables. Default on. */
+    bool deep_cold_anchor;
 } ds4_kvstore_options;
 
 typedef struct {

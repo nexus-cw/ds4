@@ -11203,6 +11203,24 @@ static void generate_job(server *s, server_slot *slot, job *j) {
                                                     ds4_token_assistant(s->engine));
         cold_store_len = anchor >= s->kv.opt.min_tokens ?
                          anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
+    } else if (cached == 0 &&
+               s->kv.enabled &&
+               s->kv.opt.deep_cold_anchor &&
+               s->kv.opt.cold_max_tokens > 0 &&
+               prompt_for_sync->len > s->kv.opt.cold_max_tokens)
+    {
+        /* Deep canonical prompt anchor (operator "LAYER 1"): prompts beyond
+         * cold_max_tokens otherwise get only continued/evict anchors keyed by
+         * the post-generation token stream (hidden thinking included), which a
+         * re-send or fresh shared-prefix request — whose replayed transcript is
+         * thinking-stripped — can never match, forcing a full re-prefill every
+         * time.  The incoming prompt text is already the canonical (API-visible,
+         * thinking-stripped, template-normalized) form, so store the aligned
+         * near-full prompt prefix as a "cold" anchor keyed by that text.  The
+         * next request that shares this canonical prefix content-addresses it
+         * and restores with a tail-only prefill.  Cost is bounded by the disk
+         * budget, LRU eviction, and pinning. */
+        cold_store_len = kv_cache_store_len(&s->kv, prompt_for_sync->len);
     }
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {

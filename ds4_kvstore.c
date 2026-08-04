@@ -177,6 +177,7 @@ ds4_kvstore_options ds4_kvstore_default_options(void) {
         .continued_interval_tokens = KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS,
         .boundary_trim_tokens = KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS,
         .boundary_align_tokens = KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS,
+        .deep_cold_anchor = true,
     };
 }
 
@@ -656,6 +657,12 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
     kc->budget_bytes = budget_mb * 1024ull * 1024ull;
     kc->reject_different_quant = reject_different_quant;
     kc->opt = opt;
+    const char *deep_env = getenv("DS4_KV_DEEP_COLD_ANCHOR");
+    if (deep_env && *deep_env && (deep_env[0] == '0' || deep_env[0] == 'n' ||
+                                  deep_env[0] == 'N' || deep_env[0] == 'f' ||
+                                  deep_env[0] == 'F')) {
+        kc->opt.deep_cold_anchor = false;
+    }
     kc->pin_min_hits = 0;
     const char *pin_env = getenv(KV_CACHE_PIN_MIN_HITS_ENV);
     if (pin_env && *pin_env) {
@@ -682,6 +689,9 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
             kc->opt.boundary_trim_tokens,
             kc->opt.boundary_align_tokens,
             (unsigned long long)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS);
+    kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+            "%s: KV disk cache deep canonical prompt anchors %s (DS4_KV_DEEP_COLD_ANCHOR)",
+            kv_log_name(kc), kc->opt.deep_cold_anchor ? "enabled" : "disabled");
     if (kc->pin_min_hits > 0) {
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
                 "%s: KV disk cache pinning enabled: anchor checkpoints with hits>=%d are never evicted (%s)",
