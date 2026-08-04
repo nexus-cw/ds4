@@ -4299,3 +4299,66 @@ separate engine prefill call with its own full expert sweep. Per-chunk fixed I/O
 small per-token compute means chunk size is the direct lever: double the chunk, halve
 the I/O per token, until the ~15-20% compute share dominates (ceiling ~3-4x). Phase 2 =
 chunk/quantum sweep 4096/8192/16384.
+
+
+## Task #29 Phase 2/3: prefill chunk sweep, 8192 default shipped -- cold 22k prefill 26.1 -> 66.2 t/s (2.54x) (2026-08-04)
+
+Lever chosen per the Phase 1 NVMe-bound verdict: amortize the per-chunk full expert
+sweep over more tokens. Both knobs must move together (the server idle sync quantum
+was the real 2048 clamp; the engine cap alone does nothing). Sweep: fresh boot per
+config (cold expert cache = the target metric), same ~22k corpus, manual instance
+with production flags, one request per config.
+
+| effective chunk (quantum=chunk) | wall s | prefill t/s | vs 2048 | boot plan | MemAvailable warm |
+|---|---|---|---|---|---|
+| 2048 (old default) | 842.1 | 26.1 | 1.0x | 74.01 GiB planned, ctx buffers 3111.75 MiB | ~15-16 GiB |
+| 4096 | 512.6 | 42.9 | 1.64x | 74.01 GiB planned, ctx buffers 3111.75 MiB | 15 GiB |
+| 8192 | 349.8 | 62.9 | 2.41x | 75.33 GiB planned, ctx buffers 4460.31 MiB | 9 GiB |
+| 16384 | FAILED | -- | -- | 77.33 GiB planned, ctx buffers 6512.43 MiB | -- |
+
+16384 fails hard at request time: "gpu layer 2 attention batch encode failed" ->
+HTTP 500 (attention batch encoder limit; not chased -- 8192 is inside the 2-3x
+target and the attention n^2 term erodes returns beyond it anyway). Scaling is
+sublinear (1.64x/2.41x vs ideal 2x/4x) because the compute share (~15-20% of wall
+at 2048) grows as I/O amortizes.
+
+Shipped (commit "default CUDA ssd-streaming server prefill chunk + idle sync
+quantum to 8192"): ds4-server defaults engine prefill_chunk to 8192 when
+ssd-streaming + CUDA and --prefill-chunk unset; idle sync quantum follows the
+engine chunk (server_prefill_quantum_for2), mixed quantum stays 128 for
+interactivity. --prefill-chunk / DS4_SERVER_PREFILL_QUANTUM /
+DS4_SERVER_MIXED_PREFILL_QUANTUM all still override. Non-streaming and non-CUDA
+servers keep the old 2048 idle default. Production benefits with NO service-file
+change.
+
+### Verification (new binary, production flags, no env)
+
+- Boot line confirms defaults: prefill_quantum=8192 mixed_prefill_quantum=128,
+  prefill_chunk=8192, plan 75.33 GiB.
+- **Final cold-20k-class number: 21,974 tokens in 331.9 s = 66.2 t/s = 2.54x**
+  vs the 26.1 t/s baseline (a 20k cold prompt now ~5.0 min, was ~12.6 min --
+  meets the 3-5 min target at the top of the band).
+- Greedy identity: 5k-token prompt, temperature=0, 80 tokens -- chunk 8192 vs
+  forced legacy 2048 on the same binary: **IDENTICAL** output text.
+- Decode: shallow 200-token greedy turn 4.45 t/s incl. its prefill (normal range;
+  decode path untouched by both changes -- quantum only differs when no generation
+  is active, and only for prefill).
+- Memory: MemAvailable 9 GiB measured right after the 22k prefill on the manual
+  instance (floor 8 GiB) -- the 8192 shared prefill workspace costs ~4-5 GiB over
+  the 2048 config (the "N resident sessions request at least X GiB" line went
+  6.08 -> 8.71 GiB and the aliased workspace scales with cap). Thin but above
+  floor; worth watching on the first deep (100k) prefill under the new default.
+- Production restored: systemctl active, /v1/models 200, /v1/capabilities OK,
+  chat smoke OK, new boot lines confirmed in journal. Service file untouched.
+  Nothing experimental left on (MMA gate untouched, still default OFF).
+
+### What remains
+
+- The remaining gap to the ~4 GB/s I/O floor at chunk 8192 is roughly half I/O,
+  half compute. Task #14's expert-major repack would cut per-sweep read
+  amplification (observed ~310 GB fetched per 2048-token chunk vs ~137 GiB of
+  routed expert bytes -- about 2x amplification from layout/readahead); combined
+  with chunk 8192 the amplification fix is worth up to another ~1.5x on cold
+  prefill before compute dominates.
+- MMA prefill stays a no-win while NVMe-bound (Phase 1 re-confirmed the old
+  verdict); it becomes relevant only after #14-class I/O wins.
