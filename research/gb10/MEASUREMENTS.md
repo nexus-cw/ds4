@@ -4101,3 +4101,160 @@ parity only) — corrected at the 128k restart; (3) 65k-unit's per-config
 shallow-during-deep probe (starvation result above) — two concurrent DEEP
 sessions were shown to collapse prefill to ~2.1 t/s each, which is the
 stronger statement.
+
+## Task #30 — KV continuation "full re-prefill" root-caused + fixed (deep canonical prompt anchors); 128k multi-turn-at-depth gap closed (2026-08-04)
+
+Unit: the 128k promotion recorded "every request re-prefills the full prompt"
+(live-KV token-mismatch at every turn boundary; deep disk anchors stored but
+never matched). Isolate the variable, root-cause, fix with the smallest safe
+change, and close the "multi-turn at depth unvalidated" gap the 128k unit
+left open. Fix commit ee2722d on research/gb10; production on robo-dog runs
+the new binary.
+
+### Isolating experiment matrix (small 2-3-turn prompts, production ctx=131072)
+
+| case | API | thinking | turn N+1 result |
+|---|---|---|---|
+| A | /v1/chat/completions | on, finish=stop | HIT `match=visible-prefix`, 9-tok delta prefill |
+| B | /v1/messages (anthropic) | on, finish=stop | HIT `match=visible-prefix`, 9-tok delta prefill |
+| C | chat, thinking TRUNCATED (finish=length) | on | MISS token-mismatch -> full re-prefill next turn |
+| D | deep re-send of identical prompt >30k | either | MISS -> full re-prefill (no matchable anchor) |
+
+Key correction to the 128k finding: multi-turn continuation with normal
+(finish=stop) turns is NOT broken on this build — it already hits the
+`thinking-visible` live checkpoint and prefills only the new-user-turn delta,
+on BOTH chat and anthropic (cases A/B, verified 9-token deltas). The 128k
+"every request re-prefills" observation was dominated by TWO methodology
+artifacts, each an instance of one root cause:
+
+- Truncated probe turns (case C): the quality probes used tiny max_tokens
+  and the model spent the budget inside `<think>`, so turns finished
+  finish=length. `should_remember_thinking_checkpoint()` deliberately (and
+  correctly) skips length-truncated turns — the sampled KV holds an unclosed,
+  thinking-stripped-on-replay span, so no cheap continuation is even
+  well-defined. This is inherent, not a fixable bug.
+- Deep needle probes were re-sent as fresh full prompts (case D). See below.
+
+### Root cause (single, unifying): stored/live representation carries hidden
+thinking; the replayed request is thinking-stripped, so the two forms cannot
+be content-addressed against each other.
+
+- Live-KV path already mitigates this at the last turn boundary via the
+  in-memory `thinking_live` visible checkpoint (ds4_server.c
+  thinking_live_visible_prefix_prompt / build_toolless_thinking_visible_text)
+  and the `evict`/`shutdown` disk anchor keyed by that visible transcript
+  (kv_cache_store_current). This is why continuation (cases A/B) and
+  continuation-after-eviction both restore.
+- The GAP (case D): prompts beyond `cold_max_tokens` (default 30000) receive
+  NO cold anchor. Their only disk anchors are `continued`
+  (kv_cache_maybe_store_continued) and `evict`, both keyed by the
+  post-generation token stream via ds4_kvstore_render_tokens_text
+  (ds4_kvstore.c:1017) — i.e. INCLUDING the hidden `<think>…</think>` spans.
+  A later re-send or fresh shared-prefix request, whose prompt_text is the
+  canonical thinking-stripped form, can never sha-match those anchors in
+  ds4_kvstore_find_text_prefix (ds4_kvstore.c:1236) -> full re-prefill from
+  ctx=0 (~57 min at 101k). Shallow (<=30k) prompts were unaffected because
+  the existing `cold` anchor is already keyed by the canonical prompt text
+  (ds4_server.c:11201 region), which is exactly why cold anchors "hit" and
+  deep ones did not in the 128k run.
+
+### Fix (operator LAYER 1: canonical, thinking-stripped, template-normalized
+per-turn-boundary content-addressing) — commit ee2722d
+
+Store an aligned near-full `cold` anchor for deep prompts too, keyed by the
+incoming request's rendered prompt text (already the API-visible, canonical
+form). ds4_server.c cold-store block gains an `else if` deep branch
+(prompt_len > cold_max_tokens && opt.deep_cold_anchor) setting
+cold_store_len = kv_cache_store_len(prompt_len). New option
+ds4_kvstore_options.deep_cold_anchor (default true), env kill-switch
+DS4_KV_DEEP_COLD_ANCHOR=0. No change to live-KV reuse, the anthropic/responses
+tool paths, task-16 pinning, or existing anchors. Old token-text deep anchors
+simply remain unmatched (acceptable). Cost bounded by disk budget + LRU +
+pinning. Server self-tests pass (`ds4-server tests: ok`); CPU build clean.
+
+Why not touch the truncation guard (case C): on finish=length the sampled KV
+lacks the closing `</think>`/EOS the visible key would claim, and the next
+turn's replay strips the incomplete thinking, so the byte-prefix key can't
+match regardless. Reusing that KV would be incorrect. Left as-is.
+
+### Acceptance evidence (production ctx=131072, new binary, robo-dog)
+
+ACC1 — multi-turn thinking, delta-only, both APIs: chat turns 2/3
+`match=visible-prefix cached=60/115`, prefill ctx=60..69:9 and 115..124:9
+(~2 s). anthropic turns 2/3 `match=visible-prefix cached=56/107`, prefill
+56..65:9 and 107..116:9. PASS (9-token deltas, not full re-prefill).
+
+ACC4 — multi-turn AT DEPTH (closes the 128k "multi-turn at depth
+unvalidated" gap): 48,619-token facility corpus, thinking enabled.
+Turn 1 full prefill 1542 s (~26 min, one-time). Turns 2-4:
+prompt_tokens 48704 / 48775 / 48851 (deltas +85/+71/+76),
+`match=visible-prefix cached=48691/48758/48837`, prefill
+48691..48704:13 (3.3 s), 48758..48775:17 (3.8 s), 48837..48851:14 (2.8 s).
+Recall correct at depth in genuine back-and-forth: vault code ZULU-7788-QX,
+turbine serial TN-40551-K, and "earliest IMPORTANT RECORD" reasoning all
+answered correctly. PASS — each follow-up turn is delta-only, seconds not
+30+ min.
+
+ACC2 — deep anchor restore across a FULL SERVICE RESTART: turn 1 above stored
+`kv cache stored tokens=47104 trimmed=1515 reason=cold key=token-text
+size=641.45 MiB` (the deep-canonical-anchor branch, prompt 48619 > 30000).
+`systemctl restart ds4-server` (fresh session, model reloaded), then re-sent
+the identical 48,619-token prompt: `kv cache hit text tokens=47104
+key=token-text load=385 ms`, prefill ctx=47104..48619:1515 (66 s), total
+wall 88 s (vs 1542 s cold) -> ~17x. Answer ZULU-7788-QX. PASS. Pre-fix
+baseline for this exact request: full ctx=0 re-prefill (reproduced at small
+scale with cold_max=1024: 1506-token re-send went 0..1506 before fix, and
+1280..1506:226 tail-only after fix).
+
+ACC3 — claude CLI 2-turn regression: the anthropic /v1/messages continuation
+path claude CLI uses is exercised by ACC1-anthropic, which replays the full
+assistant content blocks (thinking verbatim, as the CLI does) and still hits
+visible-prefix with a 9-token delta. The fix modifies no code on the live-KV,
+anthropic_live, or tool-result path (only adds deep disk-anchor storage), so
+the task-9 (commit 9c1316d) claude CLI tool-result behavior is preserved by
+construction. NOTE: driving the real `claude` CLI live against the box was not
+a clean measurement here — the CLI's ~21k-token system-prompt context prefills
+in ~14 min at ~25 t/s, longer than the CLI's client-side request timeout, so
+the CLI disconnects mid-prefill and retries (`stream closed during prefill`).
+That is a decode/prefill-speed vs client-timeout mismatch, NOT a continuation
+regression; the box logs during those retries actually show the new anchors
+restoring 10k/20k-token prefixes (`kv cache hit … reason=cold/continued`),
+i.e. the fix helping. Prewarming / faster prefill (task #24 block anchors)
+is the real remedy for interactive deep CLI use.
+
+### Corrected KV bytes/token number
+
+The 128k unit measured ~13.4 MB/1k on-disk and flagged it above the earlier
+~9 MB/1k estimate. Confirmed here: the 47,104-token cold anchor is 641.45 MiB
+= 14.28 MB/1k; the 20,480-token CLI anchor 291.79 MiB = 14.95 MB/1k; the
+10,240-token 157.34 MiB = 16.1 MB/1k. On-disk anchor cost is ~13.5-16 MB/1k
+tokens at ctx=131072 (compressed-row mix plus per-entry text+trailer
+overhead, heavier at smaller token counts). The ~9 MB/1k figure was a
+raw-KV-only estimate and is superseded: budget deep anchors at ~14 MB/1k
+(a full 107k anchor ~= 1.44 GiB, consistent with the 128k table).
+
+### Linkage design note (for tasks #24 block anchors + prewarming)
+
+Three-layer plan (operator, 2026-08-04):
+- LAYER 1 (shipped, this task): canonical-form matching — thinking-stripped,
+  template-normalized — content-addressed per turn boundary. The replayed
+  transcript is its own marker; works for all clients; O(text) sha lookup.
+  Deep prompts now participate via the deep-cold-anchor branch.
+- LAYER 2 (follow-up, NOT built): the anthropic surface already EMITS a
+  `signature` field on thinking blocks (ds4_server.c append_anthropic_thinking
+  :7378, currently the message-id prefix) and clients are required to replay
+  thinking/redacted_thinking blocks verbatim. A server-generated opaque handle
+  embedded there would round-trip legitimately and give O(1) exact session
+  identity + slot affinity without content inference. Incoming parsing
+  currently ignores `signature`; wiring emit->parse->handle->checkpoint table
+  is moderate new code+state, so deferred (not "cheap and clean" after L1).
+- LAYER 3 (note only): OpenAI Responses-style previous_response_id explicit
+  linkage — future.
+
+### Server state
+
+robo-dog ds4-server.service ACTIVE on new binary (ee2722d): /v1/models 200,
+/v1/capabilities configured=131072 trained=65536, DS4_KV_PIN_MIN_HITS=2,
+"deep canonical prompt anchors enabled", chat + deep restore smoke OK. Service
+file UNCHANGED (fix is default-on in the binary; env kill-switch available but
+not set). Instant-rollback IQ2 block untouched.
