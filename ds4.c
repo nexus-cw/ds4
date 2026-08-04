@@ -3003,6 +3003,19 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
                                               span_offsets, span_sizes, span_count)) {
             continue;
         }
+        /* Task-22 piece 2 (DS4_EMBD_MMAP=1, default OFF): leave the token
+         * embedding table out of the resident device spans; the CUDA embed
+         * path serves the rows from the read-only host mapping instead
+         * (see cuda_model_range_ptr). Saves ~1 GiB of residency. */
+        if (getenv("DS4_EMBD_MMAP") != NULL &&
+            t->name.len == strlen("token_embd.weight") &&
+            memcmp(t->name.ptr, "token_embd.weight", t->name.len) == 0) {
+            fprintf(stderr,
+                    "ds4: DS4_EMBD_MMAP=1: token_embd.weight (%.2f MiB) left "
+                    "unprepared, served from the host model mapping\n",
+                    (double)t->bytes / 1048576.0);
+            continue;
+        }
         spans[nspan++] = (accelerator_tensor_span){
             .off = t->abs_offset,
             .end = t->abs_offset + t->bytes,
