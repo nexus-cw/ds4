@@ -4206,8 +4206,13 @@ baseline for this exact request: full ctx=0 re-prefill (reproduced at small
 scale with cold_max=1024: 1506-token re-send went 0..1506 before fix, and
 1280..1506:226 tail-only after fix).
 
-ACC3 — claude CLI 2-turn regression: the anthropic /v1/messages continuation
-path claude CLI uses is exercised by ACC1-anthropic, which replays the full
+ACC3 — claude CLI 2-turn regression: measured directly on the anthropic
+tool-result path claude CLI uses (task-9 shape). Turn 1 -> stop_reason
+tool_use (get_code); turn 2 replays assistant thinking+tool_use verbatim +
+the tool_result, and the box logs `anthropic live continuation
+match=tool-output-ids ids=1 cached=428 prompt=445` -> 17-token delta prefill,
+answer correct (QRX-2214), reproducing exactly the task-9 (commit 9c1316d)
+17-token delta. Also exercised by ACC1-anthropic, which replays the full
 assistant content blocks (thinking verbatim, as the CLI does) and still hits
 visible-prefix with a 9-token delta. The fix modifies no code on the live-KV,
 anthropic_live, or tool-result path (only adds deep disk-anchor storage), so
