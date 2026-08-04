@@ -4263,3 +4263,39 @@ robo-dog ds4-server.service ACTIVE on new binary (ee2722d): /v1/models 200,
 "deep canonical prompt anchors enabled", chat + deep restore smoke OK. Service
 file UNCHANGED (fix is default-on in the binary; env kill-switch available but
 not set). Instant-rollback IQ2 block untouched.
+
+
+## Task #29 Phase 1: cold-prefill bound diagnosis, cold vs warm expert cache (2026-08-04)
+
+Question: what is bulk prefill bound by NOW (post grouped-prefill a627e80, 70GB cache,
+O_DIRECT, ctx 131072)? Method: ds4-server stopped; manual instance with production flags
+(+DS4_CUDA_STREAM_STATS=1); one ~22k-token cold request on a fresh boot (cold expert
+cache), then two more full-prefill requests in the SAME process (nonce-prefixed prompt
+forces token-mismatch -> full re-prefill; device expert LRU is warm/populated).
+nvidia-smi 5s sampler + iostat -x 5 per arm. Prompt: 78KB of ds4_server.c text,
+21,985-21,988 tokens.
+
+| arm | wall s | prompt tokens | prefill t/s | avg NVMe read | NVMe util | GPU util distribution |
+|---|---|---|---|---|---|---|
+| cold (fresh boot) | 842.1 | 21985 | 26.1 | 3.97 GB/s | 70.4% | ~15-20% of samples at 66-96%, rest 7-9% |
+| warm (same proc)  | 854.9 | 21987 | 25.7 | 3.90 GB/s | 71.0% | similar |
+| warm2             | 852.1 | 21988 | 25.8 | -- | -- | -- |
+
+**Verdict: NVMe-BOUND, via expert-cache capacity thrash.** Warm == cold to within 1.5% --
+the 63.61 GiB expert cache never helps bulk prefill because each 2048-token chunk routes
+to essentially the whole routed expert set, which exceeds the cache, so every chunk
+re-streams from NVMe. Both arms sit at ~3.9 GB/s sustained (the known ~4 GB/s ceiling)
+for the entire prefill: ~3.3 TB read for a 22k prefill, ~310 GB per 2048-token chunk
+(roughly 2x the full routed-expert byte set per chunk). GPU is mostly idle (dominant
+5s sample 7-9% util, with a ~15-20% minority at 66-96% -- the compute share). The old
+"MMA prefill was a no-win because prefill was NVMe-bound" verdict is NOT stale: it is
+still true, now at 26-30 t/s instead of 3.6.
+
+Corollary: today's effective prefill chunk in the server is **2048, not 4096** -- the
+engine cap is 4096 (`prefill_chunk=4096` in the boot line) but
+`server_prefill_quantum_for()` slices session sync into 2048-token quanta when no
+generation is active (`DS4_SERVER_PREFILL_QUANTUM` default), and each quantum is a
+separate engine prefill call with its own full expert sweep. Per-chunk fixed I/O cost +
+small per-token compute means chunk size is the direct lever: double the chunk, halve
+the I/O per token, until the ~15-20% compute share dominates (ceiling ~3-4x). Phase 2 =
+chunk/quantum sweep 4096/8192/16384.
