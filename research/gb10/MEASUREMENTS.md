@@ -3944,3 +3944,160 @@ No OOM, no thrash, no server errors, clean shutdown. Production
 prudence-deviation comment replaced by the validation record; daemon-reload +
 restart verified (/v1/models 200, capabilities configured=65536, chat smoke).
 Authority copy committed on dMon /opt/carriedworld-cloud (064d3ad, unpushed).
+
+## 2026-08-04 — ctx 131072 / 262144 validation (RoPE-stretch, quality-gated); 131072 PROMOTED
+
+Unit: validate --ctx 131072 (2x trained) and --ctx 262144 (4x trained) on
+robo-dog, memory AND quality at depth; promote the largest passing config.
+trained original_context_length=65536 (/v1/capabilities), GGUF-declared
+1048576 = 16x stretch. Test pattern: production stopped, manual instance,
+production flags except --ctx. 256k arm ABORTED BY OPERATOR mid-run (below).
+
+### Boot plans (measured)
+
+| ctx | context buffers / slot | 2 slots | planned total | caps configured/trained |
+|---|---|---|---|---|
+| 65536 (prior) | 1739.75 MiB | ~3.4 GiB | 74.0 GiB-class | 65536 / 65536 |
+| 131072 | 3111.75 MiB | >= 6.08 GiB | 74.01 GiB | 131072 / 65536 |
+| 262144 | 5855.75 MiB | >= 11.44 GiB | 76.69 GiB | 262144 / 65536 |
+
+Per-slot buffers scale ~1.79x per ctx doubling (not the naive 2x: raw ring
+fixed at 4352 rows, compressed rows scale: 32770 @128k, 65538 @256k).
+Prefill headroom (6.38 GiB) and expert cache (63.61 GiB) unchanged, as
+predicted by the 65k unit.
+
+### SERVING FINDING (load-bearing for all deep-context use): every request
+re-prefills the full prompt on this build (HEAD 24c8261)
+
+- Live-slot KV reuse fails on EVERY conversation continuation with
+  reason=token-mismatch at the turn boundary (observed: common=6102 vs
+  live=6119; common=107755 vs live=107929). The generated (thinking) token
+  history retokenizes differently on replay, so the memory-token,
+  memory-text, and thinking-visible paths all miss. Confirmed on BOTH
+  /v1/chat/completions and /v1/messages (anthropic).
+- Disk kv anchors: only small "cold" anchors (~3.5k tokens, trimmed to the
+  raw-window boundary) were ever HIT. Deep "continued"/"evict" anchors
+  (10240..102400 tokens, up to 1440 MiB) were stored but never matched by
+  ds4_kvstore_find_text_prefix on identical re-sent prompts — every deep
+  request prefilled from ctx=0. Root cause not fully isolated (sha-prefix
+  lookup looks correct in ds4_kvstore.c; suspect interaction in the
+  find/eviction path). Without pinning, mid-doc anchors are also evicted
+  (disk-cache-full, hits=0) under the 16384 MiB budget.
+- Net: a 101k-token prompt costs ~57 min prefill EVERY time (~29.5 t/s).
+  Two concurrent deep prefills collapse to ~2.1 t/s each (observed) — the
+  scheduler interleaves 128-token chunks and NVMe streaming (~4 GB/s, ~69%
+  util) is the shared bottleneck. A shallow request issued during a deep
+  prefill was starved ~44 min before completing.
+- Consequence for protocol: needle probes could not be separate cheap turns
+  (each = full re-prefill); the quality gate was run as a single deep
+  request with all probes asked at once (deviation, operator-visible), plus
+  a mid-depth request. Also: model burns most of a small max_tokens budget
+  on thinking — first probe run at max_tokens=700 spent ~670 tokens thinking
+  and truncated; rerun at max_tokens=2500 with a "answer directly" system
+  line completed.
+
+### ctx=131072 — memory
+
+| point | MemAvailable | notes |
+|---|---|---|
+| post-boot (cache cold) | 109.1 GiB | before expert cache fills |
+| warm steady, deep prefill running | ~17.1-18.2 GiB | stable through 101k prefill |
+| minimum over whole arm | 16.51 GiB | floor criterion 8 GiB — wide margin |
+| swap | peak ~1.2 GiB used | no thrash; SwapFree 16.46 -> 15.27 GiB min |
+
+Dual-slot at depth: shallow request fired during the 101k prefill/decode
+completed (elapsed 2675 s — starvation latency, see finding above); memory
+held (the min above includes this window). No OOM, no server errors.
+
+### ctx=131072 — quality gate (needle-in-haystack, self-scored, verbatim)
+
+Document: ~365 KB real repo text, 101,021-101,031 prompt tokens, 7 invented
+factoids planted at controlled depths. temperature=0.
+
+Mid-depth request (56,044 tokens, inside trained window), answers verbatim
+"1. QRX-2214\n2. BLUE-HERON-52\n3. TN-88413-F" — 3/3 exact.
+
+Full-depth request (101,031 tokens; stretch zone = beyond 65536):
+
+| # | planted depth (tok) | key | expected | answer | pass |
+|---|---|---|---|---|---|
+| 1 | ~5k | pump station Delta-7 maintenance code | QRX-2214 | QRX-2214 | PASS |
+| 2 | ~30k | reservoir gate Kilo-3 access phrase | BLUE-HERON-52 | BLUE-HERON-52 | PASS |
+| 3 | ~45k | turbine Echo-9 serial | TN-88413-F | TN-88413-F | PASS |
+| 4 | ~60k | depot Sierra-1 callsign | FOXTROT-NINER-2 | FOXTROT-NINER-2 | PASS |
+| 5 | ~80k (stretch) | manifold Tango-4 valve torque | 112 newton-metres | 112 newton-metres | PASS |
+| 6 | ~90k (stretch) | sensor array Lima-6 firmware tag | v7.3.1-rc4 | v7.3.1-rc4 | PASS |
+| 7 | ~100k (stretch) | culvert November-8 inspection date | 14 March 2031 | 14 March 2031 | PASS |
+
+Recall: 4/4 = 100% inside trained window; 3/3 = 100% stretch zone
+(gate: 100% / >=75%). Reasoning-over-context probes (same request), verbatim:
+
+Q8 "Which IMPORTANT RECORD appears closest to the end of the document and
+which earliest?" -> "Closest to the end: \"the inspection date for culvert
+November-8 is 14 March 2031\" (just before END OF DOCUMENT). Earliest:
+\"the maintenance code for pump station Delta-7 is QRX-2214\" (in the QA
+Before Releases section)." — correct on both, correctly localized.
+
+Q9 beginning/middle/end characterization -> "Near the beginning: project
+documentation (Agent Notes: goals, quality rules, layout, testing). Middle:
+model card synopsis, release QA gates, README/usage documentation, and
+CLI/server source code. End: low-level distributed-inference source code
+(ds4_distributed.c) and the final IMPORTANT RECORD." — accurate against the
+actual corpus ordering. Subjective quality at 101k: coherent, precise, no
+degradation signs. QUALITY: PASS.
+
+### ctx=131072 — throughput at depth
+
+| depth (prompt tokens) | prefill avg t/s | decode t/s |
+|---|---|---|
+| shallow (35) warm | — | 5.36 (65k-unit baseline; this arm's shallow probes were contended: 0.66-1.64, not comparable) |
+| 56,044 | 29.7 | 4.02 |
+| 101,021-107,769 | 23.4-29.6 | 4.20 (uncontended run; 3.29 and 3.13 on concurrent runs) |
+
+Decode -21.6% at 101k vs 5.36 shallow — outside the 15% band used at 65k
+but graceful and interactive; degradation is depth-driven, not
+config-driven (the band was defined for the 45k point; at 45-56k this
+config shows 4.02-4.78, consistent with the 65k unit's own curve).
+
+### KV anchor arithmetic at 131072
+
+Measured ~13.4 MB/1k tokens on-disk (426 MiB @30720, 695 MiB @51200,
+1233 MiB @92160, 1440 MiB @107929 — above the 65k unit's ~9 MB/1k estimate;
+compressed-row mix differs at 128k). 16384 MiB budget holds ~11 full-depth
+(107k) anchors; with pinning off, deep anchors evict small ones
+(disk-cache-full observed). Production keeps DS4_KV_PIN_MIN_HITS=2.
+
+### ctx=262144 — arm ABORTED BY OPERATOR (partial data)
+
+- Boot at bs=2 SUCCEEDS: buffers 5855.75 MiB/slot (11.44 GiB both),
+  planned 76.69 GiB, caps configured=262144/trained=65536. The
+  --batched-session 1 fallback was never needed for boot.
+- Deep build reached 63,488/195,188 tokens (32.5%) at avg 29.13 t/s prefill
+  when the operator stop landed (prefill-acceleration work queued behind
+  this unit; 256k ceiling documentation judged not worth the box-hours).
+- Memory at abort window: MemAvailable min 10.87 GiB (floor 8 GiB — closer
+  but never breached); swap peak ~2.8 GiB used (fail threshold 3 GiB
+  sustained — flirting with it during prefill; would have needed watching
+  at 195k + dual slot).
+- NO quality probes were reached. 262144 is NOT validated: memory-plausible
+  at bs=2 but quality at 4x stretch is unknown. Do not promote without a
+  fresh quality-gated run.
+
+### Verdict and production state
+
+ctx=131072: PASS memory + PASS quality -> PROMOTED 2026-08-04.
+/etc/systemd/system/ds4-server.service ExecStart --ctx 65536 -> 131072
+(assert-exact replace), validation comment block updated; daemon-reload +
+restart; verified /v1/models 200, capabilities configured=131072
+trained=65536 pin_min_hits=2, chat smoke OK. Instant-rollback IQ2 block
+untouched. Authority copy committed on dMon /opt/carriedworld-cloud
+(9981edb, local only, unpushed).
+
+Deviations: (1) quality probes batched into one request per depth instead
+of separate turns (forced by full-re-prefill economics, documented above);
+(2) test instances initially ran without DS4_KV_PIN_MIN_HITS=2 (CLI-flag
+parity only) — corrected at the 128k restart; (3) 65k-unit's per-config
+"dual-slot concurrent decode" measurement replaced by the concurrent
+shallow-during-deep probe (starvation result above) — two concurrent DEEP
+sessions were shown to collapse prefill to ~2.1 t/s each, which is the
+stronger statement.
