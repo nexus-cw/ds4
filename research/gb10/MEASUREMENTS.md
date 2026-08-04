@@ -4435,3 +4435,135 @@ Production: restored on the ORIGINAL file and verified (models 200,
 capabilities, chat smoke). Promotion of the repacked artifact is the
 operator's call; it is drop-in (identity-verified) and lives at
 /data/gguf/accretion/ with its manifest.
+
+
+## Task #22: I/O polish -- fallback observability, embedding mmap, resident audit, GDS go/no-go (2026-08-05)
+
+Four bounded pieces on the streaming I/O path. Production context: DS4-Flash
+MXFP4/Q8 streamed, ctx 131072, 70GB expert cache, chunk 8192, chains+prewarm.
+Commits d006159 (piece 1) + bc484cb (piece 2), research/gb10.
+
+### Piece 1: direct-I/O fallback observability (SHIPPED, live in production)
+
+Closes the "tier 2 could silently vanish and nobody would know" gap: an
+EINVAL/EFAULT/ENOTSUP on a direct read permanently disables O_DIRECT for the
+process, previously with only a verbose-mode stderr line as evidence. Now:
+
+- Counters: fallback events by errno class (einval/efault/enotsup/other),
+  permanent-disable state + errno, widened-read stats (count + total wasted
+  alignment bytes). The permanent-disable event now always logs.
+- Exposed in the DS4_CUDA_STREAM_STATS self-report, /v1/capabilities
+  serving.direct_io, /v1/activity (state only), and the web console status
+  line (red when not engaged).
+
+Sample self-report (arm0, robo-dog, warm turns):
+
+```
+ds4: CUDA direct I/O: state=engaged disable_errno=0 fallbacks einval=0
+efault=0 enotsup=0 other=0 widened_reads=69166 widen_wasted=270.179 MiB
+avg_waste=4096.0 B/read
+```
+
+Capabilities excerpt (production, post-restore):
+
+```
+"direct_io": {"state": "engaged", "disable_errno": 0,
+  "fallbacks": {"einval": 0, "efault": 0, "enotsup": 0, "other": 0},
+  "widened_reads": ..., "widen_wasted_bytes": ...}
+```
+
+Finding from the counters themselves: avg waste is EXACTLY 4096 B/read --
+every widened read pays one extra 4KB page of alignment, i.e. ~0.03% of a
+~13 MiB expert fetch. Widening overhead is confirmed negligible.
+
+**Upstream note (assessed, not filed): the same gap exists on antirez main**
+-- upstream ds4_cuda.cu:2118-2120 has the identical errno-class permanent
+disable behind a DS4_CUDA_WEIGHT_CACHE_VERBOSE-only log, and no counters.
+The observability port is upstream-relevant alongside the task-18 accounting
+backport already noted at PR #647.
+
+### Piece 2: embedding-table mmap (DS4_EMBD_MMAP=1, default OFF) -- CLEAN
+
+token_embd.weight (Q8_0, 1010 MiB -- the entire "resident model 0.99 GiB"
+plan line) is left out of the resident CUDA spans; embed kernels resolve it
+to the read-only host model mapping (GB10 ATS/HMM pageable access,
+page-cache-backed rows). Per-token decode touches one ~7.6 KB row.
+
+Protocol: production stopped, manual instances, production flags +
+DS4_CUDA_STREAM_STATS=1, new binary both arms; same turn script (3430-token
+prefill, then 3x 128-token warm turns, e2e t/s incl. prefill of the short
+prompt, matching the task-18 protocol).
+
+| measure | arm0 (resident) | arm1 (DS4_EMBD_MMAP=1) | verdict |
+|---|---|---|---|
+| (a) resident delta | covered 0.99 GiB spans | covered 0.00 GiB; "left unprepared, served from host mapping" | **-1010 MiB residency** (free -g avail 96 vs 97 post-boot) |
+| (b) warm decode e2e t/s (T2/T3/T4) | 4.25 / 4.28 / 4.36 | 4.19 / 4.23 / 4.33 | -0.9% avg, within run-to-run noise |
+| (c) cold-prefill, 3430 tok @ chunk 8192 | 144.0 s | 76.1 s | no cost signal (arm1 faster; T1 confounded by disk-cache state, not a claimed win) |
+| (d) first-token after full page-cache drop | -- | short req 4.8 s vs 2.3 s warm | **~2.5 s one-time transient**, recovered by next request (4.15 -> 4.36 t/s across 3 post-drop turns) |
+
+**Verdict: CLEAN -- no measurable throughput cost, ~1 GiB residency freed,
+worst-case transient bounded at ~2.5 s once after a total page-cache drop.**
+
+**Upstream-proposal case**: on any box where the model streams (the setting
+ds4's --ssd-streaming exists for), the embedding table is the single largest
+always-resident tensor and its access pattern is one row per token -- exactly
+what a read-only mmap serves at page-cache speed. Numbers above: 1010 MiB
+freed for 0% measured decode/prefill cost on GB10 unified memory. Caveat for
+the proposal: the GPU-side read relies on ATS/HMM pageable access (fine on
+GB10/Grace; discrete-GPU targets would need the cudaHostRegister path that
+cuda_model_range_ptr already has). Production left at default OFF pending
+operator decision; flipping it is a one-line env addition to the unit file.
+
+### Piece 3: resident-category audit (paper-only)
+
+From the #18 accounting, the boot plan (75.33 GiB planned at 70GB/ctx131072),
+and the GA-thrash incident audit. Categories beyond the dynamic expert cache
+(63.61 GiB LRU, byte-enforced since #18):
+
+| category | size | access pattern | demotable by policy? |
+|---|---|---|---|
+| token_embd.weight | 0.99 GiB | 1 row (~7.6 KB) per token decode; many rows per prefill chunk | **YES -- piece 2 (measured clean), env-gated** |
+| dialect-compat dequantized F16 tensors (13 families / 339 tensors) | 2.70 GiB | every token, every layer (attention/dense path) | NO -- hot per token; also exists only in the conversion extension (no on-disk form to fall back to) |
+| Q8_0 dense tensors kept as-is (365: attn projections, shared experts, norms, output head) | 5.80 GiB | every token, every layer | NO -- this is the always-hot core |
+| KV: raw+compressed rings + buffers | 4.35 GiB planned | per active session, hot | dial (ctx / --batched-session), not demotion |
+| per-slot context buffers | 3111.75 MiB x 2 = 6.08 GiB | per request | dial (ctx/slots); scales 1.79x per ctx doubling |
+| prefill expert reserve | 6.38 GiB | prefill bursts only, idle at decode | semi -- a planner split, could in principle be lent to the LRU between prefills; today static |
+| pinned host staging (model 4x + selected 4x + xdev bounce) | 0.50 GiB | every miss (O_DIRECT staging ring) | NO (load-bearing for direct I/O); GDS would remove it, see piece 4 |
+| LRU metadata (host) | ~3 MiB | -- | negligible |
+| CUDA driver overhead for mappings | unaccounted (RESEARCH_MAP: ~16 GB at 80 GiB resident scale) | -- | NO; shrinks as mapped bytes shrink |
+
+The "~9 GiB always-hot set" = 2.70 + 5.80 + embd 0.99 (now demotable) +
+staging 0.50. Remaining demotion headroom after piece 2 is essentially the
+prefill-reserve/LRU split and the ctx dials -- no further force-resident
+allocation is demotable without touching the per-token hot path.
+
+### Piece 4: GDS go/no-go (paper-only) -- **NO-GO at current bounds**
+
+With O_DIRECT verified engaged (piece 1 counters), GDS's remaining win is
+eliminating the bounce copy: NVMe -> pinned-host staging ->
+cudaMemcpyAsync H2D. Measured memcpy bandwidth (probe, this box, pinned
+512 MiB x 8): **59.1 GB/s**.
+
+- Decode: miss traffic ~0.16-0.2 GB/token. Copy cost 0.2 / 59.1 = **3.4 ms/
+  token** vs NVMe read 0.2 / 4.0 = 50 ms/token and a token budget of ~227 ms
+  (4.4 t/s). Fully serialized worst case the copy is <=1.5% of the token
+  budget; in reality the 4-deep staging event ring overlaps it behind the
+  read, so the marginal cost is ~0.
+- Prefill: a cold 22k sweep moves ~310 GB. Copy: 310 / 59.1 = **5.2 s** vs
+  read 310 / 4.0 = ~78 s (and measured wall ~330 s: other bounds dominate) --
+  <=1.6% even unoverlapped.
+- GDS upside cap: <=1-2% throughput best case + 0.50 GiB pinned staging
+  freed. Cost: nvidia-fs/cuFile dependency, rework of the staging path that
+  piece 1 just instrumented, and a second I/O path to keep honest.
+
+**Conclusion: NO-GO.** The copy hides behind a 15x-slower read. Revisit only
+if effective NVMe bandwidth approaches the same order as memcpy (~10x
+today's 4 GB/s -- stripe or NVMe-oF class), at which point the bounce copy
+stops being hidden. Closes the GDS question for this box permanently.
+
+### Server state
+
+Production restored and verified: ds4-server ACTIVE, /v1/models 200,
+/v1/capabilities serving direct_io state=engaged with live counters, console
+renders the direct I/O status line, chat smoke OK. DS4_EMBD_MMAP not set
+(default OFF) per task scope; recommendation above.
