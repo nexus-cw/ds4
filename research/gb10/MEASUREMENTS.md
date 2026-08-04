@@ -4362,3 +4362,76 @@ change.
   prefill before compute dominates.
 - MMA prefill stays a no-win while NVMe-bound (Phase 1 re-confirmed the old
   verdict); it becomes relevant only after #14-class I/O wins.
+
+
+## Task #14: accretion-prepare v0 -- expert-major/4KB repack A/B: alignment buys throughput efficiency, not fewer bytes (2026-08-04)
+
+Tool: `nexus-cw/accretion` `tools/accretion-prepare/` (python3+numpy, streaming,
+never loads the model in RAM). One command, 4 stages: FETCH (verify size/sha),
+NORMALIZE (dialect normalization moved to convert time -- transplant of the
+9c4b760/99e7f1a/f7ec45f/3106c3c/0528b32 load-time compat: derived
+deepseek4.vocab_size=129280; 13 dense tensor families BF16/2D-F32 -> F16, 0
+clamps; GA tensor names were already canonical, 0 renames), OPTIMIZE
+(general.alignment=4096, every tensor offset 4KB-padded; data order dense-first
+then per-layer gate/up/down routed tensors; MXFP4 expert slice = 4,456,448 B =
+1088*4096, so EVERY (layer,expert) slice is 4KB-aligned), MANIFEST (33,024
+expert entries + 1,199 dense entries, per-entry file/offset/len/location).
+Repack of the 156.4GB GA artifact: 1148s, output 156,309,032,960 B on /data,
+sha256 dedd760b... Root NVMe untouched throughout (112G free before = 111G after).
+
+### Verification ladder
+1. Manifest offsets: 5 random experts byte-IDENTICAL to source slices, all
+   offsets 4096-aligned; dense spot-checks OK (FAILS=0).
+2. Native load: manual ds4-server on the repacked file, production flags --
+   **dialect_compat_lines=0** (the entire point of NORMALIZE), models 200,
+   6k-token chat smoke OK.
+3. Greedy identity (temp 0, 80 tok, 6.2k-token prompt, same binary/flags,
+   fresh per-arm KV dirs, only -m differs): **IDENTICAL**.
+4. Eval smoke on repacked: **4/4 PASSED** (GPQA Diamond x2, SuperGPQA, AIME2025).
+
+### Layout A/B (cold 22k prefill, chunk 8192, DISK HELD CONSTANT)
+Disk probes: /data (sda SATA-class SSD) 519 MB/s seq O_DIRECT, root NVMe 5.1
+GB/s -- /data is ~10x slower, so BOTH arms ran from /data (original was already
+mirrored there, byte-identical size). After each drop_caches the ~8.5 GiB dense
+range set was page-cache prewarmed symmetrically in both arms (buffered reads;
+the measured expert-stream path is O_DIRECT and unaffected). Discovery en route:
+the ORIGINAL-layout boot from /data is pathological without the prewarm
+(~0.7 GiB dense loaded in 25 min -- scattered 32B-aligned dense tensors on the
+O_DIRECT load path), while the repacked dense-first/4KB file boots in minutes:
+a real operational win for slow media on its own.
+
+| arm (from /data) | wall s | prompt tok | prefill t/s | GiB read | avg read | r_await | util |
+|---|---|---|---|---|---|---|---|
+| original layout  | 2498.4 | 21974 | 8.80 | 1101 | 449 MB/s | ~48 ms | ~86% |
+| accretion repack | 2208.4 | 21974 | **9.95** | 1110 | 512 MB/s | ~5-6 ms | ~88% |
+
+- **Wall win 1.13x** (2498 -> 2208 s), matching the sustained-throughput ratio
+  (512/449 = 1.14x) at equal disk utilization.
+- **Read amplification is UNCHANGED**: ~1.1 TB read by both arms = ~2.7x the
+  137 GiB routed set per 8192-token chunk sweep (3 sweeps for 22k). The
+  amplification is expert-cache capacity thrash (task#29 phase-1 verdict), not
+  alignment edge waste -- at ~500 KB avg request size the <=511 B unaligned
+  edge is ~0.1% of bytes. The layout cannot and did not reduce bytes read.
+- The win mechanism is per-read efficiency: aligned 4KB O_DIRECT requests cut
+  r_await ~9x on this SSD and lift sustained throughput ~14%.
+
+### Projection to root NVMe (stated assumptions, not measured)
+This A/B measures the layout's RELATIVE effect with the disk held constant on
+a ~480 MB/s-class SSD. Since bytes read are unchanged, any root-NVMe gain can
+only come from the same per-read-efficiency mechanism. Root NVMe already
+sustains 3.9 GB/s at ~70% util with the unaligned layout (task#29 baseline
+66.2 t/s / 331.9 s), i.e. its queue is far less latency-bound, so the 1.14x
+observed here is an UPPER bound there. Projected root-NVMe numbers: between
+66.2 t/s (no change) and ~75 t/s / ~292 s (full 1.14x transfer). **Verdict:
+the ~1.5x hoped-for layout win is NOT there** -- amplification is cache-thrash
+-driven and layout-invariant; the honest wins are (1) zero dialect-compat load
+paths, (2) 4KB/O_DIRECT-native artifact + per-expert offset manifest
+(appendable-store-ready), (3) ~14% throughput on IOPS/latency-limited media
+and a boots-at-all fix for slow media, (4) a repeatable ingest pipeline.
+Next lever for the 1.5x question remains chunk>8192 (needs the attention
+batch-encode limit fixed) or smarter per-chunk expert scheduling, not layout.
+
+Production: restored on the ORIGINAL file and verified (models 200,
+capabilities, chat smoke). Promotion of the repacked artifact is the
+operator's call; it is drop-in (identity-verified) and lives at
+/data/gguf/accretion/ with its manifest.
