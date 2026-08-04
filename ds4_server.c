@@ -667,6 +667,10 @@ typedef struct {
     stop_list anthropic_live_call_ids;
     char *anthropic_live_suffix_text;
     tool_replay_stats tool_replay;
+    /* POST /v1/prewarm: run canonicalization + restore + prefill + anchor
+     * storage exactly as a normal request, generate zero tokens, and answer
+     * with a JSON accounting object instead of a completion. */
+    bool prewarm;
 } request;
 
 static void tool_call_free(tool_call *tc) {
@@ -8249,6 +8253,9 @@ struct server_slot {
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
     int continued_last_store_tokens;
+    /* Anchor checkpoints stored during the current request (chain + cold +
+     * continued); reported by POST /v1/prewarm. */
+    int req_anchors_stored;
 
     job *assigned;
     bool busy;
@@ -8316,6 +8323,12 @@ struct server {
      * kv_mu is already held on the store/load paths; read lock-free by the
      * activity endpoint (slightly stale reads are fine). */
     unsigned long long act_kv_stores;
+    unsigned long long act_kv_chain_stores;
+    unsigned long long act_prewarm_requests;
+    /* Jobs currently executing on a slot worker (under s->mu).  Used by the
+     * POST /v1/prewarm guard: prewarm is idle-priority and is refused (503)
+     * rather than queued behind interactive work. */
+    int active_jobs;
     unsigned long long act_kv_restores;
     unsigned long long act_kv_restored_tokens;
     int act_kv_last_restore_tokens;
@@ -9319,7 +9332,10 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                                   cache_text_ext,
                                                   cache_text_key,
                                                   &hooks, err, sizeof(err));
-    if (ok) s->act_kv_stores++;
+    if (ok) {
+        s->act_kv_stores++;
+        slot->req_anchors_stored++;
+    }
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
     return ok;
@@ -11028,6 +11044,7 @@ static uint64_t server_next_sequence(server *s) {
 static void generate_job(server *s, server_slot *slot, job *j) {
     char err[160];
     err[0] = '\0';
+    slot->req_anchors_stored = 0;
     const int old_pos = ds4_session_pos(slot->session);
     const int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
     trace_cache_diag cache_diag = {0};
@@ -11276,6 +11293,51 @@ static void generate_job(server *s, server_slot *slot, job *j) {
             kv_cache_slot_suppress_continued(s, slot, cold_store_len);
     }
 
+    /* Layered anchor chain (task #24): while this cold prefill is running
+     * anyway, park at each turn boundary / interval depth below the terminal
+     * cold store and checkpoint the KV state there, keyed by the canonical
+     * text prefix up to that depth.  A later request whose canonical prompt
+     * diverges at depth D (mid-prompt edit, shared-turns-only session)
+     * content-addresses the deepest chain link before D through the existing
+     * longest-text-prefix lookup and re-prefills only the tail.  The stores
+     * are incremental: the KV state at each depth exists exactly once, here. */
+    if (s->kv.enabled && cold_store_len >= s->kv.opt.min_tokens) {
+        int chain_depths[64];
+        const int chain_n = ds4_kvstore_chain_depths(
+            &s->kv, prompt_for_sync,
+            ds4_token_user(s->engine), ds4_token_assistant(s->engine),
+            cold_store_len, chain_depths,
+            (int)(sizeof(chain_depths) / sizeof(chain_depths[0])));
+        for (int ci = 0; ci < chain_n; ci++) {
+            const int depth = chain_depths[ci];
+            ds4_tokens chain_prefix = {0};
+            tokens_copy_prefix(&chain_prefix, prompt_for_sync, depth);
+            const int sync_rc = server_session_sync(s, slot, &chain_prefix,
+                                                    err, sizeof(err));
+            ds4_tokens_free(&chain_prefix);
+            if (sync_rc != 0) {
+                ds4_tokens_free(&effective_prompt);
+                ds4_session_set_progress(slot->session, NULL, NULL);
+                ds4_session_set_display_progress(slot->session, NULL, NULL);
+                kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
+                                                 cold_store_len);
+                kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
+                free(disk_cache_path);
+                trace_event(s, trace_id, "prefill failed: %s", err);
+                send_prefill_failure_response(s, j, &progress, ctx_span,
+                                              req_flags, err);
+                return;
+            }
+            if (kv_cache_store_live_prefix(s, slot, prompt_for_sync, depth,
+                                           "cold")) {
+                kv_cache_slot_note_store(slot, depth);
+                s->act_kv_chain_stores++;
+                trace_event(s, trace_id, "kv chain checkpoint stored depth=%d",
+                            depth);
+            }
+        }
+    }
+
     if (s->kv.enabled &&
         cold_store_len >= s->kv.opt.min_tokens &&
         cold_store_len < prompt_for_sync->len)
@@ -11345,6 +11407,35 @@ static void generate_job(server *s, server_slot *slot, job *j) {
             kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                              cold_store_len);
         }
+    }
+    if (j->req.prewarm) {
+        /* Prewarm ends here: the canonical prompt is restored/prefilled and
+         * every qualifying anchor (chain, cold, continued) is on disk, but no
+         * token is generated -- prefill computation above is byte-identical to
+         * a normal request, so greedy identity is unaffected. */
+        const double wall_ms = (now_sec() - t0) * 1000.0;
+        s->act_prewarm_requests++;
+        char body[192];
+        snprintf(body, sizeof(body),
+                 "{\"restored_tokens\":%d,\"prefilled_tokens\":%d,"
+                 "\"anchors_stored\":%d,\"wall_ms\":%.1f}",
+                 cached,
+                 prompt_tokens > cached ? prompt_tokens - cached : 0,
+                 slot->req_anchors_stored,
+                 wall_ms);
+        http_response(j->fd, s->enable_cors, 200, "application/json", body);
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: prewarm ctx=%s restored=%d prefilled=%d anchors=%d wall=%.1f ms",
+                   ctx_span, cached,
+                   prompt_tokens > cached ? prompt_tokens - cached : 0,
+                   slot->req_anchors_stored, wall_ms);
+        trace_event(s, trace_id,
+                    "prewarm done restored=%d prefilled=%d anchors=%d wall=%.1f ms",
+                    cached,
+                    prompt_tokens > cached ? prompt_tokens - cached : 0,
+                    slot->req_anchors_stored, wall_ms);
+        ds4_tokens_free(&effective_prompt);
+        return;
     }
     const uint64_t response_seq = server_next_sequence(s);
     char id[96];
@@ -12248,7 +12339,13 @@ static void *worker_main(void *arg) {
     for (;;) {
         job *j = dequeue(s);
         if (!j) break;
+        pthread_mutex_lock(&s->mu);
+        s->active_jobs++;
+        pthread_mutex_unlock(&s->mu);
         generate_job(s, &s->slots[0], j);
+        pthread_mutex_lock(&s->mu);
+        s->active_jobs--;
+        pthread_mutex_unlock(&s->mu);
         slot_activity_reset(&s->slots[0]);
         pthread_mutex_lock(&j->mu);
         j->done = true;
@@ -12272,9 +12369,13 @@ static void *slot_worker_main(void *arg) {
         }
         job *j = slot->assigned;
         slot->assigned = NULL;
+        s->active_jobs++;
         pthread_mutex_unlock(&s->mu);
 
         generate_job(s, slot, j);
+        pthread_mutex_lock(&s->mu);
+        s->active_jobs--;
+        pthread_mutex_unlock(&s->mu);
         slot_activity_reset(slot);
         pthread_mutex_lock(&j->mu);
         j->done = true;
@@ -12621,10 +12722,12 @@ static bool send_activity(server *s, int fd) {
         ds4_gpu_stream_expert_cache_current_count());
 #endif
     buf_printf(&b,
-        "},\"kv_events\":{\"stores\":%llu,\"restores\":%llu,"
+        "},\"kv_events\":{\"stores\":%llu,\"chain_stores\":%llu,"
+        "\"prewarm_requests\":%llu,\"restores\":%llu,"
         "\"restored_tokens_total\":%llu,\"last_restore_tokens\":%d,"
         "\"last_restore_ms\":%.1f}}\n",
-        s->act_kv_stores, s->act_kv_restores, s->act_kv_restored_tokens,
+        s->act_kv_stores, s->act_kv_chain_stores, s->act_prewarm_requests,
+        s->act_kv_restores, s->act_kv_restored_tokens,
         s->act_kv_last_restore_tokens, s->act_kv_last_restore_ms);
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -12749,7 +12852,45 @@ static void *client_main(void *arg) {
     char err[160];
     bool ok = false;
     const int ctx_size = s->ctx_size;
-    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
+    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/prewarm")) {
+        /* POST /v1/prewarm: body is a standard messages request in either
+         * dialect.  Canonicalization must match the dialect the real requests
+         * will use, so sniff Anthropic-shaped bodies (top-level system string /
+         * anthropic_version) first and fall back to the other parser if the
+         * preferred one rejects the body. */
+        pthread_mutex_lock(&s->mu);
+        const bool busy = s->head != NULL || s->active_jobs >= s->slot_count;
+        pthread_mutex_unlock(&s->mu);
+        if (busy) {
+            /* Prewarm is idle-priority: refuse rather than queue behind
+             * interactive generation.  When it does run, no generation is
+             * active, so prefill uses the existing idle quantum path. */
+            http_error(fd, s->enable_cors, 503,
+                       "prewarm refused: server busy (idle-priority operation)");
+            http_request_free(&hr);
+            goto done;
+        }
+        const bool anthropic_shaped =
+            (hr.body && (strstr(hr.body, "\"anthropic_version\"") ||
+                         strstr(hr.body, "\"system\":"))) ? true : false;
+        if (anthropic_shaped) {
+            ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
+                                         ctx_size, &req, err, sizeof(err));
+            if (!ok) ok = parse_chat_request(s->engine, s, hr.body,
+                                             s->default_tokens, ctx_size, &req,
+                                             err, sizeof(err));
+        } else {
+            ok = parse_chat_request(s->engine, s, hr.body, s->default_tokens,
+                                    ctx_size, &req, err, sizeof(err));
+            if (!ok) ok = parse_anthropic_request(s->engine, s, hr.body,
+                                                  s->default_tokens, ctx_size,
+                                                  &req, err, sizeof(err));
+        }
+        if (ok) {
+            req.prewarm = true;
+            req.stream = false;
+        }
+    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
         ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/chat/completions")) {

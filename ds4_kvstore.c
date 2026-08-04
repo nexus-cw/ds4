@@ -63,6 +63,18 @@
  * because the whole point is surviving idle days.  0 (default) disables
  * pinning and preserves the existing eviction behavior exactly. */
 #define KV_CACHE_PIN_MIN_HITS_ENV "DS4_KV_PIN_MIN_HITS"
+/* Layered anchor chain (task #24): intermediate checkpoints during a
+ * qualifying cold prefill, at turn boundaries + fixed intervals.  Existing
+ * longest-text-prefix matching makes them restore targets after mid-prompt
+ * edits with no new lookup machinery. */
+#define KV_CACHE_CHAIN_INTERVAL_ENV "DS4_KV_CHAIN_INTERVAL"
+#define KV_CACHE_CHAIN_MAX_ENV "DS4_KV_CHAIN_MAX"
+#define KV_CACHE_DEFAULT_CHAIN_INTERVAL_TOKENS 8192
+#define KV_CACHE_DEFAULT_CHAIN_MAX 8
+/* Do not store chain checkpoints closer together than this: a checkpoint is
+ * ~14 MB per 1k tokens on disk and ~336 ms per save at 24k depth, so dense
+ * turn boundaries would burn budget for near-zero extra restore value. */
+#define KV_CACHE_CHAIN_MIN_GAP_TOKENS 2048
 
 typedef struct {
     char *ptr;
@@ -178,6 +190,8 @@ ds4_kvstore_options ds4_kvstore_default_options(void) {
         .boundary_trim_tokens = KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS,
         .boundary_align_tokens = KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS,
         .deep_cold_anchor = true,
+        .chain_interval_tokens = KV_CACHE_DEFAULT_CHAIN_INTERVAL_TOKENS,
+        .chain_max = KV_CACHE_DEFAULT_CHAIN_MAX,
     };
 }
 
@@ -663,6 +677,30 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
                                   deep_env[0] == 'F')) {
         kc->opt.deep_cold_anchor = false;
     }
+    const char *chain_int_env = getenv(KV_CACHE_CHAIN_INTERVAL_ENV);
+    if (chain_int_env && *chain_int_env) {
+        char *end = NULL;
+        long v = strtol(chain_int_env, &end, 10);
+        if (end && *end == '\0' && v >= 0 && v <= INT_MAX) {
+            kc->opt.chain_interval_tokens = (int)v;
+        } else {
+            kv_logf(kc, DS4_KVSTORE_LOG_WARNING,
+                    "%s: ignoring invalid %s=%s (want a non-negative integer)",
+                    kv_log_name(kc), KV_CACHE_CHAIN_INTERVAL_ENV, chain_int_env);
+        }
+    }
+    const char *chain_max_env = getenv(KV_CACHE_CHAIN_MAX_ENV);
+    if (chain_max_env && *chain_max_env) {
+        char *end = NULL;
+        long v = strtol(chain_max_env, &end, 10);
+        if (end && *end == '\0' && v >= 0 && v <= 64) {
+            kc->opt.chain_max = (int)v;
+        } else {
+            kv_logf(kc, DS4_KVSTORE_LOG_WARNING,
+                    "%s: ignoring invalid %s=%s (want 0..64)",
+                    kv_log_name(kc), KV_CACHE_CHAIN_MAX_ENV, chain_max_env);
+        }
+    }
     kc->pin_min_hits = 0;
     const char *pin_env = getenv(KV_CACHE_PIN_MIN_HITS_ENV);
     if (pin_env && *pin_env) {
@@ -692,6 +730,15 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
     kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
             "%s: KV disk cache deep canonical prompt anchors %s (DS4_KV_DEEP_COLD_ANCHOR)",
             kv_log_name(kc), kc->opt.deep_cold_anchor ? "enabled" : "disabled");
+    kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+            "%s: KV disk cache layered anchor chain %s (interval=%d max=%d; %s/%s)",
+            kv_log_name(kc),
+            kc->opt.chain_interval_tokens > 0 && kc->opt.chain_max > 0 ?
+                "enabled" : "disabled",
+            kc->opt.chain_interval_tokens,
+            kc->opt.chain_max,
+            KV_CACHE_CHAIN_INTERVAL_ENV,
+            KV_CACHE_CHAIN_MAX_ENV);
     if (kc->pin_min_hits > 0) {
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
                 "%s: KV disk cache pinning enabled: anchor checkpoints with hits>=%d are never evicted (%s)",
@@ -781,6 +828,75 @@ int ds4_kvstore_chat_anchor_pos(const ds4_kvstore *kc,
         if (token == user_token_id) last_user = i;
     }
     return last_user >= kc->opt.min_tokens ? last_user : -1;
+}
+
+static int kv_chain_cmp_int(const void *a, const void *b) {
+    const int x = *(const int *)a, y = *(const int *)b;
+    return x < y ? -1 : x > y ? 1 : 0;
+}
+
+/* Compute intermediate checkpoint depths for the layered anchor chain of one
+ * qualifying cold prefill: (1) canonical turn boundaries (positions of each
+ * user/assistant marker token -- the prefix stored excludes the marker itself,
+ * matching ds4_kvstore_chat_anchor_pos), and (2) fixed token intervals so any
+ * span longer than chain_interval_tokens (e.g. a 50k system prompt) still has
+ * restore points inside it.  Depths are strictly below final_len (the caller's
+ * terminal cold store), at least min_tokens deep, at least
+ * KV_CACHE_CHAIN_MIN_GAP_TOKENS apart, and evenly thinned to chain_max.
+ * Returns the number of depths written to out, ascending. */
+int ds4_kvstore_chain_depths(const ds4_kvstore *kc,
+                             const ds4_tokens *prompt,
+                             int user_token_id,
+                             int assistant_token_id,
+                             int final_len,
+                             int *out, int max_out) {
+    if (!kc || !prompt || !out || max_out <= 0) return 0;
+    const int interval = kc->opt.chain_interval_tokens;
+    int chain_max = kc->opt.chain_max;
+    if (interval <= 0 || chain_max <= 0) return 0;
+    if (chain_max > max_out) chain_max = max_out;
+    if (final_len > prompt->len) final_len = prompt->len;
+
+    enum { KV_CHAIN_CAND_MAX = 512 };
+    int cand[KV_CHAIN_CAND_MAX];
+    int n = 0;
+    for (int i = 0; i < prompt->len && i < final_len && n < KV_CHAIN_CAND_MAX; i++) {
+        const int t = prompt->v[i];
+        if ((user_token_id >= 0 && t == user_token_id) ||
+            (assistant_token_id >= 0 && t == assistant_token_id))
+            cand[n++] = i;
+    }
+    for (int d = interval; d < final_len && n < KV_CHAIN_CAND_MAX; d += interval)
+        cand[n++] = d;
+    if (n == 0) return 0;
+    qsort(cand, (size_t)n, sizeof(cand[0]), kv_chain_cmp_int);
+
+    /* Filter: min depth, strictly before final_len, minimum spacing (also
+     * against final_len so the last chain link is not a near-duplicate of the
+     * terminal cold store). */
+    int kept[KV_CHAIN_CAND_MAX];
+    int k = 0;
+    int prev = 0;
+    for (int i = 0; i < n; i++) {
+        const int d = cand[i];
+        if (d < kc->opt.min_tokens) continue;
+        if (d >= final_len - KV_CACHE_CHAIN_MIN_GAP_TOKENS + 1) break;
+        if (k > 0 && d - prev < KV_CACHE_CHAIN_MIN_GAP_TOKENS) continue;
+        kept[k++] = d;
+        prev = d;
+    }
+    if (k <= chain_max) {
+        memcpy(out, kept, (size_t)k * sizeof(int));
+        return k;
+    }
+    /* Even thinning that always keeps the shallowest (turn-boundary reuse)
+     * and deepest (closest restore point to the terminal store) links. */
+    for (int i = 0; i < chain_max; i++) {
+        const int src = chain_max == 1 ? 0 :
+            (int)(((long)i * (k - 1)) / (chain_max - 1));
+        out[i] = kept[src];
+    }
+    return chain_max;
 }
 
 static int kv_cache_continued_step(const ds4_kvstore *kc) {

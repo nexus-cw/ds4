@@ -70,6 +70,16 @@ typedef struct {
      * restores it.  Bounded by the disk budget + eviction + pinning.
      * DS4_KV_DEEP_COLD_ANCHOR=0 disables. Default on. */
     bool deep_cold_anchor;
+    /* Layered anchor chain: during a qualifying cold prefill, store
+     * intermediate checkpoints at turn boundaries plus fixed token intervals,
+     * each keyed by the canonical text prefix up to its depth.  An edit at
+     * depth D then matches the deepest stored checkpoint before D through the
+     * existing longest-text-prefix lookup; only the tail is re-prefilled.
+     * chain_interval_tokens (DS4_KV_CHAIN_INTERVAL, default 8192, 0 disables)
+     * fills spans longer than the interval; chain_max (DS4_KV_CHAIN_MAX,
+     * default 8) caps intermediate checkpoints per request/lineage. */
+    int chain_interval_tokens;
+    int chain_max;
 } ds4_kvstore_options;
 
 typedef struct {
@@ -147,6 +157,12 @@ int ds4_kvstore_chat_anchor_pos(const ds4_kvstore *kc,
                                 const ds4_tokens *prompt,
                                 int user_token_id,
                                 int assistant_token_id);
+int ds4_kvstore_chain_depths(const ds4_kvstore *kc,
+                             const ds4_tokens *prompt,
+                             int user_token_id,
+                             int assistant_token_id,
+                             int final_len,
+                             int *out, int max_out);
 int ds4_kvstore_continued_store_target(const ds4_kvstore *kc, int live_tokens);
 void ds4_kvstore_note_store(ds4_kvstore *kc, int tokens);
 int ds4_kvstore_suppress_continued_store(ds4_kvstore *kc, int tokens);
