@@ -175,6 +175,42 @@ static uint64_t g_cuda_stream_stats_cache_misses;     /* == expert_fetches today
 static uint64_t g_cuda_stream_stats_bytes_from_file;  /* bytes pread via mapped view */
 static uint64_t g_cuda_stream_stats_bytes_from_cache; /* always 0 today; see above */
 
+/* Task-22 direct-I/O observability. Closes the silent-fallback gap: an
+ * EINVAL/EFAULT/ENOTSUP on a direct read permanently disables O_DIRECT for
+ * the rest of the process, which previously left only a verbose-mode stderr
+ * line as evidence. These counters make the state and the fallback history
+ * machine-readable (self-report line, /v1/capabilities, /v1/activity).
+ * Plain (non-atomic) counters: the model stage-read path runs on the one
+ * CUDA-dispatch thread, same convention as the stream stats above; readers
+ * (HTTP threads) may see a beat-stale value, which is fine for monitoring. */
+#define DS4_CUDA_DIRECT_IO_UNAVAILABLE 0 /* never opened: env off, non-Linux, open() failed */
+#define DS4_CUDA_DIRECT_IO_ENGAGED     1
+#define DS4_CUDA_DIRECT_IO_DISABLED    2 /* permanently disabled after an errno fallback */
+static int g_cuda_direct_io_state = DS4_CUDA_DIRECT_IO_UNAVAILABLE;
+static int g_cuda_direct_io_disable_errno;            /* errno that caused state 2 (or open failure) */
+static uint64_t g_cuda_direct_io_fallback_einval;     /* alignment/fs rejection */
+static uint64_t g_cuda_direct_io_fallback_efault;     /* bad staging buffer */
+static uint64_t g_cuda_direct_io_fallback_enotsup;    /* ENOTSUP/EOPNOTSUPP */
+static uint64_t g_cuda_direct_io_fallback_other;      /* transient read error served buffered; direct stays on */
+static uint64_t g_cuda_direct_io_widened_reads;       /* direct reads issued (each widened to alignment) */
+static uint64_t g_cuda_direct_io_widen_wasted_bytes;  /* sum over reads of read_size - payload bytes */
+
+extern "C" int ds4_gpu_direct_io_state(void) { return g_cuda_direct_io_state; }
+extern "C" int ds4_gpu_direct_io_disable_errno(void) { return g_cuda_direct_io_disable_errno; }
+extern "C" void ds4_gpu_direct_io_counters(uint64_t *fallback_einval,
+                                           uint64_t *fallback_efault,
+                                           uint64_t *fallback_enotsup,
+                                           uint64_t *fallback_other,
+                                           uint64_t *widened_reads,
+                                           uint64_t *widen_wasted_bytes) {
+    if (fallback_einval) *fallback_einval = g_cuda_direct_io_fallback_einval;
+    if (fallback_efault) *fallback_efault = g_cuda_direct_io_fallback_efault;
+    if (fallback_enotsup) *fallback_enotsup = g_cuda_direct_io_fallback_enotsup;
+    if (fallback_other) *fallback_other = g_cuda_direct_io_fallback_other;
+    if (widened_reads) *widened_reads = g_cuda_direct_io_widened_reads;
+    if (widen_wasted_bytes) *widen_wasted_bytes = g_cuda_direct_io_widen_wasted_bytes;
+}
+
 static uint32_t cuda_stream_expert_cache_configured_budget(void);
 static uint32_t g_cuda_expert_cache_entry_count_getter(void);
 static uint64_t cuda_stream_expert_cache_budget_bytes(void);
@@ -226,6 +262,24 @@ extern "C" void ds4_gpu_print_cuda_stream_stats(void) {
             (double)(counted + parked) / gib,
             (double)cuda_pinned_host_bytes_total() / gib,
             g_cuda_expert_cache_entry_count_getter());
+    /* Task-22 direct-I/O self-report: state + fallback/widening history.
+     * avg_waste is per-read alignment padding (head delta + tail round-up). */
+    fprintf(stderr,
+            "ds4: CUDA direct I/O: state=%s disable_errno=%d "
+            "fallbacks einval=%llu efault=%llu enotsup=%llu other=%llu "
+            "widened_reads=%llu widen_wasted=%.3f MiB avg_waste=%.1f B/read\n",
+            g_cuda_direct_io_state == DS4_CUDA_DIRECT_IO_ENGAGED ? "engaged" :
+            g_cuda_direct_io_state == DS4_CUDA_DIRECT_IO_DISABLED ? "disabled" : "unavailable",
+            g_cuda_direct_io_disable_errno,
+            (unsigned long long)g_cuda_direct_io_fallback_einval,
+            (unsigned long long)g_cuda_direct_io_fallback_efault,
+            (unsigned long long)g_cuda_direct_io_fallback_enotsup,
+            (unsigned long long)g_cuda_direct_io_fallback_other,
+            (unsigned long long)g_cuda_direct_io_widened_reads,
+            (double)g_cuda_direct_io_widen_wasted_bytes / (1024.0 * 1024.0),
+            g_cuda_direct_io_widened_reads ?
+                (double)g_cuda_direct_io_widen_wasted_bytes /
+                (double)g_cuda_direct_io_widened_reads : 0.0);
 }
 
 static void cuda_stream_selected_cache_invalidate(void) {
@@ -2200,18 +2254,26 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
             const int saved_errno = errno;
             errno = 0;
             if (cuda_pread_full(g_model_direct_fd, stage, read_size, aligned_off)) {
+                g_cuda_direct_io_widened_reads++;
+                g_cuda_direct_io_widen_wasted_bytes += read_size - bytes;
                 *payload = (const char *)stage + delta;
                 errno = saved_errno;
                 return 1;
             }
             const int direct_errno = errno;
             if (direct_errno == EINVAL || direct_errno == EFAULT || direct_errno == ENOTSUP || direct_errno == EOPNOTSUPP) {
-                if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
-                    fprintf(stderr, "ds4: CUDA direct model read disabled: %s\n", strerror(direct_errno));
-                }
+                if (direct_errno == EINVAL) g_cuda_direct_io_fallback_einval++;
+                else if (direct_errno == EFAULT) g_cuda_direct_io_fallback_efault++;
+                else g_cuda_direct_io_fallback_enotsup++;
+                g_cuda_direct_io_state = DS4_CUDA_DIRECT_IO_DISABLED;
+                g_cuda_direct_io_disable_errno = direct_errno;
+                fprintf(stderr, "ds4: CUDA direct model read permanently disabled, buffered I/O from now on: %s\n",
+                        strerror(direct_errno));
                 (void)close(g_model_direct_fd);
                 g_model_direct_fd = -1;
                 g_model_direct_align = 1;
+            } else {
+                g_cuda_direct_io_fallback_other++;
             }
             errno = direct_errno;
         }
@@ -4412,12 +4474,18 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
             if (direct_fd >= 0) {
                 g_model_direct_fd = direct_fd;
                 if (g_model_direct_align < 512) g_model_direct_align = 512;
+                g_cuda_direct_io_state = DS4_CUDA_DIRECT_IO_ENGAGED;
+                g_cuda_direct_io_disable_errno = 0;
                 if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
                     fprintf(stderr, "ds4: CUDA model direct I/O enabled (align=%llu)\n",
                             (unsigned long long)g_model_direct_align);
                 }
-            } else if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
-                fprintf(stderr, "ds4: CUDA model direct I/O unavailable: %s\n", strerror(errno));
+            } else {
+                g_cuda_direct_io_state = DS4_CUDA_DIRECT_IO_UNAVAILABLE;
+                g_cuda_direct_io_disable_errno = errno;
+                if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+                    fprintf(stderr, "ds4: CUDA model direct I/O unavailable: %s\n", strerror(errno));
+                }
             }
         }
 #endif

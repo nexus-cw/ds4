@@ -12635,7 +12635,32 @@ static bool send_capabilities(server *s, int fd) {
             ds4_gpu_stream_expert_cache_configured_count());
     }
 #endif
-    buf_puts(&b, "},\"kv_disk_store\":{");
+    buf_puts(&b, "}");
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* Task-22 direct-I/O observability: whether tier-2 O_DIRECT streaming is
+     * actually engaged right now, plus the fallback history that would
+     * otherwise be invisible (an EINVAL/EFAULT/ENOTSUP permanently disables
+     * direct I/O for the process). Consumer-facing: the console shows
+     * degraded I/O from this object. CUDA-only, same guard as expert_cache. */
+    {
+        uint64_t fb_einval = 0, fb_efault = 0, fb_enotsup = 0, fb_other = 0;
+        uint64_t widened = 0, wasted = 0;
+        ds4_gpu_direct_io_counters(&fb_einval, &fb_efault, &fb_enotsup,
+                                   &fb_other, &widened, &wasted);
+        const int st = ds4_gpu_direct_io_state();
+        buf_printf(&b,
+            ",\"direct_io\":{\"state\":\"%s\",\"disable_errno\":%d,"
+            "\"fallbacks\":{\"einval\":%llu,\"efault\":%llu,"
+            "\"enotsup\":%llu,\"other\":%llu},"
+            "\"widened_reads\":%llu,\"widen_wasted_bytes\":%llu}",
+            st == 1 ? "engaged" : st == 2 ? "disabled" : "unavailable",
+            ds4_gpu_direct_io_disable_errno(),
+            (unsigned long long)fb_einval, (unsigned long long)fb_efault,
+            (unsigned long long)fb_enotsup, (unsigned long long)fb_other,
+            (unsigned long long)widened, (unsigned long long)wasted);
+    }
+#endif
+    buf_puts(&b, ",\"kv_disk_store\":{");
     pthread_mutex_lock(&s->kv_mu);
     buf_printf(&b,
         "\"enabled\":%s,\"budget_bytes\":%llu,"
@@ -12721,8 +12746,17 @@ static bool send_activity(server *s, int fd) {
         (unsigned long long)ds4_gpu_stream_expert_cache_counted_bytes(),
         ds4_gpu_stream_expert_cache_current_count());
 #endif
+    buf_puts(&b, "}");
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* Task-22: live direct-I/O state (O(1) counter read, CUDA-only). */
+    {
+        const int dio = ds4_gpu_direct_io_state();
+        buf_printf(&b, ",\"direct_io\":{\"state\":\"%s\"}",
+                   dio == 1 ? "engaged" : dio == 2 ? "disabled" : "unavailable");
+    }
+#endif
     buf_printf(&b,
-        "},\"kv_events\":{\"stores\":%llu,\"chain_stores\":%llu,"
+        ",\"kv_events\":{\"stores\":%llu,\"chain_stores\":%llu,"
         "\"prewarm_requests\":%llu,\"restores\":%llu,"
         "\"restored_tokens_total\":%llu,\"last_restore_tokens\":%d,"
         "\"last_restore_ms\":%.1f}}\n",

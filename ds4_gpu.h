@@ -154,6 +154,18 @@ uint32_t ds4_gpu_stream_expert_cache_current_count(void);
 uint64_t ds4_gpu_stream_expert_cache_budget_bytes(void);
 uint64_t ds4_gpu_stream_expert_cache_counted_bytes(void);
 uint64_t ds4_gpu_stream_expert_cache_parked_bytes(void);
+/* Task-22 direct-I/O observability (CUDA-only symbols, same guard as above).
+ * state: 0 = unavailable (env off / open failed / non-Linux), 1 = engaged,
+ * 2 = permanently disabled after an errno fallback (EINVAL/EFAULT/ENOTSUP).
+ * disable_errno: the errno behind an open failure or state 2, else 0. */
+int ds4_gpu_direct_io_state(void);
+int ds4_gpu_direct_io_disable_errno(void);
+void ds4_gpu_direct_io_counters(uint64_t *fallback_einval,
+                                uint64_t *fallback_efault,
+                                uint64_t *fallback_enotsup,
+                                uint64_t *fallback_other,
+                                uint64_t *widened_reads,
+                                uint64_t *widen_wasted_bytes);
 typedef struct ds4_gpu_stream_expert_table {
     const void *model_map;
     uint64_t    model_size;
