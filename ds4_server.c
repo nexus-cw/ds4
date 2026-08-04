@@ -12859,7 +12859,11 @@ static void *client_main(void *arg) {
          * anthropic_version) first and fall back to the other parser if the
          * preferred one rejects the body. */
         pthread_mutex_lock(&s->mu);
-        const bool busy = s->head != NULL || s->active_jobs >= s->slot_count;
+        /* Fully idle only: with batched slots a prewarm sharing the engine
+         * with an active generation would run on the mixed (128-token)
+         * quantum and crawl; idle-priority means the whole idle quantum path
+         * or nothing. */
+        const bool busy = s->head != NULL || s->active_jobs > 0;
         pthread_mutex_unlock(&s->mu);
         if (busy) {
             /* Prewarm is idle-priority: refuse rather than queue behind
