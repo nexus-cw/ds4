@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_console.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
@@ -8259,6 +8260,15 @@ struct server_slot {
     int decode_token;
     int decode_rc;
     char decode_err[160];
+
+    /* GET /v1/activity snapshot.  Written lock-free from the serving path
+     * (progress callback + decode loop); read without locks by the activity
+     * endpoint.  A slightly stale read is fine and documented. */
+    volatile int act_state;          /* 0=idle 1=prefill 2=decode */
+    volatile int act_prefill_done;   /* tokens prefilled this request */
+    volatile int act_prefill_total;  /* tokens to prefill this request */
+    volatile double act_prefill_tps; /* measured average prefill t/s */
+    volatile int act_gen_tokens;     /* tokens generated this request */
 };
 
 static bool id_list_contains(const stop_list *ids, const char *id);
@@ -8302,6 +8312,14 @@ struct server {
      * GGUF + engine config; served by GET /v1/capabilities. */
     ds4_capabilities caps;
     uint64_t session_ctx_bytes;
+    /* GET /v1/activity KV-event counters (this uptime).  Incremented while
+     * kv_mu is already held on the store/load paths; read lock-free by the
+     * activity endpoint (slightly stale reads are fine). */
+    unsigned long long act_kv_stores;
+    unsigned long long act_kv_restores;
+    unsigned long long act_kv_restored_tokens;
+    int act_kv_last_restore_tokens;
+    double act_kv_last_restore_ms;
 };
 
 /* Jobs are stack-owned by the client thread.  A resident-slot worker signals
@@ -9301,6 +9319,7 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                                   cache_text_ext,
                                                   cache_text_key,
                                                   &hooks, err, sizeof(err));
+    if (ok) s->act_kv_stores++;
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
     return ok;
@@ -9450,11 +9469,18 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
     ds4_kvstore_load_result lr = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
+    const double load_t0 = now_sec();
     pthread_mutex_lock(&s->inference_mu);
     pthread_mutex_lock(&s->kv_mu);
     int loaded = ds4_kvstore_try_load_text(&s->kv, s->engine, slot->session,
                                            prompt_text, effective_prompt, &lr,
                                            &hooks, responses_protocol);
+    if (loaded > 0) {
+        s->act_kv_restores++;
+        s->act_kv_restored_tokens += (unsigned long long)loaded;
+        s->act_kv_last_restore_tokens = loaded;
+        s->act_kv_last_restore_ms = (now_sec() - load_t0) * 1000.0;
+    }
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
     if (loaded > 0) {
@@ -10490,6 +10516,12 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     p->last_current = current;
     p->last_t = now;
     p->seen = true;
+    if (p->slot) {
+        p->slot->act_prefill_done = display_current;
+        p->slot->act_prefill_total = display_total;
+        p->slot->act_prefill_tps = avg_tps;
+        p->slot->act_state = 1;
+    }
     char flags[64];
     log_flags(flags, sizeof(flags), p->responses_protocol,
               p->has_tools, false, false, false);
@@ -11418,8 +11450,11 @@ decode_again:
     dsml_decode_tracker_init(&dsml_tracker);
 
     server_generation_enter(s);
+    slot->act_state = 2;
+    slot->act_gen_tokens = 0;
     while (!g_stop_requested && completion < max_tokens &&
            ds4_session_pos(slot->session) < ds4_session_ctx(slot->session)) {
+        slot->act_gen_tokens = completion;
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
@@ -12200,12 +12235,21 @@ static job *dequeue(server *s) {
     return j;
 }
 
+static void slot_activity_reset(server_slot *slot) {
+    slot->act_state = 0;
+    slot->act_prefill_done = 0;
+    slot->act_prefill_total = 0;
+    slot->act_prefill_tps = 0.0;
+    slot->act_gen_tokens = 0;
+}
+
 static void *worker_main(void *arg) {
     server *s = arg;
     for (;;) {
         job *j = dequeue(s);
         if (!j) break;
         generate_job(s, &s->slots[0], j);
+        slot_activity_reset(&s->slots[0]);
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);
@@ -12231,6 +12275,7 @@ static void *slot_worker_main(void *arg) {
         pthread_mutex_unlock(&s->mu);
 
         generate_job(s, slot, j);
+        slot_activity_reset(slot);
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);
@@ -12529,6 +12574,112 @@ static bool send_capabilities(server *s, int fd) {
     return ok;
 }
 
+/* GET /v1/activity (also /activity): O(1) live snapshot of what the server is
+ * doing right now.  All figures are lock-free reads of counters the serving
+ * path already maintains (prefill progress callback, decode loop, KV disk
+ * store paths) -- no GPU work, no hot-path locks, safe to poll.  Because the
+ * reads are lock-free, a value can be a beat stale or torn across fields;
+ * consumers must treat this as a monitoring snapshot, not a transaction. */
+static bool send_activity(server *s, int fd) {
+    buf b = {0};
+    buf_puts(&b, "{\"schema_version\":1,\"note\":\"lock-free snapshot; "
+                 "values may be slightly stale\",\"slots\":[");
+    for (int i = 0; i < s->slot_count; i++) {
+        const server_slot *slot = &s->slots[i];
+        const int state = slot->act_state;
+        if (i) buf_putc(&b, ',');
+        buf_printf(&b, "{\"id\":%d,\"state\":\"%s\"", i,
+                   state == 1 ? "prefill" : state == 2 ? "decode" : "idle");
+        if (state == 1) {
+            const int done = slot->act_prefill_done;
+            const int total = slot->act_prefill_total;
+            const double tps = slot->act_prefill_tps;
+            buf_printf(&b,
+                ",\"prefill\":{\"tokens_done\":%d,\"tokens_total\":%d,"
+                "\"tokens_per_second\":%.2f",
+                done, total, tps);
+            if (tps > 0.0 && total > done) {
+                buf_printf(&b, ",\"eta_seconds\":%.1f",
+                           (double)(total - done) / tps);
+            }
+            buf_putc(&b, '}');
+        } else if (state == 2) {
+            buf_printf(&b, ",\"generated_tokens\":%d", slot->act_gen_tokens);
+        }
+        buf_putc(&b, '}');
+    }
+    buf_puts(&b, "],\"expert_cache\":{");
+    buf_printf(&b, "\"budget_bytes\":%llu",
+               (unsigned long long)s->caps.expert_cache_budget_bytes);
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* Task-18 byte-accounting self-report; CUDA-only counters (absent on
+     * CPU/Metal/ROCm builds, same guard convention as capabilities). */
+    buf_printf(&b,
+        ",\"live_budget_bytes\":%llu,\"counted_bytes\":%llu,\"entries\":%u",
+        (unsigned long long)ds4_gpu_stream_expert_cache_budget_bytes(),
+        (unsigned long long)ds4_gpu_stream_expert_cache_counted_bytes(),
+        ds4_gpu_stream_expert_cache_current_count());
+#endif
+    buf_printf(&b,
+        "},\"kv_events\":{\"stores\":%llu,\"restores\":%llu,"
+        "\"restored_tokens_total\":%llu,\"last_restore_tokens\":%d,"
+        "\"last_restore_ms\":%.1f}}\n",
+        s->act_kv_stores, s->act_kv_restores, s->act_kv_restored_tokens,
+        s->act_kv_last_restore_tokens, s->act_kv_last_restore_ms);
+    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static void buf_html_escape(buf *b, const char *s) {
+    for (; s && *s; s++) {
+        switch (*s) {
+        case '&': buf_puts(b, "&amp;"); break;
+        case '<': buf_puts(b, "&lt;"); break;
+        case '>': buf_puts(b, "&gt;"); break;
+        default: buf_putc(b, *s); break;
+        }
+    }
+}
+
+/* GET / and /console: the accretion web console.  A single self-contained
+ * HTML page embedded in the binary (ds4_console.h) -- no external assets,
+ * no build step.  The STATUS facts are rendered server-side between the two
+ * template halves so the section is correct with JavaScript disabled; JS
+ * only adds the live ACTIVITY view (polling /v1/activity) and host-filled
+ * CONNECT snippets. */
+static bool send_console(server *s, int fd) {
+    const ds4_capabilities *c = &s->caps;
+    buf b = {0};
+    buf_puts(&b, ds4_console_html_head);
+
+    buf_puts(&b, "<div class=\"kv\"><span>model</span><b>");
+    buf_html_escape(&b, c->model_name);
+    buf_puts(&b, "</b></div><div class=\"kv\"><span>quantization</span><b>");
+    bool first = true;
+    for (int i = 0; i < c->quant_category_count; i++) {
+        if (c->quant[i].tensors == 0) continue;
+        if (!first) buf_puts(&b, " &middot; ");
+        first = false;
+        buf_html_escape(&b, c->quant[i].category);
+        buf_putc(&b, ' ');
+        buf_html_escape(&b, c->quant[i].quants);
+    }
+    const unsigned long long trained =
+        c->rope_original_context_length ? c->rope_original_context_length
+                                        : c->trained_context_length;
+    buf_printf(&b,
+        "</b></div><div class=\"kv ctx\"><span>context</span>"
+        "<b>%d configured / %llu trained</b></div>",
+        s->ctx_size, trained);
+
+    buf_puts(&b, ds4_console_html_tail);
+    bool ok = http_response(fd, s->enable_cors, 200,
+                            "text/html; charset=utf-8", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
 static void client_done(server *s) {
     pthread_mutex_lock(&s->mu);
     if (s->clients > 0) s->clients--;
@@ -12566,6 +12717,20 @@ static void *client_main(void *arg) {
          !strcmp(hr.path, "/capabilities")))
     {
         send_capabilities(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") &&
+        (!strcmp(hr.path, "/v1/activity") || !strcmp(hr.path, "/activity")))
+    {
+        send_activity(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") &&
+        (!strcmp(hr.path, "/") || !strcmp(hr.path, "/console")))
+    {
+        send_console(s, fd);
         http_request_free(&hr);
         goto done;
     }
