@@ -880,7 +880,11 @@ int ds4_kvstore_chain_depths(const ds4_kvstore *kc,
     for (int i = 0; i < n; i++) {
         const int d = cand[i];
         if (d < kc->opt.min_tokens) continue;
-        if (d >= final_len - KV_CACHE_CHAIN_MIN_GAP_TOKENS + 1) break;
+        /* Keep boundaries close to final_len too: a turn boundary just below
+         * the terminal store is exactly what a new session sharing only the
+         * earlier turns needs, and its store cost is one file on a prefill
+         * that is passing that depth anyway. */
+        if (d >= final_len - kc->opt.min_tokens + 1) break;
         if (k > 0 && d - prev < KV_CACHE_CHAIN_MIN_GAP_TOKENS) continue;
         kept[k++] = d;
         prev = d;
