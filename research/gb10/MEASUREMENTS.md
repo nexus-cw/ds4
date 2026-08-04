@@ -4567,3 +4567,20 @@ Production restored and verified: ds4-server ACTIVE, /v1/models 200,
 /v1/capabilities serving direct_io state=engaged with live counters, console
 renders the direct I/O status line, chat smoke OK. DS4_EMBD_MMAP not set
 (default OFF) per task scope; recommendation above.
+
+### Upstream filings (2026-08-04)
+
+Both task-22 code pieces are now filed on antirez/ds4, adapted to upstream
+structure (no capabilities/activity endpoints upstream; the counters surface
+via ds4_gpu.h accessors + a --memory-report line, and the permanent-disable
+log is always-on):
+
+- Piece 1 (direct-I/O observability): issue
+  https://github.com/antirez/ds4/issues/687 + PR
+  https://github.com/antirez/ds4/pull/689 (branch directio-observability)
+- Piece 2 (DS4_EMBD_MMAP, default OFF, ATS/HMM caveat stated): issue
+  https://github.com/antirez/ds4/issues/688 + PR
+  https://github.com/antirez/ds4/pull/690 (branch embd-host-mapping)
+
+Build verify: make cpu clean on croft; ds4_cuda.o + ds4.o nvcc-clean on
+robo-dog scratch clone (removed after).
