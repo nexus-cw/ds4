@@ -10280,8 +10280,17 @@ static void server_prefill_leave(server *s) {
     pthread_mutex_unlock(&s->model_mu);
 }
 
-static int server_prefill_quantum_for(bool generation_active) {
-    int quantum = generation_active ? 128 : 2048;
+/* Idle (no generation active) prefill quantum follows the engine's prefill
+ * chunk when that is larger than the historical 2048 default: on the CUDA
+ * SSD-streaming path every engine prefill call re-streams roughly the whole
+ * routed expert set from NVMe, so slicing sync into quanta smaller than the
+ * engine chunk multiplies prefill I/O (task#29: 2048 = 26 t/s vs 8192 =
+ * 63 t/s on a cold 22k prompt).  The mixed quantum (generation active)
+ * stays small for interactivity.  Env overrides win in both cases. */
+static int server_prefill_quantum_for2(bool generation_active,
+                                       int idle_default) {
+    if (idle_default < 2048) idle_default = 2048;
+    int quantum = generation_active ? 128 : idle_default;
     const char *env = getenv(generation_active ?
                              "DS4_SERVER_MIXED_PREFILL_QUANTUM" :
                              "DS4_SERVER_PREFILL_QUANTUM");
@@ -10299,7 +10308,8 @@ static int server_prefill_quantum(server *s) {
     pthread_mutex_lock(&s->model_mu);
     bool generation_active = s->active_generations > 0;
     pthread_mutex_unlock(&s->model_mu);
-    return server_prefill_quantum_for(generation_active);
+    return server_prefill_quantum_for2(generation_active,
+                                       (int)ds4_engine_prefill_chunk(s->engine));
 }
 
 /* Synchronize one resident slot without monopolizing the model executor.  A
@@ -13067,6 +13077,18 @@ int main(int argc, char **argv) {
     cfg.engine.context_size = cfg.ctx_size;
     cfg.engine.placement_ctx_hint = cfg.ctx_size;
     cfg.engine.share_session_prefill_workspace = cfg.batched_sessions > 0;
+    /* Task#29: bulk prefill on the CUDA SSD-streaming path is NVMe-bound via
+     * expert-cache capacity thrash -- every prefill chunk re-streams roughly
+     * the whole routed expert set, so per-token I/O scales inversely with
+     * chunk size.  Measured on robo-dog (22k cold prompt): chunk 2048 =
+     * 26 t/s, 4096 = 43 t/s, 8192 = 63 t/s (2.4x); 16384 fails in the
+     * attention batch encoder and is rejected.  Default the engine prefill
+     * chunk to 8192 for this configuration; --prefill-chunk still overrides. */
+    if (cfg.engine.prefill_chunk == 0 &&
+        cfg.engine.ssd_streaming &&
+        cfg.engine.backend == DS4_BACKEND_CUDA) {
+        cfg.engine.prefill_chunk = 8192;
+    }
     ds4_engine *engine = NULL;
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
         ds4_gpu_config gpu_cfg = {0};
@@ -13180,8 +13202,10 @@ int main(int argc, char **argv) {
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: batched mode enabled resident_sessions=%d prefill_quantum=%d mixed_prefill_quantum=%d decode_coalesce_us=%ld batch_decode=%d",
                    s.slot_count,
-                   server_prefill_quantum_for(false),
-                   server_prefill_quantum_for(true),
+                   server_prefill_quantum_for2(
+                       false, (int)ds4_engine_prefill_chunk(engine)),
+                   server_prefill_quantum_for2(
+                       true, (int)ds4_engine_prefill_chunk(engine)),
                    server_decode_coalesce_us(),
                    server_batch_decode_enabled() ? 1 : 0);
         if (ds4_engine_has_mtp(engine)) {
