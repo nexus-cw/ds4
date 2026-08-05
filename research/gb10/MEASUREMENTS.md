@@ -4776,3 +4776,91 @@ remains unfixed (deliberately -- no fix attempted); the gate
 trigger: a faster disk (or I/O-path change) OR a diagnosis showing prefill
 has become compute-bound. Until one of those holds, MMA work is not worth
 the integration risk.
+
+## Task-17: Laguna-S-2.1 as second model — license, obtain, bench resident (2026-08-05)
+
+### License gate: PASS
+
+poolside/Laguna-S-2.1 is released under **OpenMDW-1.1** (open model+data+weights):
+local deployment, modification, and commercial use permitted; redistribution of
+derivatives allowed. Obligations: comply with poolside's Acceptable Use Policy;
+do not strip safety guardrails without equivalent mitigations. No attribution
+clause found on the card. Compatible with sovereign self-hosting.
+
+### Artifact provenance
+
+- First choice **jcbtc/Laguna-S-2.1-NVFP4-GGUF** `Laguna-S-2.1-NVFP4.gguf`
+  (71,977,030,080 B = 67.03 GiB, sha256
+  `5cf866a0b1531c62a6754e811b64b8bd867b9f5cd5d6a69b2cde04077d807e87`, verified
+  after download) — **UNUSABLE**: no ds4-lineage branch has NVFP4 (type 40)
+  dequant kernels (quants.h enumerates the id only). Kept at
+  /data/gguf/Laguna-S-2.1-NVFP4.gguf as #26/FP4-port input.
+- Benchmarked artifact: **poolside/Laguna-S-2.1-GGUF** `laguna-s-2.1-Q4_K_M.gguf`
+  at pinned revision `706fa697` (the revision upstream download_model.sh blesses),
+  68,248,759,648 B = 63.56 GiB, sha256
+  `e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a` (no
+  published sha to compare). Q8_0 386 tensors / Q4_K 141 (59.5 GiB routed) / F32.
+
+### Arch support + binary
+
+- upstream **main: no laguna support**; branch **upstream/laguna-s2.1**
+  (17 commits ahead, head 448d569 "Tune Laguna sampling defaults") has
+  first-class Laguna: arch loader, CUDA path, sampling defaults
+  (temp 0.7 / top-k 20 / top-p 0.95 / min-p 0.05), prefill chunk 16384.
+- research/gb10: **no laguna arch** (0 hits).
+- Binary used: scratch clone of upstream/laguna-s2.1 on robo-dog
+  (~/src/ds4-laguna, `make cuda-spark`).
+
+### accretion-prepare on a foreign arch
+
+Two small commits in the accretion repo:
+- `72bcab4` add NVFP4 (type 40) to the GGML type table (64 elems / 36 B blocks).
+- `ee2f023` graceful skip of dialect normalization on non-deepseek4 arch:
+  generic stages only (verify, 4096-alignment repack, manifest with
+  arch-prefixed keys) + xlog `skip_foreign_arch` record. test_prepare.py passes.
+Result on Q4_K_M: clean run in 149 s, manifest with **36096 expert entries**
+(47 sparse layers x 256 experts x 3 projections) + 673 dense entries. Output:
+~/models/laguna-s21/laguna-s-2.1-Q4_K_M.accretion.gguf (root NVMe).
+
+### Arms (ds4 CLI one-shots, temp 0, service stopped during window)
+
+| arm | load | prefill t/s | warm decode t/s | notes |
+|---|---|---|---|---|
+| RESIDENT rep1 (cold-ish) | 22.5 s | 62.1 (short prompt) | 23.80 | 64.00 GiB planned (63.56 model + 0.45 KV @ ctx 8192) |
+| RESIDENT rep2 | 15.4 s | 64.6 | 23.81 | page-cache warm |
+| RESIDENT rep3 | 15.4 s | 65.2 | 23.84 | |
+| RESIDENT long prefill | 15.1 s | **2197.9** (~16k-tok code prompt, ctx 32768, default Laguna chunk 16384) | n/a | `--prefill-chunk` not honored for Laguna ("standard local graph path only") |
+| STREAMED 30GB | — | — | — | **BLOCKED**: `--ssd-streaming is not implemented for Laguna S 2.1 yet` on the only Laguna-capable branch; research/gb10 (our streaming stack) lacks the laguna arch. Streaming-generality test needs a port (#26 seam input). |
+
+Warm decode mean (reps 2-3): **23.8 t/s** — ~4.4x GA's 5.36 t/s warm decode
+(caveat: Laguna 118B/A8B resident Q4_K vs GA streamed IQ2-class; different
+arch, param count, and residency). Long-prompt prefill 2198 t/s vs GA 66 t/s
+cold prefill — resident vs streamed is the dominant factor.
+
+### Quality smoke: 8/8 pass (temp 0, --nothink, verbatim outputs in bench notes)
+
+p1 merge_intervals: correct + docstring + empty case. p2 bsearch bug: exactly
+right (`lo = mid` no-progress -> `lo = mid + 1`). p3 diff explanation: correct
+(double accumulation for numerical stability). p4 nginx top-10 IPs: canonical
+`awk|sort|uniq -c|sort -nr|head`. p5 C dangling stack return: identified,
+malloc fix + caller-frees note. p6 SQL: correct JOIN/EXTRACT/GROUP BY/HAVING/
+ORDER BY. Calibration g1 "capital of France": Paris (verbose but correct).
+g2 09:40->13:05: 205 minutes. Raw outputs: robo-dog ~/bench17/out_*.txt.
+
+### Verdict: YES — keep Laguna-Q4_K_M as the second model (hot-swap candidate)
+
+- Quality-per-throughput for coding is outstanding: 23.8 t/s decode + 2200 t/s
+  prefill + clean 8/8 coding smoke, vs GA at 5.36/66. For interactive coding
+  work Laguna-resident is the clearly better daily experience.
+- **Hot-swap implication: full teardown swap.** Laguna resident needs ~64 GiB;
+  GA's expert cache is 70 GiB — they cannot coexist in 121 GiB usable RAM.
+  A swap = stop ds4-server (GA), start Laguna (~15-25 s model load) — cheap in
+  itself, but GA's popularity-preloaded cache warmth is lost each round trip.
+- Streamed Laguna does not exist yet; until an arch port lands in a
+  streaming-capable branch, Laguna is resident-only (which its size makes fine).
+- Disk cost: 63.6 GiB prepared copy on root NVMe (399 GB free after) + source
+  artifacts on /data/gguf (Q4_K_M 63.6 GiB + dead NVFP4 67 GiB, kept per
+  backup-first rule; /data 410 GB free).
+- License cost: nil beyond AUP compliance.
+
+Server state after window: ds4-server restarted, /v1/models 200, chat smoke OK.
