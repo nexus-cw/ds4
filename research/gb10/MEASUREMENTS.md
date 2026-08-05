@@ -4698,3 +4698,63 @@ reads — the contiguity/order prize (task #31; filefrag shows the production
 file has 220 extents with early 8MiB fragments smaller than one expert read).
 Drive HMB is at its own firmware-requested maximum (hmpre=hmmin=64MiB, granted)
 — nothing to raise; upgrade path is hardware.
+
+
+## Task #31 rung 1: extent-contiguity A/B -- allocation is NOT the prize; the fio gap is read ORDER (2026-08-05)
+
+Two pieces: (a) accretion-prepare now preallocates its output contiguously
+(nexus-cw/accretion commit 9d8d705: os.posix_fallocate of the full
+header+tensor size right after the header write, graceful warning fallback,
+test asserts the path runs); (b) production-file contiguity A/B on robo-dog.
+
+### Contig copy + extent audit
+
+Re-copied the production GGUF (156,378,344,992 B) into a preallocated file
+(posix_fallocate full size, then 64 MiB streamed chunks, 327 s). Verified:
+size equal, sha256 of 64 MiB samples at 3 interior offsets identical.
+Production file untouched throughout.
+
+filefrag: original 220 extents, preallocated copy **299 extents** -- the
+"single-digit extents" expectation is unreachable on this fs: e2freefrag
+shows free space itself split into ~21k extents (67.6% of free blocks in
+1-2 GB extents, only ~144 of them), so any 145 GiB allocation needs 100+
+extents. Layout quality per filefrag -v: both files average ~500-675 MiB
+per extent, max 1.92 GiB. Sub-13MiB extents: orig 26 scattered across ALL
+logical deciles; contig 53 but clustered in two narrow bands (logical 0
+and ~92-94 GiB). For random 13 MiB expert reads, boundary-crossing
+probability is ~2-4% either way -- extent fragmentation was already a
+second-order effect before the A/B ran.
+
+### A/B (cold ~22k prefill, chunk 8192, production flags, service stopped)
+
+Manual instance per arm, fresh KV dir + nonce-prefixed 78KB ds4_server.c
+prompt (defeats KV pinning), page cache dropped per arm, port 8010,
+DS4_CUDA_STREAM_STATS=1, iostat -x 5. Delta under 5% after rep 1, so a
+second rep of both per protocol.
+
+| arm | wall s | prompt tok | e2e t/s | avg NVMe read (busy) | NVMe util |
+|---|---|---|---|---|---|
+| orig rep1 | 319.0 | 21967 | 68.9 | 3.65 GB/s | 65% |
+| contig rep1 | 325.6 | 21967 | 67.5 | 3.62 GB/s | 63% |
+| orig rep2 | 343.9 | 21968 | 63.9 | 3.50 GB/s | 64% |
+| contig rep2 | 324.6 | 21968 | 67.7 | 3.65 GB/s | 63% |
+
+Means: orig 66.4 t/s, contig 67.6 t/s (+1.8%) -- smaller than orig's own
+rep-to-rep spread (63.9-68.9, +-3.8%). Direct-I/O counters clean and
+IDENTICAL in shape both arms: state=engaged, 0 fallbacks, ~128k widened
+reads, avg waste exactly 4096 B/read (~524 MB total, ~0.03% of traffic).
+NVMe throughput indistinguishable (3.5-3.65 GB/s both arms).
+
+**VERDICT: MARGINAL -- no promotable win.** Extent allocation is not where
+the fio 4.0-4.15 vs 5.1 GB/s gap lives. Both files already average
+~0.5 GiB/extent, and equalizing allocation moved nothing. The gap is
+dominated by read ORDER -- the per-chunk expert sweep scatters 13 MiB reads
+across the whole 145 GiB file regardless of how contiguously it is
+allocated. The remaining prize belongs to popularity-ordered layout
+(task #31 rungs 2-3), which changes the seek pattern, not the allocation.
+
+Cleanup: contig copy deleted (156 GB reclaimed; root NVMe 463G free).
+Production restored and verified: service active, models/capabilities/
+console/routing-stats all 200, chat smoke OK, service file untouched.
+Pipeline keeps the fallocate change -- it is free and prevents the
+worst-case (8 MiB early fragments) on emptier filesystems.
