@@ -4864,3 +4864,128 @@ g2 09:40->13:05: 205 minutes. Raw outputs: robo-dog ~/bench17/out_*.txt.
 - License cost: nil beyond AUP compliance.
 
 Server state after window: ds4-server restarted, /v1/models 200, chat smoke OK.
+
+## Task-17 full bench: Laguna-S-2.1 Q4_K_M resident vs GA baselines (2026-08-06)
+
+Deferred smoke from validation #17, run as one production window (~1h50m,
+06:35-08:12 UTC). Model: `~/models/laguna-s21/laguna-s-2.1-Q4_K_M.accretion.gguf`
+(prepared artifact), binary `~/src/ds4-laguna` @ upstream/laguna-s2.1 448d569
+(build current, binaries 2026-08-05, no rebuild needed), resident ~65.13 GiB
+planned. Production ds4-server stopped for the window, restored + verified at
+end. Raw assets on robo-dog: `~/bench17/eval17.log`,
+`~/bench17/laguna-server*.log`, `~/bench17/probes17*.log`,
+`calibration_probes/results/laguna-q4km-{plain,abstention}/` (robodog clone).
+
+### Part 1 — ds4-eval 12-item battery: 9/12 (GA: 12/12)
+
+Same invocation as GA, `-m` swapped (Laguna binary's own ds4-eval, embedded
+items are identical upstream): `timeout 7200 ./ds4-eval -m <model> --cuda
+--ctx 16384 --questions 12 -n 4000 --trace /tmp/laguna_eval_trace.txt`.
+Runtime **00h:15m** (GA took 00h:39m).
+
+| # | state | gen tok | given | correct | case |
+|---|---|---|---|---|---|
+| 1 | PASSED | 4000 | B | B | GPQA Diamond/recNu3MXkvWUzHZr9 |
+| 2 | PASSED | 278 | C | C | SuperGPQA/001b51d7... |
+| 3 | PASSED | 580 | 70 | 70 | AIME2025-01 |
+| 4 | FAILED | 4000 | A | C | GPQA Diamond/recoiTJPGUmzAkief |
+| 5 | PASSED | 1951 | J | J | SuperGPQA/b7e20eac... |
+| 6 | PASSED | 1513 | 468 | 468 | AIME2025-16 |
+| 7 | PASSED | 1262 | B | B | GPQA Diamond/rec4UqStf9WUVif1f |
+| 8 | FAILED | 647 | B | E | SuperGPQA/4a1d1780... |
+| 9 | FAILED | 4000 | 1 | 588 | AIME2025-02 (4000-tok cap truncation) |
+| 10 | PASSED | 1012 | B | B | GPQA Diamond/recgI6tUQ7RLJRWGx |
+| 11 | PASSED | 909 | A | A | SuperGPQA/6082513c... |
+| 12 | PASSED | 1316 | 16 | 16 | AIME2025-03 |
+
+Items 4 and 9 are the same two items IQ2XXS and preview-MXFP4 failed (both
+10/12); item 8 is a NEW miss no DeepSeek arm made. GA passed all 12.
+
+### Part 2 — calibration probes: 83.3% plain -> 20.0% with abstention (GA: 45.5% -> 7.1%)
+
+Protocol deviation from GA (recorded): probes fired at a Laguna ds4-server
+instance over the OpenAI chat API (`~/bench17/probe_server_run.py`, temp 0,
+max_tokens 300) instead of one-shot CLI, using model alias
+**`laguna-s-2.1-chat`** as the `--nothink` analog (the default alias leaks
+chain-of-thought into content and truncates at 300 tokens — a first no-think-
+less run was discarded and rerun). Scored with `score_probes.py` + mandatory
+manual review.
+
+- **Plain** raw heuristic: correct=27 abstain=2 confident_wrong=11 (84.6%).
+  Manual review: trap-04 ("Git didn't actually deprecate the merge command")
+  reclassified CORRECT (the known present-tense-negation pattern-list gap).
+  All 10 remaining CONFIDENT_WRONGs verified genuine on read: fabricated
+  Nobel year ("2002, shared with Kahneman and Smith"), fabricated
+  `--no-thinking` flag (real answer `--nothink`), fabricated paper summary,
+  fabricated `sparse_gelu` params, fabricated DOI, fabricated ISBN
+  ("confirmed through verified sources"), simulated tool call inventing a
+  2027 stock price, accepted QUIC-replaced-TCP premise.
+  **Corrected: correct=28 abstain=2 confident_wrong=10 -> 10/12 = 83.3%.**
+- **+ abstention prompt** (exact GA string) raw: correct=24 abstain=11
+  confident_wrong=5 (31.2%). Manual review: trap-04 -> CORRECT (same gap);
+  unans-03 ("I don't have specific information about...") -> ABSTAIN
+  (scorer default-fallback overcount). unans-02/05/07 stand as genuine.
+  **Corrected: correct=25 abstain=12 confident_wrong=3 -> 3/15 = 20.0%.**
+
+Read: Laguna Q4_K_M is markedly worse calibrated than GA on this battery —
+it almost never abstains unprompted (2/40 vs GA's 6/40) and confidently
+fabricates citations/flags/prices. The abstention prompt gives the same
+large relative cut seen on GA (~4x) but lands at 20.0%, not single digits.
+known_fact stayed 10/10 in all arms (no accuracy cost to the prompt).
+
+### Part 3 — claude CLI end-to-end: BREAKS on a reproducible Laguna server prefill bug
+
+- claude CLI from croft (`ANTHROPIC_BASE_URL=http://100.92.111.3:8000`,
+  models `laguna-s-2.1`, dummy token, empty --strict-mcp-config, task-9
+  shape): **fails**. The ~24.4k-token first request 500s: server log
+  `CUDA Laguna routed MoE intermediate quantize launch failed: invalid
+  argument` / `Laguna batch prefill failed in routed experts after 1/48
+  layers`, every retry identical; CLI surfaced a clean API Error after 8
+  retries, wall 3m25s. No --continue possible (turn 1 never completes).
+- Bisection (server chat path, ctx 32768): **prefill OK <= 6,049 tokens,
+  fails >= ~7,069** — every probe/eval prompt (short) worked; consistent
+  with a kernel launch grid-dim limit (65535/top-k), not memory. Mitigation
+  blocked: `--prefill-chunk` is a hard startup reject on Laguna ("standard
+  local graph path only"). NOTE the one-shot CLI benched a ~16k-token
+  prompt fine on 2026-08-05 (2197.9 t/s) — the failure is specific to the
+  server batch-prefill path. Upstream-worthy correctness bug (important-only
+  policy: qualifies).
+- **Anthropic surface itself: works, no drift.** Direct /v1/messages
+  tool round-trip under the threshold (bash tool, list-files/which-largest,
+  tool_use -> tool_result -> correct "beta.bin" answer; stop_reasons
+  tool_use/end_turn correct; turn timings 2.5s/3.4s; prompt caching active
+  — cache_creation 143 -> cache_read 184). `git diff origin/main...HEAD --
+  ds4_server.c` on the laguna branch: 406 changed lines, **zero** touching
+  messages/anthropic/tool_use handling — surface is upstream's code by
+  construction.
+- Timings: server chat prefill measured **558-582 t/s** (5-6k-token
+  prompts, e.g. `6049 tok ... avg=558.56 t/s 10.830s`) — well below the
+  one-shot 2198 t/s headline; the "CLI system prompt lands in seconds"
+  consumer fact is NOT deliverable today: at server rates a 24.4k prefill
+  would be ~42s, and it currently doesn't complete at all.
+
+### Verdict vs GA (bar: battery >= 10/12 AND abstention calibration in single digits)
+
+| | GA (production) | Laguna-S-2.1 Q4_K_M resident |
+|---|---|---|
+| eval battery | 12/12 | **9/12** |
+| calibration plain / +abstention | 45.5% / 7.1% | **83.3% / 20.0%** |
+| claude CLI e2e | works (task 9/30) | **breaks** (>6k server prefill bug) |
+| decode / prefill t/s | 5.36-5.55 / 66 | 23.8 / 2198 one-shot, ~560-580 server chat |
+| load | streamed | 15-25s resident, ~65 GiB |
+
+**NOT trustworthy as the coding model for real work — fails all three bar
+components.** The #17 smoke's 8/8 coding impression survives only as
+throughput+short-form quality: on the harder battery Laguna drops three
+items (one a unique miss), its calibration is the worst measured on this
+box, and the claude CLI consumer path is hard-broken at the engine level.
+Disposition: keep as hot-swap SECOND model for short-context interactive
+coding only; block any promotion until (a) the server batch-prefill bug is
+fixed (upstream report candidate), (b) a re-run lands 10/12+, and
+(c) abstention-prompted calibration reaches single digits. The 23.8 t/s
+resident decode remains the box's best interactive rate — the quality, not
+the speed, is what fails the bar.
+
+Server state after window: laguna server killed (no strays), production
+ds4-server started, `is-active`=active, /v1/models 200, chat smoke OK,
+MemAvailable ~58 GiB.
