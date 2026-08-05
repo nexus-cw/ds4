@@ -4681,3 +4681,20 @@ after a cold restart, still warming), i.e. the "what would trimming cost"
 panel is in the right regime. Full sample JSON excerpt in
 ROUTING_TELEMETRY.md's endpoint section context; raw capture kept with the
 task notes.
+
+### fio read-only queue-depth sweep (2026-08-05, root NVMe, production GGUF)
+
+| bs | QD1 | QD4 | QD16 | QD32 |
+|---|---|---|---|---|
+| 128k | 237 | 1033 | 1428 | 1475 MB/s |
+| 1M | 2015 | 3614 | 3687 | 3605 MB/s |
+| 13M (expert-read size) | 3857 | 4031 | 4133 | 4154 MB/s |
+
+At our 13MiB expert-read size, QD1 already reaches 93 percent of drive max —
+the 4-deep staging ring captures the rest; no submission-level gain available.
+Small blocks are IOPS-limited (DRAM-less FTL tax). Pure sequential probe was
+5.1 GB/s, so ~20-25 percent remains between big-scattered and truly-contiguous
+reads — the contiguity/order prize (task #31; filefrag shows the production
+file has 220 extents with early 8MiB fragments smaller than one expert read).
+Drive HMB is at its own firmware-requested maximum (hmpre=hmmin=64MiB, granted)
+— nothing to raise; upgrade path is hardware.
