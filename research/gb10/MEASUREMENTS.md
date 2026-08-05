@@ -4989,3 +4989,14 @@ the speed, is what fails the bar.
 Server state after window: laguna server killed (no strays), production
 ds4-server started, `is-active`=active, /v1/models 200, chat smoke OK,
 MemAvailable ~58 GiB.
+
+## Task-17 follow-up: Laguna server batch-prefill bug filed upstream (2026-08-05)
+
+Repro re-verified on robo-dog at upstream laguna-s2.1 head 448d569 (unchanged
+since bench; no fix in last 15 upstream commits): ~7,500-token chat completion
+-> HTTP 500 with "CUDA Laguna routed MoE intermediate quantize launch failed:
+invalid argument" / "Laguna batch prefill failed in routed experts after 1/48
+layers"; short-prompt control 200. Log: ~/bench17/repro_issue.log. Production
+restored after window (is-active, /v1/models 200, chat smoke OK).
+
+Filed (issue only, no fix in hand): https://github.com/antirez/ds4/issues/713
