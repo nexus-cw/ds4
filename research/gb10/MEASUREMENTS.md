@@ -4616,3 +4616,68 @@ projectCards GraphQL deprecation error and did not apply). Comments:
 https://github.com/antirez/ds4/pull/662#issuecomment-5186836186 and
 https://github.com/antirez/ds4/pull/664#issuecomment-5186836309. Scratch
 dirs removed on both boxes; production ds4-server untouched, /v1/models 200.
+
+## 2026-08-05 — task #28: per-(layer,expert) routing-traffic telemetry
+
+Counters live on production (commits 69479f1 / 0782441 / a30856d, deployed
+robo-dog, make cuda-spark clean, make cpu clean on croft). Design note:
+ROUTING_TELEMETRY.md.
+
+### Overhead (counters default ON — justified below)
+
+Warm decode, same 200-token chat turn, 3 warm turns each side:
+- before (8556898-era build): 5.11 / 5.11 / 5.27 / 5.38 t/s
+- after (a30856d, counters on): 5.08 / 5.00 / 5.20 t/s (fresh restart, cache
+  still re-warming on the early turns)
+Within noise. Prefill stress (the heavy case: counters tick per selection
+during chunk sweeps): ~9k-token cold-ish prompt peaked 99.5 t/s prefill
+(task#29 reference: 63 t/s on 22k fully-cold at chunk 8192) — no measurable
+cost; per-token increments kept, no need for the per-chunk batching
+fallback. Kill switch DS4_ROUTING_COUNTERS=0 available regardless.
+
+### Correctness
+
+After 4 bench turns (800 decode tokens, 108 prefill tokens):
+selections / (tokens x routed_layers) = 234264 / (908 x 43) = **6.000** =
+DS4_N_EXPERT_USED exactly. hit+miss consistent with the task-18
+DS4_CUDA_STREAM_STATS aggregates (hit_rate 0.908 at that point).
+Greedy identity: counters are pure observers (no write into any compute
+path); chat output unchanged in smoke.
+
+### Persistence
+
+systemctl restart: totals identical across the boundary
+(2563230/1608/8327 before == after, merged_prior_state=true), file
+~/.ds4/routing-stats/DeepSeek_V4_Flash_0731-156378344992.rstats (278 KB,
+~9.9k sparse keys). atexit flush on SIGTERM proven by the restart itself.
+
+### Entropy-counter decision
+
+OFF on production, by code evidence: the GPU-router path (both DS4 Flash
+streamed decode and GLM) reads back only the i32 selected ids; router
+probs never leave the device, so the entropy compare is not free there.
+v0 counts entropy only at the CPU-router decode path (host-resident probs,
+default ON with auto tau 0.85*ln(n_experts) at that site). Production
+per_layer.high_entropy_tokens therefore reads 0 until the v1 device-side
+compare (design in ROUTING_TELEMETRY.md).
+
+### Production sample (2026-08-05, ~10k tokens of traffic since deploy)
+
+Selection-distribution entropy per layer ~4.7-4.9 nats vs 5.55 max (256
+unique experts touched per layer already). Coverage: top 10% of keys serve
+54.9% of selections; top 25% -> 81.5%; top 50% -> 95.4%. Advisor
+(expert_bytes 13369344):
+
+| budget GiB | cache_experts (K) | estimated_hit_rate_static |
+|---|---|---|
+| 50.0 | 4015 | 0.9221 |
+| 55.0 | 4417 | 0.9378 |
+| 60.0 | 4818 | 0.9505 |
+| 63.6 | 5107 | 0.9582 |
+| 70.0 | 5621 | 0.9696 |
+
+Static-skew estimates line up with the observed live LRU hit rate (0.89
+after a cold restart, still warming), i.e. the "what would trimming cost"
+panel is in the right regime. Full sample JSON excerpt in
+ROUTING_TELEMETRY.md's endpoint section context; raw capture kept with the
+task notes.
