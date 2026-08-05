@@ -4584,3 +4584,35 @@ log is always-on):
 
 Build verify: make cpu clean on croft; ds4_cuda.o + ds4.o nvcc-clean on
 robo-dog scratch clone (removed after).
+
+## 2026-08-05 — greedy-identity re-verify on merged main + compat PR retarget
+
+### Greedy-identity (#658/#659) on merged main: FIXED upstream, nothing filed
+
+ds4f-mxfp4 merged into main; #658/#659 were closed not by the merge but by
+upstream commit 7fb2830 ("Replay partial DSpark accepts through ordinary
+decode", 2026-08-04, "Closes #658 / Closes #659"): antirez removed the
+partial-accept shortcut that committed batch-GEMM verifier frontiers via
+spec_frontier_commit_prefix. On current main (6747e77), every accept path in
+ds4_session_eval_dspark_speculative_argmax restores the pre-verify frontier
+(ds4.c:61716-61731, spec_frontier_restore) and replays accepted drafts one
+token at a time through metal_graph_eval_token_raw_swa (ds4.c:61776-61800) --
+the same fused single-token kernel as plain decode, i.e. exactly our fix's
+semantics. Static verdict: not exposed; no empirical A/B needed, production
+never stopped. Note: the env-gated split-kv self-spec path still commits
+batch frontiers (spec_frontier_commit_prefix1 at ds4.c:51876/51980) -- a
+possible same-class exposure, experimental/opt-in, out of scope, not filed.
+
+### Compat PRs #662/#664 retargeted to main
+
+Rebased dialect-compat-metadata onto upstream/main (6747e77) and
+dialect-compat-dense-types on top: code applied clean; only trivial README
+section-placement conflicts (new GLM 5.2 section). Main has no dialect
+handling of its own -- nothing subsumed. Builds: make cpu clean on croft for
+both branches; full make cuda-spark on robo-dog scratch worktree (sm_121a)
+zero errors. Force-pushed both branches to nexus-cw (444ac65 metadata,
+432f0c6 dense-types), bases switched to main via REST (gh pr edit hit the
+projectCards GraphQL deprecation error and did not apply). Comments:
+https://github.com/antirez/ds4/pull/662#issuecomment-5186836186 and
+https://github.com/antirez/ds4/pull/664#issuecomment-5186836309. Scratch
+dirs removed on both boxes; production ds4-server untouched, /v1/models 200.
