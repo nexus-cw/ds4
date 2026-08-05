@@ -154,6 +154,10 @@ uint32_t ds4_gpu_stream_expert_cache_current_count(void);
 uint64_t ds4_gpu_stream_expert_cache_budget_bytes(void);
 uint64_t ds4_gpu_stream_expert_cache_counted_bytes(void);
 uint64_t ds4_gpu_stream_expert_cache_parked_bytes(void);
+/* task#28: nominal per-expert slab byte size as planned by ds4.c (gate+up+
+ * down for the slab class).  Feeds the /v1/routing-stats cache-budget
+ * advisor's budget->K conversion.  Same CUDA-only guard as above. */
+uint64_t ds4_gpu_stream_expert_cache_expert_bytes_configured(void);
 /* Task-22 direct-I/O observability (CUDA-only symbols, same guard as above).
  * state: 0 = unavailable (env off / open failed / non-Linux), 1 = engaged,
  * 2 = permanently disabled after an errno fallback (EINVAL/EFAULT/ENOTSUP).

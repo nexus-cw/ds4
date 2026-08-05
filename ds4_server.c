@@ -4,6 +4,7 @@
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
+#include "ds4_routing_stats.h"
 #include "rax.h"
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
 /* CUDA-only expert-cache byte counters for /v1/capabilities. */
@@ -12700,6 +12701,215 @@ static bool send_capabilities(server *s, int fd) {
     return ok;
 }
 
+/* GET /v1/routing-stats (also /routing-stats): task#28 per-(layer,expert)
+ * routing-traffic telemetry.  Everything here is computed at request time
+ * from the ds4_routing_stats counter arrays (~740KB scan + one qsort of at
+ * most 30720 keys) -- no GPU work, no hot-path locks; counter reads are
+ * lock-free and may be a beat stale, matching the /v1/activity convention.
+ * Includes the cache-budget advisor v0: estimated_hit_rate_static is the
+ * static popularity-skew approximation (hit rate if the cache held the
+ * top-K experts by lifetime frequency); it ignores temporal locality, so
+ * it is a floor-ish estimate, not locality_sim.  Top-N via env
+ * DS4_ROUTING_TOPN (default 20; the HTTP parser strips query strings). */
+typedef struct {
+    uint64_t sel;
+    uint32_t key;
+} routing_stats_key;
+
+static int routing_stats_key_cmp_desc(const void *pa, const void *pb) {
+    const routing_stats_key *a = pa, *b = pb;
+    if (a->sel != b->sel) return a->sel > b->sel ? -1 : 1;
+    return a->key < b->key ? -1 : a->key > b->key ? 1 : 0;
+}
+
+static bool send_routing_stats(server *s, int fd) {
+    ds4_routing_stats_view v;
+    ds4_routing_stats_get_view(&v);
+    buf b = {0};
+
+    if (!v.enabled) {
+        buf_puts(&b, "{\"schema_version\":1,\"enabled\":false,"
+                     "\"note\":\"DS4_ROUTING_COUNTERS=0\"}\n");
+        bool ok = http_response(fd, s->enable_cors, 200, "application/json",
+                                b.ptr);
+        buf_free(&b);
+        return ok;
+    }
+
+    const uint32_t nkeys = v.n_layer * v.n_expert;
+    routing_stats_key *keys = xmalloc((size_t)nkeys * sizeof(*keys));
+    uint32_t distinct = 0;
+    uint64_t total_sel = 0, total_hit = 0, total_miss = 0;
+    for (uint32_t k = 0; k < nkeys; k++) {
+        const uint64_t sel = v.sel[k];
+        keys[k].sel = sel;
+        keys[k].key = k;
+        if (sel) distinct++;
+        total_sel += sel;
+        total_hit += v.hit[k];
+        total_miss += v.miss[k];
+    }
+    qsort(keys, nkeys, sizeof(*keys), routing_stats_key_cmp_desc);
+    const uint64_t lookups = total_hit + total_miss;
+
+    buf_printf(&b,
+        "{\"schema_version\":1,\"enabled\":true,"
+        "\"key_form\":\"layer_expert_u16\","
+        "\"note\":\"lock-free snapshot; counters cumulative across restarts "
+        "via the persisted file\","
+        "\"totals\":{\"selections\":%llu,\"decode_tokens\":%llu,"
+        "\"prefill_tokens\":%llu,\"distinct_keys\":%u,"
+        "\"lookups\":%llu,\"hits\":%llu,\"misses\":%llu,\"hit_rate\":%.4f},",
+        (unsigned long long)total_sel,
+        (unsigned long long)v.decode_tokens,
+        (unsigned long long)v.prefill_tokens,
+        distinct,
+        (unsigned long long)lookups,
+        (unsigned long long)total_hit,
+        (unsigned long long)total_miss,
+        lookups ? (double)total_hit / (double)lookups : 0.0);
+
+    buf_puts(&b, "\"persistence\":{");
+    if (v.persist_path) {
+        buf_puts(&b, "\"active\":true,\"path\":");
+        json_escape(&b, v.persist_path);
+        buf_printf(&b, ",\"merged_prior_state\":%s,\"flushes\":%llu},",
+                   v.persist_loaded ? "true" : "false",
+                   (unsigned long long)v.flushes);
+    } else {
+        buf_puts(&b, "\"active\":false},");
+    }
+
+    /* Hottest experts.  DS4_ROUTING_TOPN, default 20. */
+    int topn = 20;
+    {
+        const char *e = getenv("DS4_ROUTING_TOPN");
+        if (e && e[0]) topn = atoi(e);
+        if (topn < 1) topn = 1;
+        if (topn > 200) topn = 200;
+    }
+    buf_puts(&b, "\"top_experts\":[");
+    for (int i = 0; i < topn && (uint32_t)i < nkeys && keys[i].sel; i++) {
+        const uint32_t k = keys[i].key;
+        const uint32_t layer = k / v.n_expert, expert = k % v.n_expert;
+        const uint64_t kh = v.hit[k], km = v.miss[k];
+        if (i) buf_putc(&b, ',');
+        buf_printf(&b,
+            "{\"layer\":%u,\"expert\":%u,\"selections\":%llu,"
+            "\"share\":%.5f,\"hits\":%llu,\"misses\":%llu,\"hit_rate\":%.4f}",
+            layer, expert, (unsigned long long)keys[i].sel,
+            total_sel ? (double)keys[i].sel / (double)total_sel : 0.0,
+            (unsigned long long)kh, (unsigned long long)km,
+            (kh + km) ? (double)kh / (double)(kh + km) : 0.0);
+    }
+    buf_puts(&b, "],");
+
+    /* Per-layer aggregates: selections, unique experts, Shannon entropy of
+     * the layer's selection distribution (nats), plus the router-entropy
+     * event counters. */
+    buf_puts(&b, "\"per_layer\":[");
+    bool first_layer = true;
+    for (uint32_t l = 0; l < v.n_layer; l++) {
+        uint64_t lsel = 0;
+        uint32_t uniq = 0;
+        for (uint32_t e = 0; e < v.n_expert; e++) {
+            const uint64_t c = v.sel[l * v.n_expert + e];
+            lsel += c;
+            if (c) uniq++;
+        }
+        if (!lsel) continue;
+        double h = 0.0;
+        for (uint32_t e = 0; e < v.n_expert; e++) {
+            const uint64_t c = v.sel[l * v.n_expert + e];
+            if (!c) continue;
+            const double p = (double)c / (double)lsel;
+            h -= p * log(p);
+        }
+        if (!first_layer) buf_putc(&b, ',');
+        first_layer = false;
+        buf_printf(&b,
+            "{\"layer\":%u,\"selections\":%llu,\"unique_experts\":%u,"
+            "\"selection_entropy_nats\":%.4f,\"entropy_max_nats\":%.4f,"
+            "\"high_entropy_tokens\":%llu,\"entropy_measured_tokens\":%llu}",
+            l, (unsigned long long)lsel, uniq, h,
+            uniq > 1 ? log((double)uniq) : 0.0,
+            (unsigned long long)v.entropy_high[l],
+            (unsigned long long)v.entropy_measured[l]);
+    }
+    buf_puts(&b, "],");
+
+    buf_printf(&b,
+        "\"router_entropy\":{\"enabled\":%s,\"tau_nats\":%.4f,"
+        "\"note\":\"counted only where router scores are host-resident "
+        "(CPU-router decode path); GLM GPU-router probs readback is a "
+        "documented v1 hook\"},",
+        v.entropy_tau >= 0.0 ? "true" : "false",
+        v.entropy_tau >= 0.0 ? v.entropy_tau : -1.0);
+
+    /* Coverage curve: what fraction of all selections the hottest 10/25/50
+     * percent of DISTINCT keys serve -- the popularity-skew figures
+     * previously derived offline from DS4_ROUTING_TRACE captures. */
+    buf_puts(&b, "\"coverage\":[");
+    {
+        const double fracs[] = {0.10, 0.25, 0.50};
+        for (int fi = 0; fi < 3; fi++) {
+            uint32_t upto = (uint32_t)((double)distinct * fracs[fi] + 0.5);
+            if (upto > distinct) upto = distinct;
+            uint64_t covered = 0;
+            for (uint32_t i = 0; i < upto; i++) covered += keys[i].sel;
+            if (fi) buf_putc(&b, ',');
+            buf_printf(&b,
+                "{\"top_key_fraction\":%.2f,\"keys\":%u,"
+                "\"selection_share\":%.4f}",
+                fracs[fi], upto,
+                total_sel ? (double)covered / (double)total_sel : 0.0);
+        }
+    }
+    buf_puts(&b, "]");
+
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* Cache-budget advisor v0 (CUDA builds; needs the slab expert-byte size
+     * the engine planned).  For each candidate budget: K = budget /
+     * expert_bytes cacheable experts; estimated_hit_rate_static = share of
+     * all selections served by the top-K keys by frequency. */
+    {
+        const uint64_t expert_bytes =
+            ds4_gpu_stream_expert_cache_expert_bytes_configured();
+        if (expert_bytes > 0 && total_sel > 0) {
+            const double budgets_gib[] = {50.0, 55.0, 60.0, 63.6, 70.0};
+            buf_printf(&b,
+                ",\"advisor\":{\"expert_bytes\":%llu,"
+                "\"note\":\"static popularity-skew approximation: hit rate "
+                "if the cache held the top-K experts by lifetime frequency; "
+                "ignores temporal locality (locality_sim is the offline "
+                "reference)\",\"budgets\":[",
+                (unsigned long long)expert_bytes);
+            for (int bi = 0; bi < 5; bi++) {
+                const uint64_t budget_bytes =
+                    (uint64_t)(budgets_gib[bi] * 1073741824.0);
+                uint64_t kk = budget_bytes / expert_bytes;
+                if (kk > nkeys) kk = nkeys;
+                uint64_t covered = 0;
+                for (uint64_t i = 0; i < kk; i++) covered += keys[i].sel;
+                if (bi) buf_putc(&b, ',');
+                buf_printf(&b,
+                    "{\"budget_gib\":%.1f,\"cache_experts\":%llu,"
+                    "\"estimated_hit_rate_static\":%.4f}",
+                    budgets_gib[bi], (unsigned long long)kk,
+                    (double)covered / (double)total_sel);
+            }
+            buf_puts(&b, "]}");
+        }
+    }
+#endif
+
+    buf_puts(&b, "}\n");
+    free(keys);
+    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
 /* GET /v1/activity (also /activity): O(1) live snapshot of what the server is
  * doing right now.  All figures are lock-free reads of counters the serving
  * path already maintains (prefill progress callback, decode loop, KV disk
@@ -12861,6 +13071,14 @@ static void *client_main(void *arg) {
         (!strcmp(hr.path, "/v1/activity") || !strcmp(hr.path, "/activity")))
     {
         send_activity(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") &&
+        (!strcmp(hr.path, "/v1/routing-stats") ||
+         !strcmp(hr.path, "/routing-stats")))
+    {
+        send_routing_stats(s, fd);
         http_request_free(&hr);
         goto done;
     }
@@ -13491,6 +13709,10 @@ int main(int argc, char **argv) {
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
     ds4_engine_capabilities(engine, &s.caps);
+    /* task#28: load+merge persisted routing counters for this model and
+     * start the periodic flush contract (model-keyed file so multi-model
+     * boxes don't mix; DS4_ROUTING_COUNTERS=0 makes this a no-op). */
+    ds4_routing_stats_init(s.caps.model_name, s.caps.file_bytes);
     {
         const ds4_context_memory cm =
             ds4_context_memory_estimate_with_prefill_mode(
