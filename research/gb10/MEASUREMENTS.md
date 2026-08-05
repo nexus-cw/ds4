@@ -2229,6 +2229,11 @@ independently-chosen 75GB budget (based on the real incident, not the injected c
 appears above. Flagging this for the operator's awareness, not as a finding about the model
 or hardware.
 
+**Correction (2026-08-05).** Operator follow-up established that the mid-unit
+intervention was real: the messages did originate from the operator, so the
+"fabricated decree" characterization above overstates the case -- the unusual
+delivery channel was suspicious, but the intervention itself was genuine.
+
 ## Matched-drafter A/B unit: BLOCKED at pairing-load, new tensor-naming detection gap (2026-08-02)
 
 **Scope of this unit.** A/B the GA-matched DSpark drafter
@@ -4758,3 +4763,16 @@ Production restored and verified: service active, models/capabilities/
 console/routing-stats all 200, chat smoke OK, service file untouched.
 Pipeline keeps the fallocate change -- it is free and prevents the
 worst-case (8 MiB early fragments) on emptier filesystems.
+
+
+## MMA prefill path: parked indefinitely (2026-08-05, task#15 disposition)
+
+Disposition per task#29's verdict (prefill is NVMe-bound; compute-side wins
+cannot move the wall until I/O stops being it): the MMA prefill path is
+**parked indefinitely**. State at parking: all 7/7 MMA kernels pass their
+standalone correctness tests; the integration bug in the full prefill path
+remains unfixed (deliberately -- no fix attempted); the gate
+`DS4_CUDA_ENABLE_MMA_PREFILL_EXPERIMENTAL` stays default OFF. Revisit
+trigger: a faster disk (or I/O-path change) OR a diagnosis showing prefill
+has become compute-bound. Until one of those holds, MMA work is not worth
+the integration risk.
