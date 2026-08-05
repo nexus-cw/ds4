@@ -43,6 +43,7 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
 #include "ds4_tp.h"
+#include "ds4_routing_stats.h"  /* task#28 routing-traffic counters */
 
 /* Wave-2 multi-GPU types are needed in every build because the engine
  * struct embeds ds4_gpu_config and the placement table. ds4_layer_pack.h
@@ -21761,6 +21762,12 @@ static bool metal_graph_decode_cpu_router(
     for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
         selected_i32[i] = (int32_t)selected[i];
     }
+    /* task#28: router-entropy event counter.  This is the one decode path
+     * where the full router score vector is host-resident (just computed
+     * above), so the entropy compare is effectively free here.  The GLM
+     * GPU-router path keeps probs on device; its opt-in readback is a
+     * documented v1 (ROUTING_TELEMETRY.md). */
+    ds4_routing_stats_note_probs(il, probs, DS4_N_EXPERT);
     const double t_cpu = profile ? now_sec() : 0.0;
 
     if (ds4_gpu_tensor_write(metal_graph_router_logits(g),

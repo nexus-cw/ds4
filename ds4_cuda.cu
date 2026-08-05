@@ -20,6 +20,8 @@
 #include <vector>
 #include <algorithm>
 
+#include "ds4_routing_stats.h"  /* task#28 routing-traffic counters */
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -25377,6 +25379,14 @@ static int cuda_stream_selected_cache_begin_load(
         return 0;
     }
 
+    /* task#28: per-(layer,expert) selection counters.  Every streamed
+     * dispatch funnels through here (decode, prefill batch, GLM tensor
+     * path, async worker), so this is the one choke point that sees all
+     * selections; ids may repeat (k slots per token).  Relaxed-atomic
+     * increments; DS4_ROUTING_COUNTERS=0 short-circuits inside. */
+    ds4_routing_stats_note_selections(table->layer, selected_ids, slot_count);
+    ds4_routing_stats_tick();
+
     std::vector<int32_t> expert_to_slot;
     std::vector<int32_t> compact_ids;
     std::vector<int32_t> slot_ids;
@@ -25514,6 +25524,7 @@ static int cuda_stream_selected_cache_begin_load(
             }
             g_cuda_stream_stats_expert_fetches++;
             g_cuda_stream_stats_cache_hits++;
+            ds4_routing_stats_note_lookup(table->layer, (uint32_t)expert, 1);
             g_cuda_stream_stats_bytes_from_cache +=
                 table->gate_expert_bytes * 2ull + table->down_expert_bytes;
         } else {
@@ -25537,6 +25548,7 @@ static int cuda_stream_selected_cache_begin_load(
             }
             g_cuda_stream_stats_expert_fetches++;
             g_cuda_stream_stats_cache_misses++;
+            ds4_routing_stats_note_lookup(table->layer, (uint32_t)expert, 0);
             g_cuda_stream_stats_bytes_from_file +=
                 table->gate_expert_bytes * 2ull + table->down_expert_bytes;
             /*
@@ -29228,6 +29240,10 @@ extern "C" int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
                  "GLM streaming selected-id read")) {
         return 0;
     }
+    /* task#28: this entry is the GLM decode path's per-(token,layer) call
+     * (prefill goes through prepare_selected_batch); count the token phase
+     * here, selections are counted inside begin_load. */
+    ds4_routing_stats_note_decode_layer(table->layer);
     return cuda_stream_selected_cache_begin_load(table, ids.data(), n_selected);
 }
 
@@ -29867,6 +29883,7 @@ extern "C" int ds4_gpu_stream_expert_cache_begin_selected_load(
         uint32_t                           n_selected) {
     if (table && selected_ids && n_selected > 0) {
         routing_trace_decode(table->layer, selected_ids, n_selected);
+        ds4_routing_stats_note_decode_layer(table->layer);  /* task#28 */
     }
     return cuda_stream_selected_cache_begin_load(table, selected_ids,
                                                  n_selected);
@@ -30079,6 +30096,7 @@ extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
     }
     if (table && selected_ids) {
         routing_trace_prefill(table->layer, n_tokens, selected_ids, n_selected);
+        ds4_routing_stats_note_prefill_layer(table->layer, n_tokens);  /* task#28 */
     }
     return cuda_stream_selected_cache_begin_load(
             table, selected_ids, n_tokens * n_selected);
