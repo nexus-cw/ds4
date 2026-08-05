@@ -1,6 +1,8 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
 #include "ds4_help.h"
+#include "ds4_gpu.h"
+#include "ds4_routing_stats.h"
 
 /* ds4-eval: small built-in benchmark integration test.
  *
@@ -4305,6 +4307,12 @@ int main(int argc, char **argv) {
 
     tui_free(&ui);
     ds4_session_free(session);
+    if (getenv("DS4_CUDA_STREAM_STATS") != NULL) {
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__)
+        ds4_gpu_print_cuda_stream_stats();
+#endif
+        ds4_routing_stats_print_summary(stderr);
+    }
     ds4_engine_close(engine);
     if (trace) fclose(trace);
     free(case_sequence);

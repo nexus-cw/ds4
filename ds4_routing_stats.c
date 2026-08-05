@@ -343,3 +343,43 @@ void ds4_routing_stats_get_view(ds4_routing_stats_view *v) {
     v->persist_path = g_persist_active ? g_persist_path : NULL;
     v->flushes = g_flushes;
 }
+
+/* End-of-run one-line summary for the CLI tools (task#15 item 1).  The server
+ * self-reports via /v1/routing-stats; the ds4 CLI and ds4-eval call this at
+ * exit when DS4_CUDA_STREAM_STATS=1 so long REPL/eval sessions emit the same
+ * aggregate hit-rate figures the A/B tables need.  Aggregates only -- the
+ * per-(layer,expert) matrix stays behind the HTTP endpoint. */
+void ds4_routing_stats_print_summary(FILE *out) {
+    if (!out) out = stderr;
+    ds4_routing_stats_view v;
+    ds4_routing_stats_get_view(&v);
+    if (!v.enabled) {
+        fprintf(out, "ds4: routing-stats: disabled (DS4_ROUTING_COUNTERS=0)\n");
+        return;
+    }
+    uint64_t hits = 0, misses = 0, layers_active = 0;
+    for (uint32_t l = 0; l < v.n_layer; l++) {
+        uint64_t layer_sel = 0;
+        for (uint32_t e = 0; e < v.n_expert; e++) {
+            const size_t i = (size_t)l * v.n_expert + e;
+            layer_sel += v.sel[i];
+            hits += v.hit[i];
+            misses += v.miss[i];
+        }
+        if (layer_sel) layers_active++;
+    }
+    const uint64_t lookups = hits + misses;
+    fprintf(out,
+            "ds4: routing-stats summary: decode_tokens=%llu prefill_tokens=%llu "
+            "selections=%llu lru_hits=%llu lru_misses=%llu hit_rate=%.3f "
+            "layers_active=%llu flushes=%llu persist=%s\n",
+            (unsigned long long)v.decode_tokens,
+            (unsigned long long)v.prefill_tokens,
+            (unsigned long long)v.total_selections,
+            (unsigned long long)hits,
+            (unsigned long long)misses,
+            lookups ? (double)hits / (double)lookups : 0.0,
+            (unsigned long long)layers_active,
+            (unsigned long long)v.flushes,
+            v.persist_path ? v.persist_path : "none");
+}

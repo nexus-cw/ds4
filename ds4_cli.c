@@ -5,6 +5,7 @@
 #include "ds4_tp.h"
 #include "ds4_help.h"
 #include "linenoise.h"
+#include "ds4_routing_stats.h"
 
 /* ds4 CLI.
  *
@@ -2199,6 +2200,16 @@ int main(int argc, char **argv) {
         rc = run_repl(engine, &cfg);
     } else {
         rc = run_generation(engine, &cfg);
+    }
+    /* End-of-run stats self-report (task#15 item 1): the one-shot generation
+     * path prints these inline, but REPL and other long-session paths exited
+     * silently, so DS4_CUDA_STREAM_STATS=1 runs produced no hit-rate output.
+     * Same block the server self-reports; gated on the same env inside. */
+    if (getenv("DS4_CUDA_STREAM_STATS") != NULL) {
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__)
+        ds4_gpu_print_cuda_stream_stats();
+#endif
+        ds4_routing_stats_print_summary(stderr);
     }
     if (tp_leader) ds4_tp_send_stop(tp_leader);
     ds4_engine_close(engine);

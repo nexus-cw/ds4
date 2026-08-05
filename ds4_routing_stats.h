@@ -50,6 +50,7 @@
 #define DS4_ROUTING_STATS_H
 
 #include <stdint.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -121,6 +122,12 @@ typedef struct {
 } ds4_routing_stats_view;
 
 void ds4_routing_stats_get_view(ds4_routing_stats_view *v);
+
+/* End-of-run aggregate summary line to `out` (stderr if NULL).  Called by the
+ * ds4 CLI and ds4-eval at exit when DS4_CUDA_STREAM_STATS=1, alongside
+ * ds4_gpu_print_cuda_stream_stats(), so long REPL/eval runs report hit rates
+ * without the HTTP endpoint. */
+void ds4_routing_stats_print_summary(FILE *out);
 
 #ifdef __cplusplus
 }
