@@ -13351,7 +13351,7 @@ static void model_mode_classify(avail_model *m) {
         const double tps = strtod(v, &end);
         if (end && end != v && *end == '\0' && tps > 0) {
             snprintf(m->decode_tps_reference,
-                     sizeof(m->decode_tps_reference), "%s", v);
+                     sizeof(m->decode_tps_reference), "%.20s", v);
         }
     }
 }
