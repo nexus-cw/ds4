@@ -86,7 +86,7 @@ static const char ds4_console_html_tail[] =
     "<pre id=\"oc\">base_url = \"http://&lt;host&gt;:8000/v1\"\n"
     "model    = \"deepseek-v4-flash\"</pre>\n"
     "</section>\n"
-    "<footer>Read-only console. Settings and the prepare-pipeline UX arrive in v1.</footer>\n"
+    "<footer>Model switching requires an admin token; everything else is read-only. Prepare-pipeline UX arrives post-v0.1.</footer>\n"
     "<script>\n"
     "(function(){\n"
     "\"use strict\";\n"
