@@ -47,6 +47,12 @@
 
 static volatile sig_atomic_t g_stop_requested = 0;
 static volatile sig_atomic_t g_listen_fd = -1;
+/* POST /v1/models/select: a successful select drains and exits with
+ * DS4_SERVER_SWAP_EXIT_CODE so a Restart=on-failure supervisor restarts the
+ * server reading the updated env file.  g_swap_start_ms times the drain. */
+#define DS4_SERVER_SWAP_EXIT_CODE 42
+static volatile sig_atomic_t g_swap_requested = 0;
+static double g_swap_start_ms = 0.0;
 
 #define DS4_SERVER_IO_TIMEOUT_SEC 10
 #define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
@@ -8319,6 +8325,18 @@ struct server {
     /* Honest-capability snapshot: computed once at startup from the loaded
      * GGUF + engine config; served by GET /v1/capabilities. */
     ds4_capabilities caps;
+    /* Model management (GET /v1/models/available, POST /v1/models/select).
+     * model_path is the -m argument; model_realpath its resolved form (empty
+     * if resolution failed).  admin_token is ACCRETION_ADMIN_TOKEN (NULL =
+     * select disabled).  env_file is the env file a select rewrites
+     * (DS4_ENV_FILE, falling back to the accretion install layout default if
+     * that file exists; NULL = hand-managed install, select refused).
+     * model_dirs is DS4_MODEL_DIRS (colon-separated extra scan dirs). */
+    const char *model_path;
+    char model_realpath[PATH_MAX];
+    const char *admin_token;
+    const char *env_file;
+    const char *model_dirs;
     uint64_t session_ctx_bytes;
     /* GET /v1/activity KV-event counters (this uptime).  Incremented while
      * kv_mu is already held on the store/load paths; read lock-free by the
@@ -12394,6 +12412,9 @@ static void *slot_worker_main(void *arg) {
 typedef struct {
     char method[8];
     char path[256];
+    /* Authorization header value ("Bearer xyz"), empty if absent.  Used by
+     * the admin-token gate on mutating model-management endpoints. */
+    char auth[512];
     char *body;
     size_t body_len;
 } http_request;
@@ -12430,6 +12451,31 @@ static long content_length(const char *h, size_t n) {
     return 0;
 }
 
+/* Copy the value of a named header (case-insensitive, name includes the
+ * trailing colon, e.g. "Authorization:") into out; empty string if absent. */
+static void header_value(const char *h, size_t n, const char *name,
+                         char *out, size_t out_sz) {
+    const size_t name_len = strlen(name);
+    const char *p = h, *end = h + n;
+    out[0] = '\0';
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len > name_len && strncasecmp(line, name, name_len) == 0) {
+            const char *v = line + name_len;
+            while (v < line + len && isspace((unsigned char)*v)) v++;
+            size_t vlen = (size_t)(line + len - v);
+            if (vlen >= out_sz) vlen = out_sz - 1;
+            memcpy(out, v, vlen);
+            out[vlen] = '\0';
+            return;
+        }
+        if (p < end) p++;
+    }
+}
+
 static bool read_http_request(int fd, http_request *r) {
     buf b = {0};
     ssize_t hend = -1;
@@ -12456,6 +12502,8 @@ static bool read_http_request(int fd, http_request *r) {
     if (sscanf(line, "%7s %255s", r->method, r->path) != 2) goto fail;
     char *q = strchr(r->path, '?');
     if (q) *q = '\0';
+
+    header_value(b.ptr, (size_t)hend, "Authorization:", r->auth, sizeof(r->auth));
 
     long clen = content_length(b.ptr, (size_t)hend);
     if (clen < 0 || (size_t)clen > max_body) goto fail;
@@ -13027,6 +13075,457 @@ static bool send_console(server *s, int fd) {
     return ok;
 }
 
+/* =========================================================================
+ * Model management: GET /v1/models/available + POST /v1/models/select.
+ *
+ * The server scans the directory of the active model plus DS4_MODEL_DIRS
+ * (colon-separated) for *.gguf files and reports name/path/size/quant/arch/
+ * active/loadable per model.  Quant + architecture come from a bounded GGUF
+ * header peek, cached per (path,size,mtime) so repeated scans are cheap.
+ *
+ * Select is the deliberate-teardown swap: validate the requested path is in
+ * the scanned list, rewrite DS4_MODEL= in the env file that drives the unit,
+ * answer 200, then drain (stop accepting, finish in-flight work) and exit
+ * with DS4_SERVER_SWAP_EXIT_CODE so the supervisor restarts on the new
+ * selection.  Guarded by ACCRETION_ADMIN_TOKEN; disabled (405) when unset.
+ * ========================================================================= */
+
+static double swap_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+/* llama.cpp general.file_type enum -> human quant summary. */
+static const char *gguf_file_type_name(uint32_t ft) {
+    switch (ft) {
+    case 0: return "F32";      case 1: return "F16";
+    case 2: return "Q4_0";     case 3: return "Q4_1";
+    case 7: return "Q8_0";     case 8: return "Q5_0";
+    case 9: return "Q5_1";     case 10: return "Q2_K";
+    case 11: return "Q3_K_S";  case 12: return "Q3_K_M";
+    case 13: return "Q3_K_L";  case 14: return "Q4_K_S";
+    case 15: return "Q4_K_M";  case 16: return "Q5_K_S";
+    case 17: return "Q5_K_M";  case 18: return "Q6_K";
+    case 19: return "IQ2_XXS"; case 20: return "IQ2_XS";
+    case 21: return "Q2_K_S";  case 22: return "IQ3_XS";
+    case 23: return "IQ3_XXS"; case 24: return "IQ1_S";
+    case 25: return "IQ4_NL";  case 26: return "IQ3_S";
+    case 27: return "IQ3_M";   case 28: return "IQ2_S";
+    case 29: return "IQ2_M";   case 30: return "IQ4_XS";
+    case 31: return "IQ1_M";   case 32: return "BF16";
+    default: return "unknown";
+    }
+}
+
+typedef struct {
+    char path[PATH_MAX];
+    uint64_t size;
+    int64_t mtime;
+    char architecture[64];
+    char quant[32];
+    bool valid;
+} gguf_peek_entry;
+
+#define GGUF_PEEK_CACHE_MAX 256
+static gguf_peek_entry g_peek_cache[GGUF_PEEK_CACHE_MAX];
+static int g_peek_cache_len = 0;
+static pthread_mutex_t g_peek_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static bool peek_read(FILE *f, void *out, size_t n) {
+    return fread(out, 1, n, f) == n;
+}
+
+/* Bounded GGUF v2/v3 header walk: pull general.architecture and
+ * general.file_type, skipping other KVs (arrays element-wise for strings,
+ * seek for fixed-size).  Best effort: returns false on anything odd. */
+static bool gguf_peek_file(const char *path, char *arch, size_t arch_sz,
+                           char *quant, size_t quant_sz) {
+    arch[0] = '\0';
+    snprintf(quant, quant_sz, "unknown");
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    bool ok = false;
+    uint32_t magic = 0, version = 0;
+    uint64_t n_tensors = 0, n_kv = 0;
+    if (!peek_read(f, &magic, 4) || magic != 0x46554747u) goto out;
+    if (!peek_read(f, &version, 4) || version < 2 || version > 3) goto out;
+    if (!peek_read(f, &n_tensors, 8) || !peek_read(f, &n_kv, 8)) goto out;
+    if (n_kv > 4096) goto out;
+    bool have_arch = false, have_ft = false;
+    for (uint64_t i = 0; i < n_kv && !(have_arch && have_ft); i++) {
+        uint64_t klen = 0;
+        if (!peek_read(f, &klen, 8) || klen > 1024) goto out;
+        char key[1025];
+        if (!peek_read(f, key, klen)) goto out;
+        key[klen] = '\0';
+        uint32_t type = 0;
+        if (!peek_read(f, &type, 4)) goto out;
+        static const int fixed_sz[] = {1,1,2,2,4,4,4,1,-1,-2,8,8,8};
+        if (type == 8) { /* string */
+            uint64_t slen = 0;
+            if (!peek_read(f, &slen, 8) || slen > (64u << 20)) goto out;
+            if (!strcmp(key, "general.architecture") && slen < arch_sz) {
+                if (!peek_read(f, arch, slen)) goto out;
+                arch[slen] = '\0';
+                have_arch = true;
+            } else if (fseek(f, (long)slen, SEEK_CUR) != 0) goto out;
+        } else if (type == 9) { /* array */
+            uint32_t etype = 0;
+            uint64_t count = 0;
+            if (!peek_read(f, &etype, 4) || !peek_read(f, &count, 8)) goto out;
+            if (etype == 8) {
+                for (uint64_t j = 0; j < count; j++) {
+                    uint64_t slen = 0;
+                    if (!peek_read(f, &slen, 8) || slen > (64u << 20)) goto out;
+                    if (fseek(f, (long)slen, SEEK_CUR) != 0) goto out;
+                }
+            } else if (etype <= 12 && etype != 9 && fixed_sz[etype] > 0) {
+                if (fseek(f, (long)((uint64_t)fixed_sz[etype] * count),
+                          SEEK_CUR) != 0) goto out;
+            } else goto out;
+        } else if (type <= 12 && fixed_sz[type] > 0) {
+            uint8_t vbuf[8];
+            if (!peek_read(f, vbuf, (size_t)fixed_sz[type])) goto out;
+            if (!strcmp(key, "general.file_type") && type == 4) {
+                uint32_t ft;
+                memcpy(&ft, vbuf, 4);
+                snprintf(quant, quant_sz, "%s", gguf_file_type_name(ft));
+                have_ft = true;
+            }
+        } else goto out;
+    }
+    ok = have_arch || have_ft;
+out:
+    fclose(f);
+    return ok;
+}
+
+static const gguf_peek_entry *gguf_peek_cached(const char *path,
+                                               uint64_t size, int64_t mtime) {
+    pthread_mutex_lock(&g_peek_mu);
+    for (int i = 0; i < g_peek_cache_len; i++) {
+        gguf_peek_entry *e = &g_peek_cache[i];
+        if (!strcmp(e->path, path) && e->size == size && e->mtime == mtime) {
+            pthread_mutex_unlock(&g_peek_mu);
+            return e;
+        }
+    }
+    pthread_mutex_unlock(&g_peek_mu);
+    gguf_peek_entry ne = {0};
+    snprintf(ne.path, sizeof(ne.path), "%s", path);
+    ne.size = size;
+    ne.mtime = mtime;
+    ne.valid = gguf_peek_file(path, ne.architecture, sizeof(ne.architecture),
+                              ne.quant, sizeof(ne.quant));
+    pthread_mutex_lock(&g_peek_mu);
+    gguf_peek_entry *slot;
+    if (g_peek_cache_len < GGUF_PEEK_CACHE_MAX) {
+        slot = &g_peek_cache[g_peek_cache_len++];
+    } else {
+        slot = &g_peek_cache[0]; /* simple eviction; scans are small */
+    }
+    *slot = ne;
+    pthread_mutex_unlock(&g_peek_mu);
+    return slot;
+}
+
+typedef struct {
+    char path[PATH_MAX];
+    char name[256];
+    uint64_t size;
+    char architecture[64];
+    char quant[32];
+    bool active;
+    bool has_manifest;
+    const char *loadable; /* "yes" | "no" | "unknown" */
+} avail_model;
+
+#define AVAIL_MODELS_MAX 256
+#define AVAIL_DIRS_MAX 16
+
+/* Architectures this binary can load (config_validate_model accepts these). */
+static const char *model_arch_loadable(const char *arch) {
+    if (!arch[0]) return "unknown";
+    if (!strcmp(arch, "glm-dsa") || !strcmp(arch, "deepseek4")) return "yes";
+    return "no";
+}
+
+static int scan_dir_for_models(server *s, const char *dir,
+                               avail_model *out, int len) {
+    DIR *d = opendir(dir);
+    if (!d) return len;
+    struct dirent *de;
+    while ((de = readdir(d)) && len < AVAIL_MODELS_MAX) {
+        const size_t nl = strlen(de->d_name);
+        if (nl < 6 || strcmp(de->d_name + nl - 5, ".gguf") != 0) continue;
+        char path[PATH_MAX];
+        if (snprintf(path, sizeof(path), "%s/%s", dir, de->d_name) >=
+            (int)sizeof(path)) continue;
+        struct stat st;
+        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        char rp[PATH_MAX];
+        const char *canon = realpath(path, rp) ? rp : path;
+        bool dup = false;
+        for (int i = 0; i < len; i++) {
+            if (!strcmp(out[i].path, canon)) { dup = true; break; }
+        }
+        if (dup) continue;
+        avail_model *m = &out[len++];
+        memset(m, 0, sizeof(*m));
+        snprintf(m->path, sizeof(m->path), "%s", canon);
+        snprintf(m->name, sizeof(m->name), "%s", de->d_name);
+        m->size = (uint64_t)st.st_size;
+        const gguf_peek_entry *pe =
+            gguf_peek_cached(canon, (uint64_t)st.st_size,
+                             (int64_t)st.st_mtime);
+        if (pe && pe->valid) {
+            snprintf(m->architecture, sizeof(m->architecture), "%s",
+                     pe->architecture);
+            snprintf(m->quant, sizeof(m->quant), "%s", pe->quant);
+        } else {
+            snprintf(m->quant, sizeof(m->quant), "unknown");
+        }
+        m->loadable = model_arch_loadable(m->architecture);
+        m->active = s->model_realpath[0] &&
+                    !strcmp(canon, s->model_realpath);
+        char man[PATH_MAX + 32];
+        snprintf(man, sizeof(man), "%.*s.accretion.manifest.json",
+                 (int)(strlen(canon) - 5), canon);
+        m->has_manifest = access(man, R_OK) == 0;
+    }
+    closedir(d);
+    return len;
+}
+
+/* Scan the active model's directory + DS4_MODEL_DIRS.  Returns model count. */
+static int scan_available_models(server *s, avail_model *out) {
+    char dirs[AVAIL_DIRS_MAX][PATH_MAX];
+    int ndirs = 0;
+    if (s->model_realpath[0]) {
+        snprintf(dirs[ndirs], PATH_MAX, "%s", s->model_realpath);
+        char *slash = strrchr(dirs[ndirs], '/');
+        if (slash && slash != dirs[ndirs]) *slash = '\0';
+        else snprintf(dirs[ndirs], PATH_MAX, "/");
+        ndirs++;
+    }
+    if (s->model_dirs && s->model_dirs[0]) {
+        const char *p = s->model_dirs;
+        while (*p && ndirs < AVAIL_DIRS_MAX) {
+            const char *colon = strchr(p, ':');
+            size_t dl = colon ? (size_t)(colon - p) : strlen(p);
+            if (dl > 0 && dl < PATH_MAX) {
+                memcpy(dirs[ndirs], p, dl);
+                dirs[ndirs][dl] = '\0';
+                bool dup = false;
+                for (int i = 0; i < ndirs; i++) {
+                    if (!strcmp(dirs[i], dirs[ndirs])) { dup = true; break; }
+                }
+                if (!dup) ndirs++;
+            }
+            if (!colon) break;
+            p = colon + 1;
+        }
+    }
+    int len = 0;
+    for (int i = 0; i < ndirs; i++) {
+        len = scan_dir_for_models(s, dirs[i], out, len);
+    }
+    return len;
+}
+
+static bool send_models_available(server *s, int fd) {
+    static avail_model models[AVAIL_MODELS_MAX]; /* large; not stack-safe */
+    static pthread_mutex_t scan_mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&scan_mu);
+    const int n = scan_available_models(s, models);
+    buf b = {0};
+    buf_puts(&b, "{\"schema_version\":1,\"active_path\":");
+    json_escape(&b, s->model_realpath[0] ? s->model_realpath
+                                         : (s->model_path ? s->model_path : ""));
+    buf_printf(&b, ",\"select_enabled\":%s,\"models\":[",
+               s->admin_token && s->env_file ? "true" : "false");
+    for (int i = 0; i < n; i++) {
+        const avail_model *m = &models[i];
+        if (i) buf_putc(&b, ',');
+        buf_puts(&b, "{\"name\":");
+        json_escape(&b, m->name);
+        buf_puts(&b, ",\"path\":");
+        json_escape(&b, m->path);
+        buf_printf(&b, ",\"size_bytes\":%llu,\"quant\":",
+                   (unsigned long long)m->size);
+        json_escape(&b, m->quant);
+        buf_puts(&b, ",\"architecture\":");
+        json_escape(&b, m->architecture[0] ? m->architecture : "unknown");
+        buf_printf(&b, ",\"active\":%s,\"has_manifest\":%s,\"loadable\":\"%s\"}",
+                   m->active ? "true" : "false",
+                   m->has_manifest ? "true" : "false", m->loadable);
+    }
+    buf_puts(&b, "]}\n");
+    pthread_mutex_unlock(&scan_mu);
+    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+/* Minimal "path" extraction from the select body.  Paths are validated
+ * against the scanned list afterwards, so only \" \\ \/ escapes matter. */
+static bool select_body_path(const char *body, char *out, size_t out_sz) {
+    if (!body) return false;
+    const char *k = strstr(body, "\"path\"");
+    if (!k) return false;
+    k = strchr(k + 6, ':');
+    if (!k) return false;
+    k++;
+    while (*k && isspace((unsigned char)*k)) k++;
+    if (*k != '"') return false;
+    k++;
+    size_t o = 0;
+    while (*k && *k != '"' && o + 1 < out_sz) {
+        if (*k == '\\' && (k[1] == '"' || k[1] == '\\' || k[1] == '/')) k++;
+        out[o++] = *k++;
+    }
+    if (*k != '"') return false;
+    out[o] = '\0';
+    return o > 0;
+}
+
+/* Rewrite (or append) the DS4_MODEL= line in the env file; tmp + rename. */
+static bool env_file_set_model(const char *env_file, const char *path,
+                               char *err, size_t err_sz) {
+    FILE *f = fopen(env_file, "r");
+    if (!f) {
+        snprintf(err, err_sz, "cannot read %s: %s", env_file, strerror(errno));
+        return false;
+    }
+    buf nb = {0};
+    char line[4096];
+    bool replaced = false;
+    while (fgets(line, sizeof(line), f)) {
+        if (!strncmp(line, "DS4_MODEL=", 10)) {
+            buf_printf(&nb, "DS4_MODEL=%s\n", path);
+            replaced = true;
+        } else {
+            buf_puts(&nb, line);
+        }
+    }
+    fclose(f);
+    if (!replaced) {
+        if (nb.len && nb.ptr[nb.len - 1] != '\n') buf_putc(&nb, '\n');
+        buf_printf(&nb, "DS4_MODEL=%s\n", path);
+    }
+    char tmp[PATH_MAX + 8];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", env_file);
+    FILE *o = fopen(tmp, "w");
+    if (!o) {
+        snprintf(err, err_sz, "cannot write temp env file: %s",
+                 strerror(errno));
+        buf_free(&nb);
+        return false;
+    }
+    bool ok = fwrite(nb.ptr, 1, nb.len, o) == nb.len;
+    ok = (fclose(o) == 0) && ok;
+    buf_free(&nb);
+    if (!ok || rename(tmp, env_file) != 0) {
+        snprintf(err, err_sz, "failed to update %s: %s", env_file,
+                 strerror(errno));
+        unlink(tmp);
+        return false;
+    }
+    return true;
+}
+
+static void send_json_error(int fd, bool cors, int code, const char *type,
+                            const char *message) {
+    buf b = {0};
+    buf_printf(&b, "{\"error\":{\"type\":\"%s\",\"message\":", type);
+    json_escape(&b, message);
+    buf_puts(&b, "}}\n");
+    http_response(fd, cors, code, "application/json", b.ptr);
+    buf_free(&b);
+}
+
+static void handle_models_select(server *s, int fd, const http_request *hr) {
+    if (!s->admin_token) {
+        send_json_error(fd, s->enable_cors, 405, "admin_disabled",
+            "model switching is disabled: set ACCRETION_ADMIN_TOKEN in the "
+            "server environment and restart to enable POST /v1/models/select");
+        return;
+    }
+    const char *tok = hr->auth;
+    if (!strncasecmp(tok, "Bearer ", 7)) tok += 7;
+    if (strcmp(tok, s->admin_token) != 0) {
+        send_json_error(fd, s->enable_cors, 401, "unauthorized",
+            "missing or wrong admin token (Authorization: Bearer <token>)");
+        return;
+    }
+    if (!s->env_file) {
+        send_json_error(fd, s->enable_cors, 409, "not_env_file_managed",
+            "this install is not env-file managed (no DS4_ENV_FILE and no "
+            "/opt/accretion/etc/ds4-server.env); switch models by hand");
+        return;
+    }
+    char want[PATH_MAX];
+    if (!select_body_path(hr->body, want, sizeof(want))) {
+        send_json_error(fd, s->enable_cors, 400, "bad_request",
+                        "body must be {\"path\": \"/abs/path/model.gguf\"}");
+        return;
+    }
+    char wrp[PATH_MAX];
+    const char *canon = realpath(want, wrp) ? wrp : want;
+    static avail_model models[AVAIL_MODELS_MAX];
+    static pthread_mutex_t sel_mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&sel_mu);
+    const int n = scan_available_models(s, models);
+    const avail_model *hit = NULL;
+    for (int i = 0; i < n; i++) {
+        if (!strcmp(models[i].path, canon)) { hit = &models[i]; break; }
+    }
+    if (!hit) {
+        pthread_mutex_unlock(&sel_mu);
+        send_json_error(fd, s->enable_cors, 404, "unknown_model",
+            "path is not in the scanned model list (GET /v1/models/available)");
+        return;
+    }
+    if (hit->active) {
+        pthread_mutex_unlock(&sel_mu);
+        http_response(fd, s->enable_cors, 200, "application/json",
+                      "{\"status\":\"already_active\"}\n");
+        return;
+    }
+    if (!strcmp(hit->loadable, "no")) {
+        pthread_mutex_unlock(&sel_mu);
+        send_json_error(fd, s->enable_cors, 409, "not_loadable",
+            "this binary cannot load that model's architecture");
+        return;
+    }
+    char err[512];
+    if (!env_file_set_model(s->env_file, hit->path, err, sizeof(err))) {
+        pthread_mutex_unlock(&sel_mu);
+        send_json_error(fd, s->enable_cors, 500, "env_write_failed", err);
+        return;
+    }
+    buf b = {0};
+    buf_puts(&b, "{\"status\":\"swapping\",\"path\":");
+    json_escape(&b, hit->path);
+    buf_puts(&b, ",\"note\":\"draining sessions, then restarting on the new "
+                 "model; poll /v1/capabilities\"}\n");
+    http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: model select accepted path=%s (was %s); "
+               "draining for swap restart",
+               hit->path, s->model_realpath);
+    pthread_mutex_unlock(&sel_mu);
+    /* Trigger the existing graceful-shutdown drain: stop accepting, finish
+     * in-flight generation, then main() exits with the swap code. */
+    g_swap_start_ms = swap_now_ms();
+    g_swap_requested = 1;
+    /* Deliver the stop through the existing signal path so the blocking
+     * accept() in main() is interrupted exactly like an operator SIGTERM. */
+    if (!g_stop_requested) kill(getpid(), SIGTERM);
+}
+
 static void client_done(server *s) {
     pthread_mutex_lock(&s->mu);
     if (s->clients > 0) s->clients--;
@@ -13056,6 +13555,18 @@ static void *client_main(void *arg) {
 
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
         send_models(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") &&
+        !strcmp(hr.path, "/v1/models/available"))
+    {
+        send_models_available(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/models/select")) {
+        handle_models_select(s, fd, &hr);
         http_request_free(&hr);
         goto done;
     }
@@ -13709,6 +14220,30 @@ int main(int argc, char **argv) {
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
     ds4_engine_capabilities(engine, &s.caps);
+    /* Model management wiring: active model path, admin token, env file. */
+    s.model_path = cfg.engine.model_path;
+    if (!realpath(cfg.engine.model_path, s.model_realpath)) {
+        snprintf(s.model_realpath, sizeof(s.model_realpath), "%s",
+                 cfg.engine.model_path);
+    }
+    s.model_dirs = getenv("DS4_MODEL_DIRS");
+    {
+        const char *at = getenv("ACCRETION_ADMIN_TOKEN");
+        s.admin_token = (at && at[0]) ? at : NULL;
+        const char *ef = getenv("DS4_ENV_FILE");
+        if (ef && ef[0]) {
+            s.env_file = ef;
+        } else if (access("/opt/accretion/etc/ds4-server.env", W_OK) == 0) {
+            s.env_file = "/opt/accretion/etc/ds4-server.env";
+        } else {
+            s.env_file = NULL;
+        }
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: model select %s (admin token %s, env file %s)",
+                   s.admin_token && s.env_file ? "enabled" : "disabled",
+                   s.admin_token ? "set" : "unset",
+                   s.env_file ? s.env_file : "none");
+    }
     /* task#28: load+merge persisted routing counters for this model and
      * start the periodic flush contract (model-keyed file so multi-model
      * boxes don't mix; DS4_ROUTING_COUNTERS=0 makes this a no-op). */
@@ -13905,6 +14440,14 @@ int main(int argc, char **argv) {
         kv_cache_store_current(&s, slot, "shutdown");
     }
     server_close_resources(&s);
+    if (g_swap_requested) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: model swap drain complete in %.0f ms; "
+                   "exiting %d for supervisor restart on the new selection",
+                   swap_now_ms() - g_swap_start_ms,
+                   DS4_SERVER_SWAP_EXIT_CODE);
+        return DS4_SERVER_SWAP_EXIT_CODE;
+    }
     return 0;
 }
 #else
