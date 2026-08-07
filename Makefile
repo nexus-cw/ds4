@@ -427,3 +427,14 @@ clean:
 # Standalone inkling CPU inference CLI (self-contained; see PORT_NOTES.md).
 ds4-inkling: ds4_inkling.c ds4_inkling_tables.inc
 	$(CC) -O2 -Wall -Wextra -fopenmp -o $@ ds4_inkling.c -lm
+
+# Standalone inkling CUDA inference CLI (v1: unified/pageable-memory
+# direct-mmap kernels, see ds4_inkling_cuda.cu).  ds4_inkling.c is built
+# with its main() stripped out and linked in as the CPU oracle/utility lib.
+ds4-inkling-cuda: ds4_inkling_cuda.cu ds4_inkling.c ds4_inkling.h ds4_inkling_tables.inc
+	$(CC) -O2 -Wall -Wextra -fopenmp -DDS4_INKLING_NO_MAIN -c ds4_inkling.c -o ds4_inkling_lib.o
+	nvcc -O2 -o $@ ds4_inkling_cuda.cu ds4_inkling_lib.o -Xcompiler -fopenmp -lm
+
+# Standalone OpenAI-compatible HTTP server for the inkling engine.
+ds4-inkling-server: ds4_inkling_server.c ds4_inkling.c ds4_inkling.h ds4_inkling_tables.inc
+	$(CC) -O2 -Wall -Wextra -fopenmp -DDS4_INKLING_NO_MAIN -o $@ ds4_inkling_server.c ds4_inkling.c -lm
