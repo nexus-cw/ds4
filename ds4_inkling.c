@@ -38,11 +38,15 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "ds4_inkling.h"
 #include "ds4_inkling_tables.inc"
+
+#define fp16_to_fp32 ink_fp16_to_fp32
+#define now_sec ink_now_sec
 
 /* ========================== small utilities ========================== */
 
-static void ink_die(const char *msg) {
+void ink_die(const char *msg) {
     fprintf(stderr, "ds4-inkling: %s\n", msg);
     exit(1);
 }
@@ -54,19 +58,19 @@ static void ink_dief(const char *fmt, const char *a) {
     exit(1);
 }
 
-static void *ink_malloc(size_t n) {
+void *ink_malloc(size_t n) {
     void *p = malloc(n ? n : 1);
     if (!p) ink_die("out of memory");
     return p;
 }
 
-static void *ink_calloc(size_t n, size_t sz) {
+void *ink_calloc(size_t n, size_t sz) {
     void *p = calloc(n ? n : 1, sz);
     if (!p) ink_die("out of memory");
     return p;
 }
 
-static float fp16_to_fp32(uint16_t h) {
+float ink_fp16_to_fp32(uint16_t h) {
     const float sign = (h & 0x8000) ? -1.0f : 1.0f;
     const uint32_t exp = (h >> 10) & 0x1f;
     const uint32_t mant = h & 0x3ff;
@@ -75,7 +79,7 @@ static float fp16_to_fp32(uint16_t h) {
     return sign * ldexpf((float)(mant | 0x400), (int)exp - 25);
 }
 
-static double now_sec(void) {
+double ink_now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
@@ -83,32 +87,8 @@ static double now_sec(void) {
 
 /* ============================ GGUF reader ============================ */
 
-/* GGML tensor type ids present in inkling artifacts. */
-#define INK_T_F32     0
-#define INK_T_F16     1
-#define INK_T_Q8_0    8
-#define INK_T_Q4_K   12
-#define INK_T_Q5_K   13
-#define INK_T_Q6_K   14
-#define INK_T_IQ2_XXS 16
-#define INK_T_IQ3_XXS 18
-#define INK_T_IQ2_S  22
-#define INK_T_IQ4_XS 23
-#define INK_T_BF16   30
 
-#define QK_K 256
-#define QK8_0 32
-
-typedef struct { uint16_t d; int8_t qs[QK8_0]; } ink_block_q8_0;
-typedef struct { uint16_t d, dmin; uint8_t scales[12]; uint8_t qs[QK_K/2]; } ink_block_q4_K;
-typedef struct { uint16_t d, dmin; uint8_t scales[12]; uint8_t qh[QK_K/8]; uint8_t qs[QK_K/2]; } ink_block_q5_K;
-typedef struct { uint8_t ql[QK_K/2]; uint8_t qh[QK_K/4]; int8_t scales[QK_K/16]; uint16_t d; } ink_block_q6_K;
-typedef struct { uint16_t d; uint16_t qs[QK_K/8]; } ink_block_iq2_xxs;
-typedef struct { uint16_t d; uint8_t qs[QK_K/4]; uint8_t qh[QK_K/32]; uint8_t scales[QK_K/32]; } ink_block_iq2_s;
-typedef struct { uint16_t d; uint8_t qs[3*QK_K/8]; } ink_block_iq3_xxs;
-typedef struct { uint16_t d; uint16_t scales_h; uint8_t scales_l[QK_K/64]; uint8_t qs[QK_K/2]; } ink_block_iq4_xs;
-
-static size_t ink_type_block_elems(uint32_t t) {
+size_t ink_type_block_elems(uint32_t t) {
     switch (t) {
     case INK_T_F32: case INK_T_F16: case INK_T_BF16: return 1;
     case INK_T_Q8_0: return QK8_0;
@@ -116,7 +96,7 @@ static size_t ink_type_block_elems(uint32_t t) {
     }
 }
 
-static size_t ink_type_block_bytes(uint32_t t) {
+size_t ink_type_block_bytes(uint32_t t) {
     switch (t) {
     case INK_T_F32: return 4;
     case INK_T_F16: case INK_T_BF16: return 2;
@@ -132,33 +112,6 @@ static size_t ink_type_block_bytes(uint32_t t) {
     }
 }
 
-typedef struct {
-    char name[128];
-    uint32_t type;
-    uint32_t ndim;
-    uint64_t dims[4];
-    const uint8_t *data;    /* mapped pointer */
-} ink_tensor;
-
-typedef struct { const char *ptr; uint64_t len; } ink_str;
-
-typedef struct {
-    char key[96];
-    uint32_t type;          /* gguf value type */
-    uint32_t arr_type;      /* element type when type==9 */
-    uint64_t arr_len;
-    const uint8_t *val;     /* pointer into the mapped header at the value */
-} ink_kv;
-
-typedef struct {
-    int fd;
-    const uint8_t *map;
-    size_t map_len;
-    ink_kv *kv;
-    uint64_t n_kv;
-    ink_tensor *tensors;
-    uint64_t n_tensors;
-} ink_gguf;
 
 typedef struct { const uint8_t *p; const uint8_t *end; } ink_cur;
 
@@ -278,14 +231,14 @@ static void ink_gguf_open(ink_gguf *g, const char *path) {
     }
 }
 
-static const ink_kv *ink_kv_find(const ink_gguf *g, const char *key) {
+const ink_kv *ink_kv_find(const ink_gguf *g, const char *key) {
     for (uint64_t i = 0; i < g->n_kv; i++) {
         if (strcmp(g->kv[i].key, key) == 0) return &g->kv[i];
     }
     return NULL;
 }
 
-static bool ink_get_u32(const ink_gguf *g, const char *key, uint32_t *out) {
+bool ink_get_u32(const ink_gguf *g, const char *key, uint32_t *out) {
     const ink_kv *kv = ink_kv_find(g, key);
     if (!kv) return false;
     if (kv->type == 4 || kv->type == 5) { memcpy(out, kv->val, 4); return true; }
@@ -293,14 +246,14 @@ static bool ink_get_u32(const ink_gguf *g, const char *key, uint32_t *out) {
     return false;
 }
 
-static bool ink_get_f32(const ink_gguf *g, const char *key, float *out) {
+bool ink_get_f32(const ink_gguf *g, const char *key, float *out) {
     const ink_kv *kv = ink_kv_find(g, key);
     if (!kv || kv->type != 6) return false;
     memcpy(out, kv->val, 4);
     return true;
 }
 
-static bool ink_get_str(const ink_gguf *g, const char *key, ink_str *out) {
+bool ink_get_str(const ink_gguf *g, const char *key, ink_str *out) {
     const ink_kv *kv = ink_kv_find(g, key);
     if (!kv || kv->type != 8) return false;
     ink_cur c = { kv->val, g->map + g->map_len };
@@ -540,7 +493,7 @@ static ink_dq_fn ink_dq_for(uint32_t type) {
 }
 
 /* Dequantize row `r` (dims[0] values) of a 2D/3D tensor slice. */
-static void ink_row_f32(const ink_tensor *t, const uint8_t *base,
+void ink_row_f32(const ink_tensor *t, const uint8_t *base,
                         uint64_t row, uint64_t row_len, float *out) {
     if (t->type == INK_T_F32) {
         memcpy(out, base + row * row_len * 4, row_len * 4);
@@ -563,7 +516,7 @@ static float ink_dot(const float *a, const float *b, uint64_t n) {
 
 /* y[o] = sum_i W[o][i] * x[i]; W is a GGUF 2D tensor ne={in,out} (dim0
  * contiguous).  base allows 3D expert slices.  Parallel over rows. */
-static void ink_matvec(const ink_tensor *t, const uint8_t *base,
+void ink_matvec(const ink_tensor *t, const uint8_t *base,
                        uint64_t in, uint64_t out, const float *x, float *y) {
     #pragma omp parallel
     {
@@ -577,7 +530,24 @@ static void ink_matvec(const ink_tensor *t, const uint8_t *base,
     }
 }
 
-static void ink_rmsnorm(float *x, const float *w, uint64_t n, float eps) {
+void ink_matmat(const ink_tensor *t, const uint8_t *base,
+                uint64_t in, uint64_t out, uint32_t n_tok,
+                const float *X, float *Y) {
+    #pragma omp parallel
+    {
+        float *buf = ink_malloc(in * sizeof(float));
+        #pragma omp for schedule(static)
+        for (uint64_t o = 0; o < out; o++) {
+            ink_row_f32(t, base, o, in, buf);
+            for (uint32_t tk2 = 0; tk2 < n_tok; tk2++) {
+                Y[(size_t)tk2 * out + o] = ink_dot(buf, X + (size_t)tk2 * in, in);
+            }
+        }
+        free(buf);
+    }
+}
+
+void ink_rmsnorm(float *x, const float *w, uint64_t n, float eps) {
     float ss = 0.0f;
     for (uint64_t i = 0; i < n; i++) ss += x[i] * x[i];
     float scale = 1.0f / sqrtf(ss / (float)n + eps);
@@ -586,7 +556,7 @@ static void ink_rmsnorm(float *x, const float *w, uint64_t n, float eps) {
 
 static float ink_silu(float x) { return x / (1.0f + expf(-x)); }
 
-static float ink_logsigmoid(float x) {
+float ink_logsigmoid(float x) {
     /* logsigmoid(x) = -softplus(-x), numerically stable */
     if (x >= 0.0f) return -log1pf(expf(-x));
     return x - log1pf(expf(x));
@@ -639,9 +609,6 @@ static uint32_t ink_utf8_cp(const char *s, int len, int *adv) {
     return u[0];
 }
 
-/* FNV string hashmap: key -> int value. */
-typedef struct { char *key; uint32_t len; int val; } ink_map_slot;
-typedef struct { ink_map_slot *slots; uint64_t mask; } ink_map;
 
 static uint64_t ink_hash(const char *s, uint32_t len) {
     uint64_t h = 1469598103934665603ULL;
@@ -679,14 +646,6 @@ static int ink_map_get(const ink_map *m, const char *key, uint32_t len) {
     }
     return -1;
 }
-
-typedef struct {
-    ink_str *tokens;        /* byte-encoded vocab strings */
-    uint32_t n_tokens;
-    ink_map vocab;          /* token string -> id */
-    ink_map merges;         /* "left right" -> rank */
-    int bos, eos;
-} ink_tokenizer;
 
 static void ink_tokenizer_init(ink_tokenizer *tk, const ink_gguf *g) {
     memset(tk, 0, sizeof(*tk));
@@ -862,9 +821,8 @@ static void ink_pretokenize(const char *text, int len, ink_piece_fn emit, void *
 }
 
 /* BPE merge of one pre-token piece (raw bytes). */
-typedef struct { int *ids; int len; int cap; } ink_ids;
 
-static void ink_ids_push(ink_ids *v, int id) {
+void ink_ids_push(ink_ids *v, int id) {
     if (v->len == v->cap) {
         v->cap = v->cap ? v->cap * 2 : 64;
         v->ids = realloc(v->ids, v->cap * sizeof(int));
@@ -928,13 +886,13 @@ static void ink_bpe_piece(void *ud, const char *ptr, int len) {
     }
 }
 
-static void ink_tokenize(const ink_tokenizer *tk, const char *text, ink_ids *out) {
+void ink_tokenize(const ink_tokenizer *tk, const char *text, ink_ids *out) {
     ink_bpe_ctx ctx = { tk, out };
     ink_pretokenize(text, (int)strlen(text), ink_bpe_piece, &ctx);
 }
 
 /* Decode one token id to raw bytes (caller frees). */
-static int ink_detokenize(const ink_tokenizer *tk, int id, char *out, int cap) {
+int ink_detokenize(const ink_tokenizer *tk, int id, char *out, int cap) {
     if (id < 0 || (uint32_t)id >= tk->n_tokens) return 0;
     ink_str s = tk->tokens[id];
     int n = 0;
@@ -956,48 +914,12 @@ static int ink_detokenize(const ink_tokenizer *tk, int id, char *out, int cap) {
 
 /* =========================== model + forward ========================= */
 
-typedef struct {
-    const ink_tensor *attn_norm, *wq, *wk, *wv, *wr, *wo;
-    const ink_tensor *q_norm, *k_norm, *rel_proj;
-    const ink_tensor *sc_k, *sc_v, *sc_attn, *sc_mlp;
-    const ink_tensor *ffn_norm, *gscale;
-    /* dense */
-    const ink_tensor *ffn_gate, *ffn_up, *ffn_down;
-    /* moe */
-    const ink_tensor *gate_inp, *probs_b;
-    const ink_tensor *gate_exps, *up_exps, *down_exps;
-    const ink_tensor *gate_shexp, *up_shexp, *down_shexp;
-    bool is_swa;
-    uint32_t n_head_kv;
-} ink_layer;
-
-typedef struct {
-    ink_gguf gg;
-    ink_tokenizer tk;
-
-    uint32_t n_layer, n_dense, n_embd, n_head, head_dim, n_ff_dense;
-    uint32_t n_expert, n_expert_used, n_shexp, n_ff_exp;
-    uint32_t n_swa, d_rel, rel_extent, rel_extent_swa, conv_k;
-    uint32_t n_vocab, n_vocab_unpadded;
-    uint32_t log_n_floor;
-    float log_alpha, logit_scale, expert_weights_scale, rms_eps;
-
-    const ink_tensor *tok_embd, *tok_norm, *out_norm, *output;
-    ink_layer *layers;
-
-    /* state */
-    uint32_t n_ctx;
-    float *kcache;   /* [n_layer][n_ctx][kvw] post-norm k */
-    float *vcache;   /* [n_layer][n_ctx][kvw] post-sconv v */
-    float *conv;     /* [n_layer][(K-1)*(kvw+kvw+2*n_embd)] rolling inputs */
-} ink_model;
-
-static const float *ink_f32(const ink_tensor *t) {
+const float *ink_f32(const ink_tensor *t) {
     if (t->type != INK_T_F32) ink_dief("expected f32 tensor %s", t->name);
     return (const float *)t->data;
 }
 
-static void ink_model_open(ink_model *m, const char *path, uint32_t n_ctx) {
+void ink_model_open(ink_model *m, const char *path, uint32_t n_ctx) {
     memset(m, 0, sizeof(*m));
     ink_gguf_open(&m->gg, path);
     const ink_gguf *g = &m->gg;
@@ -1115,6 +1037,7 @@ static void ink_model_open(ink_model *m, const char *path, uint32_t n_ctx) {
         uint32_t kvw = m->layers[il].n_head_kv * m->head_dim;
         if (kvw > kvw_max) kvw_max = kvw;
     }
+    m->kvw_max = kvw_max;
     size_t kv_elem = (size_t)m->n_layer * n_ctx * kvw_max;
     m->kcache = ink_calloc(kv_elem, sizeof(float));
     m->vcache = ink_calloc(kv_elem, sizeof(float));
@@ -1126,7 +1049,7 @@ static void ink_model_open(ink_model *m, const char *path, uint32_t n_ctx) {
  * kernel gguf ne {K, C}: element (j, c) at c*K + j.  state holds the
  * previous K-1 inputs per channel, laid out [K-1][C] (time-major, oldest
  * first).  Updates state in place. */
-static void ink_sconv(const ink_tensor *kernel, float *state, uint32_t C,
+void ink_sconv(const ink_tensor *kernel, float *state, uint32_t C,
                       uint32_t K, float *x) {
     const float *w = ink_f32(kernel);
     uint32_t d = K - 1;
@@ -1150,47 +1073,50 @@ static int ink_scored_cmp(const void *a, const void *b) {
     return d > 0 ? 1 : d < 0 ? -1 : 0;
 }
 
-/* One token forward pass; logits (n_vocab) written if out_logits. */
-static void ink_forward(ink_model *m, int token, uint32_t pos, float *out_logits) {
+/* Batched forward: n_tok tokens at absolute positions pos0..pos0+n-1.
+ * Weight rows are dequantized once per row for the whole batch
+ * (ink_matmat); shortconv states advance token-sequentially; attention
+ * is causal within the batch.  Logits of the last token only. */
+void ink_forward_batch(ink_model *m, const int *tokens, uint32_t n_tok,
+                       uint32_t pos0, float *out_logits) {
     const uint32_t n_embd = m->n_embd;
     const uint32_t n_head = m->n_head;
     const uint32_t hd = m->head_dim;
     const uint32_t K = m->conv_k;
+    const uint32_t kvw_max = m->kvw_max;
+    const uint32_t nT = n_tok;
+    if (nT == 0) return;
 
-    uint32_t kvw_max = 0;
-    for (uint32_t il = 0; il < m->n_layer; il++) {
-        uint32_t kvw = m->layers[il].n_head_kv * hd;
-        if (kvw > kvw_max) kvw_max = kvw;
-    }
     const size_t conv_per_layer = (size_t)(K - 1) * (2u * kvw_max + 2u * n_embd);
     const size_t off_conv_k = 0;
     const size_t off_conv_v = (size_t)(K - 1) * kvw_max;
     const size_t off_conv_attn = (size_t)(K - 1) * 2 * kvw_max;
     const size_t off_conv_mlp = off_conv_attn + (size_t)(K - 1) * n_embd;
 
-    float *x = ink_malloc(n_embd * sizeof(float));
-    float *xn = ink_malloc(n_embd * sizeof(float));
-    float *q = ink_malloc((size_t)n_head * hd * sizeof(float));
-    float *kf = ink_malloc(kvw_max * sizeof(float));
-    float *vf = ink_malloc(kvw_max * sizeof(float));
-    float *r = ink_malloc((size_t)n_head * m->d_rel * sizeof(float));
+    float *x = ink_malloc((size_t)nT * n_embd * sizeof(float));
+    float *xn = ink_malloc((size_t)nT * n_embd * sizeof(float));
+    float *q = ink_malloc((size_t)nT * n_head * hd * sizeof(float));
+    float *kf = ink_malloc((size_t)nT * kvw_max * sizeof(float));
+    float *vf = ink_malloc((size_t)nT * kvw_max * sizeof(float));
+    float *r = ink_malloc((size_t)nT * n_head * m->d_rel * sizeof(float));
     float *rel = ink_malloc((size_t)n_head * m->rel_extent * sizeof(float));
-    float *attn_out = ink_malloc((size_t)n_head * hd * sizeof(float));
-    float *proj_out = ink_malloc(n_embd * sizeof(float));
-    float *scores = ink_malloc(m->n_ctx * sizeof(float));
+    float *attn_out = ink_malloc((size_t)nT * n_head * hd * sizeof(float));
+    float *proj_out = ink_malloc((size_t)nT * n_embd * sizeof(float));
     uint32_t big_ff = m->n_ff_dense > m->n_ff_exp ? m->n_ff_dense : m->n_ff_exp;
-    float *hg = ink_malloc(big_ff * sizeof(float));
-    float *hu = ink_malloc(big_ff * sizeof(float));
-    float *ff_out = ink_malloc(n_embd * sizeof(float));
+    float *hg = ink_malloc((size_t)nT * big_ff * sizeof(float));
+    float *hu = ink_malloc((size_t)nT * big_ff * sizeof(float));
+    float *ff_out = ink_malloc((size_t)nT * n_embd * sizeof(float));
     float *ff_acc = ink_malloc(n_embd * sizeof(float));
+    float *taus = ink_malloc(nT * sizeof(float));
 
-    /* embedding + embd norm */
-    ink_row_f32(m->tok_embd, m->tok_embd->data, (uint64_t)token, n_embd, x);
-    ink_rmsnorm(x, ink_f32(m->tok_norm), n_embd, m->rms_eps);
-
-    const float tau = (m->log_n_floor > 0)
-        ? 1.0f + m->log_alpha * logf(fmaxf((float)(pos + 1) / (float)m->log_n_floor, 1.0f))
-        : 1.0f;
+    for (uint32_t t = 0; t < nT; t++) {
+        float *xt = x + (size_t)t * n_embd;
+        ink_row_f32(m->tok_embd, m->tok_embd->data, (uint64_t)tokens[t], n_embd, xt);
+        ink_rmsnorm(xt, ink_f32(m->tok_norm), n_embd, m->rms_eps);
+        taus[t] = (m->log_n_floor > 0)
+            ? 1.0f + m->log_alpha * logf(fmaxf((float)(pos0 + t + 1) / (float)m->log_n_floor, 1.0f))
+            : 1.0f;
+    }
 
     for (uint32_t il = 0; il < m->n_layer; il++) {
         ink_layer *l = &m->layers[il];
@@ -1202,207 +1128,304 @@ static void ink_forward(ink_model *m, int token, uint32_t pos, float *out_logits
         float *vc = m->vcache + ((size_t)il * m->n_ctx) * kvw_max;
 
         /* ---- attention block ---- */
-        memcpy(xn, x, n_embd * sizeof(float));
-        ink_rmsnorm(xn, ink_f32(l->attn_norm), n_embd, m->rms_eps);
-
-        ink_matvec(l->wq, l->wq->data, n_embd, (uint64_t)n_head * hd, xn, q);
-        ink_matvec(l->wk, l->wk->data, n_embd, kvw, xn, kf);
-        ink_matvec(l->wv, l->wv->data, n_embd, kvw, xn, vf);
-        ink_matvec(l->wr, l->wr->data, n_embd, (uint64_t)n_head * m->d_rel, xn, r);
-
-        /* k/v short convs on the flat projections */
-        ink_sconv(l->sc_k, conv_l + off_conv_k, kvw, K, kf);
-        ink_sconv(l->sc_v, conv_l + off_conv_v, kvw, K, vf);
-
-        /* per-head q/k RMS norms */
-        for (uint32_t h = 0; h < n_head; h++) {
-            ink_rmsnorm(q + (size_t)h * hd, ink_f32(l->q_norm), hd, m->rms_eps);
-        }
-        for (uint32_t h = 0; h < n_head_kv; h++) {
-            ink_rmsnorm(kf + (size_t)h * hd, ink_f32(l->k_norm), hd, m->rms_eps);
+        for (uint32_t t = 0; t < nT; t++) {
+            memcpy(xn + (size_t)t * n_embd, x + (size_t)t * n_embd, n_embd * sizeof(float));
+            ink_rmsnorm(xn + (size_t)t * n_embd, ink_f32(l->attn_norm), n_embd, m->rms_eps);
         }
 
-        /* log-N tau on q, global layers only */
-        if (!l->is_swa && tau != 1.0f) {
-            for (uint32_t i = 0; i < (uint32_t)n_head * hd; i++) q[i] *= tau;
-        }
+        ink_matmat(l->wq, l->wq->data, n_embd, (uint64_t)n_head * hd, nT, xn, q);
+        ink_matmat(l->wk, l->wk->data, n_embd, kvw, nT, xn, kf);
+        ink_matmat(l->wv, l->wv->data, n_embd, kvw, nT, xn, vf);
+        ink_matmat(l->wr, l->wr->data, n_embd, (uint64_t)n_head * m->d_rel, nT, xn, r);
 
-        /* cache k (post-norm) and v (post-sconv) */
-        memcpy(kc + (size_t)pos * kvw_max, kf, kvw * sizeof(float));
-        memcpy(vc + (size_t)pos * kvw_max, vf, kvw * sizeof(float));
+        for (uint32_t t = 0; t < nT; t++) {
+            const uint32_t pos = pos0 + t;
+            float *kt = kf + (size_t)t * kvw_max;
+            float *vt = vf + (size_t)t * kvw_max;
+            float *qt = q + (size_t)t * n_head * hd;
 
-        /* rel bias per head: rel[h][e] = sum_d proj[e + d*E] * r[h*d_rel + d],
-         * scaled by tau on global layers */
-        {
-            const ink_tensor *pt = l->rel_proj;
-            float *pbuf = NULL;
-            const float *pw;
-            if (pt->type == INK_T_F32) {
-                pw = (const float *)pt->data;
-            } else {
-                pbuf = ink_malloc((size_t)rel_extent * m->d_rel * sizeof(float));
-                for (uint32_t d = 0; d < m->d_rel; d++) {
-                    ink_row_f32(pt, pt->data, d, rel_extent, pbuf + (size_t)d * rel_extent);
-                }
-                pw = pbuf;
+            /* k/v short convs (state advances per position) */
+            ink_sconv(l->sc_k, conv_l + off_conv_k, kvw, K, kt);
+            ink_sconv(l->sc_v, conv_l + off_conv_v, kvw, K, vt);
+
+            for (uint32_t h = 0; h < n_head; h++)
+                ink_rmsnorm(qt + (size_t)h * hd, ink_f32(l->q_norm), hd, m->rms_eps);
+            for (uint32_t h = 0; h < n_head_kv; h++)
+                ink_rmsnorm(kt + (size_t)h * hd, ink_f32(l->k_norm), hd, m->rms_eps);
+
+            if (!l->is_swa && taus[t] != 1.0f) {
+                for (uint32_t i = 0; i < (uint32_t)n_head * hd; i++) qt[i] *= taus[t];
             }
+
+            memcpy(kc + (size_t)pos * kvw_max, kt, kvw * sizeof(float));
+            memcpy(vc + (size_t)pos * kvw_max, vt, kvw * sizeof(float));
+        }
+
+        /* attention per token (causal); rel bias recomputed per token */
+        const uint32_t gqa = n_head / n_head_kv;
+        const float inv_hd = 1.0f / (float)hd;
+        const float *pw = ink_f32(l->rel_proj);   /* F32 in the artifact */
+
+        for (uint32_t t = 0; t < nT; t++) {
+            const uint32_t pos = pos0 + t;
+            const float *rt = r + (size_t)t * n_head * m->d_rel;
+            const float tau_t = (!l->is_swa) ? taus[t] : 1.0f;
+
+            #pragma omp parallel for schedule(static)
             for (uint32_t h = 0; h < n_head; h++) {
-                const float *rh = r + (size_t)h * m->d_rel;
+                const float *rh = rt + (size_t)h * m->d_rel;
                 float *relh = rel + (size_t)h * rel_extent;
                 for (uint32_t e = 0; e < rel_extent; e++) {
                     float acc = 0.0f;
-                    for (uint32_t d = 0; d < m->d_rel; d++) acc += pw[(size_t)d * rel_extent + e] * rh[d];
-                    relh[e] = (!l->is_swa && tau != 1.0f) ? acc * tau : acc;
+                    for (uint32_t d = 0; d < m->d_rel; d++)
+                        acc += pw[(size_t)d * rel_extent + e] * rh[d];
+                    relh[e] = acc * tau_t;
                 }
             }
-            free(pbuf);
+
+            uint32_t j0 = 0;
+            if (l->is_swa && pos + 1 > m->n_swa) j0 = pos + 1 - m->n_swa;
+
+            #pragma omp parallel for schedule(static)
+            for (uint32_t h = 0; h < n_head; h++) {
+                const float *qh = q + (size_t)t * n_head * hd + (size_t)h * hd;
+                const uint32_t hkv = h / gqa;
+                const float *relh = rel + (size_t)h * rel_extent;
+                float local_scores[4096];
+                float *sc = (pos + 1 - j0) <= 4096 ? local_scores
+                          : ink_malloc((pos + 1 - j0) * sizeof(float));
+                float maxs = -1e30f;
+                for (uint32_t j = j0; j <= pos; j++) {
+                    const float *kj = kc + (size_t)j * kvw_max + (size_t)hkv * hd;
+                    float sv = ink_dot(qh, kj, hd) * inv_hd;
+                    uint32_t d = pos - j;
+                    if (d < rel_extent) sv += relh[d];
+                    sc[j - j0] = sv;
+                    if (sv > maxs) maxs = sv;
+                }
+                float sum = 0.0f;
+                for (uint32_t j = j0; j <= pos; j++) {
+                    sc[j - j0] = expf(sc[j - j0] - maxs);
+                    sum += sc[j - j0];
+                }
+                float inv_sum = 1.0f / sum;
+                float *oh = attn_out + (size_t)t * n_head * hd + (size_t)h * hd;
+                memset(oh, 0, hd * sizeof(float));
+                for (uint32_t j = j0; j <= pos; j++) {
+                    const float *vj = vc + (size_t)j * kvw_max + (size_t)hkv * hd;
+                    float w = sc[j - j0] * inv_sum;
+                    for (uint32_t i = 0; i < hd; i++) oh[i] += w * vj[i];
+                }
+                if (sc != local_scores) free(sc);
+            }
         }
 
-        /* attention */
-        uint32_t j0 = 0;
-        if (l->is_swa && pos + 1 > m->n_swa) j0 = pos + 1 - m->n_swa;
-        const uint32_t gqa = n_head / n_head_kv;
-        const float inv_hd = 1.0f / (float)hd;
-        #pragma omp parallel for schedule(static)
-        for (uint32_t h = 0; h < n_head; h++) {
-            const float *qh = q + (size_t)h * hd;
-            const uint32_t hkv = h / gqa;
-            const float *relh = rel + (size_t)h * rel_extent;
-            float *sc = scores; /* shared scratch: give each thread its own */
-            float local_scores[4096];
-            sc = (pos + 1 - j0) <= 4096 ? local_scores : NULL;
-            if (!sc) sc = ink_malloc((pos + 1 - j0) * sizeof(float));
-            float maxs = -1e30f;
-            for (uint32_t j = j0; j <= pos; j++) {
-                const float *kj = kc + (size_t)j * kvw_max + (size_t)hkv * hd;
-                float s = ink_dot(qh, kj, hd) * inv_hd;
-                uint32_t d = pos - j;
-                if (d < rel_extent) s += relh[d];
-                sc[j - j0] = s;
-                if (s > maxs) maxs = s;
-            }
-            float sum = 0.0f;
-            for (uint32_t j = j0; j <= pos; j++) {
-                sc[j - j0] = expf(sc[j - j0] - maxs);
-                sum += sc[j - j0];
-            }
-            float inv_sum = 1.0f / sum;
-            float *oh = attn_out + (size_t)h * hd;
-            memset(oh, 0, hd * sizeof(float));
-            for (uint32_t j = j0; j <= pos; j++) {
-                const float *vj = vc + (size_t)j * kvw_max + (size_t)hkv * hd;
-                float w = sc[j - j0] * inv_sum;
-                for (uint32_t i = 0; i < hd; i++) oh[i] += w * vj[i];
-            }
-            if (sc != local_scores) free(sc);
+        ink_matmat(l->wo, l->wo->data, (uint64_t)n_head * hd, n_embd, nT, attn_out, proj_out);
+
+        for (uint32_t t = 0; t < nT; t++) {
+            float *pt = proj_out + (size_t)t * n_embd;
+            ink_sconv(l->sc_attn, conv_l + off_conv_attn, n_embd, K, pt);
+            float *xt = x + (size_t)t * n_embd;
+            for (uint32_t i = 0; i < n_embd; i++) xt[i] += pt[i];
         }
-
-        ink_matvec(l->wo, l->wo->data, (uint64_t)n_head * hd, n_embd, attn_out, proj_out);
-
-        /* attn output short conv + residual */
-        ink_sconv(l->sc_attn, conv_l + off_conv_attn, n_embd, K, proj_out);
-        for (uint32_t i = 0; i < n_embd; i++) x[i] += proj_out[i];
 
         /* ---- ffn block ---- */
-        memcpy(xn, x, n_embd * sizeof(float));
-        ink_rmsnorm(xn, ink_f32(l->ffn_norm), n_embd, m->rms_eps);
+        for (uint32_t t = 0; t < nT; t++) {
+            memcpy(xn + (size_t)t * n_embd, x + (size_t)t * n_embd, n_embd * sizeof(float));
+            ink_rmsnorm(xn + (size_t)t * n_embd, ink_f32(l->ffn_norm), n_embd, m->rms_eps);
+        }
         const float gscale = ink_f32(l->gscale)[0];
 
         if (il < m->n_dense) {
             uint32_t nf = m->n_ff_dense;
-            ink_matvec(l->ffn_gate, l->ffn_gate->data, n_embd, nf, xn, hg);
-            ink_matvec(l->ffn_up, l->ffn_up->data, n_embd, nf, xn, hu);
-            for (uint32_t i = 0; i < nf; i++) hg[i] = ink_silu(hg[i]) * hu[i];
-            ink_matvec(l->ffn_down, l->ffn_down->data, nf, n_embd, hg, ff_out);
-            for (uint32_t i = 0; i < n_embd; i++) ff_out[i] *= gscale;
+            ink_matmat(l->ffn_gate, l->ffn_gate->data, n_embd, nf, nT, xn, hg);
+            ink_matmat(l->ffn_up, l->ffn_up->data, n_embd, nf, nT, xn, hu);
+            for (uint32_t i = 0; i < nT * nf; i++) hg[i] = ink_silu(hg[i]) * hu[i];
+            ink_matmat(l->ffn_down, l->ffn_down->data, nf, n_embd, nT, hg, ff_out);
+            for (uint32_t i = 0; i < nT * n_embd; i++) ff_out[i] *= gscale;
         } else {
             const uint32_t nE = m->n_expert, nu = m->n_expert_used, ns = m->n_shexp;
-            float *logits = ink_malloc((nE + ns) * sizeof(float));
-            ink_matvec(l->gate_inp, l->gate_inp->data, n_embd, nE + ns, xn, logits);
-
-            const float *bias = ink_f32(l->probs_b);
-            ink_scored *ranked = ink_malloc(nE * sizeof(ink_scored));
-            for (uint32_t e = 0; e < nE; e++) {
-                ranked[e].score = 1.0f / (1.0f + expf(-logits[e])) + bias[e];
-                ranked[e].idx = (int)e;
-            }
-            qsort(ranked, nE, sizeof(ink_scored), ink_scored_cmp);
-
-            /* weights: softmax over logsigmoid of the raw top-k + shared
-             * logits, * expert_weights_scale * gscale */
-            float wv[64];
-            float wmax = -1e30f;
-            for (uint32_t i = 0; i < nu; i++) {
-                wv[i] = ink_logsigmoid(logits[ranked[i].idx]);
-                if (wv[i] > wmax) wmax = wv[i];
-            }
-            for (uint32_t s = 0; s < ns; s++) {
-                wv[nu + s] = ink_logsigmoid(logits[nE + s]);
-                if (wv[nu + s] > wmax) wmax = wv[nu + s];
-            }
-            float wsum = 0.0f;
-            for (uint32_t i = 0; i < nu + ns; i++) { wv[i] = expf(wv[i] - wmax); wsum += wv[i]; }
-            const float wscale = m->expert_weights_scale * gscale / wsum;
-            for (uint32_t i = 0; i < nu + ns; i++) wv[i] *= wscale;
-
-            memset(ff_acc, 0, n_embd * sizeof(float));
             const uint32_t nf = m->n_ff_exp;
+            float *logits = ink_malloc((size_t)nT * (nE + ns) * sizeof(float));
+            ink_matmat(l->gate_inp, l->gate_inp->data, n_embd, nE + ns, nT, xn, logits);
+            const float *bias = ink_f32(l->probs_b);
 
-            /* routed experts */
-            for (uint32_t i = 0; i < nu; i++) {
-                const uint32_t e = (uint32_t)ranked[i].idx;
-                size_t grow = (size_t)e * nf;   /* expert base row in the 3D bank */
-                const uint8_t *gbase = l->gate_exps->data;
-                const uint8_t *ubase = l->up_exps->data;
-                const uint8_t *dbase = l->down_exps->data;
-                size_t g_rb = (n_embd / ink_type_block_elems(l->gate_exps->type)) * ink_type_block_bytes(l->gate_exps->type);
-                size_t u_rb = (n_embd / ink_type_block_elems(l->up_exps->type)) * ink_type_block_bytes(l->up_exps->type);
-                size_t d_rb = (nf / ink_type_block_elems(l->down_exps->type)) * ink_type_block_bytes(l->down_exps->type);
-                ink_matvec(l->gate_exps, gbase + grow * g_rb, n_embd, nf, xn, hg);
-                ink_matvec(l->up_exps, ubase + grow * u_rb, n_embd, nf, xn, hu);
-                for (uint32_t t2 = 0; t2 < nf; t2++) hg[t2] = ink_silu(hg[t2]) * hu[t2];
-                ink_matvec(l->down_exps, dbase + (size_t)e * n_embd * d_rb, nf, n_embd, hg, ff_out);
-                const float w = wv[i];
-                for (uint32_t t2 = 0; t2 < n_embd; t2++) ff_acc[t2] += w * ff_out[t2];
+            size_t g_rb = (n_embd / ink_type_block_elems(l->gate_exps->type)) * ink_type_block_bytes(l->gate_exps->type);
+            size_t u_rb = (n_embd / ink_type_block_elems(l->up_exps->type)) * ink_type_block_bytes(l->up_exps->type);
+            size_t d_rb = (nf / ink_type_block_elems(l->down_exps->type)) * ink_type_block_bytes(l->down_exps->type);
+            size_t sg_rb = (n_embd / ink_type_block_elems(l->gate_shexp->type)) * ink_type_block_bytes(l->gate_shexp->type);
+            size_t su_rb = (n_embd / ink_type_block_elems(l->up_shexp->type)) * ink_type_block_bytes(l->up_shexp->type);
+            size_t sd_rb = (nf / ink_type_block_elems(l->down_shexp->type)) * ink_type_block_bytes(l->down_shexp->type);
+
+            float *wv_all = ink_malloc((size_t)nT * (nu + ns) * sizeof(float));
+            int *sel_all = ink_malloc((size_t)nT * nu * sizeof(int));
+
+            for (uint32_t t = 0; t < nT; t++) {
+                const float *lg = logits + (size_t)t * (nE + ns);
+                ink_scored *ranked = ink_malloc(nE * sizeof(ink_scored));
+                for (uint32_t e = 0; e < nE; e++) {
+                    ranked[e].score = 1.0f / (1.0f + expf(-lg[e])) + bias[e];
+                    ranked[e].idx = (int)e;
+                }
+                qsort(ranked, nE, sizeof(ink_scored), ink_scored_cmp);
+                float *wv = wv_all + (size_t)t * (nu + ns);
+                float wmax = -1e30f;
+                for (uint32_t i = 0; i < nu; i++) {
+                    sel_all[(size_t)t * nu + i] = ranked[i].idx;
+                    wv[i] = ink_logsigmoid(lg[ranked[i].idx]);
+                    if (wv[i] > wmax) wmax = wv[i];
+                }
+                for (uint32_t sx = 0; sx < ns; sx++) {
+                    wv[nu + sx] = ink_logsigmoid(lg[nE + sx]);
+                    if (wv[nu + sx] > wmax) wmax = wv[nu + sx];
+                }
+                float wsum = 0.0f;
+                for (uint32_t i = 0; i < nu + ns; i++) { wv[i] = expf(wv[i] - wmax); wsum += wv[i]; }
+                const float wscale = m->expert_weights_scale * gscale / wsum;
+                for (uint32_t i = 0; i < nu + ns; i++) wv[i] *= wscale;
+                free(ranked);
             }
 
-            /* shared experts: gamma applied to hidden BEFORE down-proj */
-            for (uint32_t s = 0; s < ns; s++) {
-                size_t srow = (size_t)s * nf;
-                size_t g_rb = (n_embd / ink_type_block_elems(l->gate_shexp->type)) * ink_type_block_bytes(l->gate_shexp->type);
-                size_t u_rb = (n_embd / ink_type_block_elems(l->up_shexp->type)) * ink_type_block_bytes(l->up_shexp->type);
-                size_t d_rb = (nf / ink_type_block_elems(l->down_shexp->type)) * ink_type_block_bytes(l->down_shexp->type);
-                ink_matvec(l->gate_shexp, l->gate_shexp->data + srow * g_rb, n_embd, nf, xn, hg);
-                ink_matvec(l->up_shexp, l->up_shexp->data + srow * u_rb, n_embd, nf, xn, hu);
-                const float gamma = wv[nu + s];
-                for (uint32_t t2 = 0; t2 < nf; t2++) hg[t2] = ink_silu(hg[t2]) * hu[t2] * gamma;
-                ink_matvec(l->down_shexp, l->down_shexp->data + (size_t)s * n_embd * d_rb, nf, n_embd, hg, ff_out);
-                for (uint32_t t2 = 0; t2 < n_embd; t2++) ff_acc[t2] += ff_out[t2];
+            /* routed experts per token */
+            for (uint32_t t = 0; t < nT; t++) {
+                const float *xt = xn + (size_t)t * n_embd;
+                float *ot = ff_out + (size_t)t * n_embd;
+                memset(ff_acc, 0, n_embd * sizeof(float));
+                for (uint32_t i = 0; i < nu; i++) {
+                    const uint32_t e = (uint32_t)sel_all[(size_t)t * nu + i];
+                    ink_matvec(l->gate_exps, l->gate_exps->data + (size_t)e * nf * g_rb, n_embd, nf, xt, hg);
+                    ink_matvec(l->up_exps, l->up_exps->data + (size_t)e * nf * u_rb, n_embd, nf, xt, hu);
+                    for (uint32_t v2 = 0; v2 < nf; v2++) hg[v2] = ink_silu(hg[v2]) * hu[v2];
+                    ink_matvec(l->down_exps, l->down_exps->data + (size_t)e * n_embd * d_rb, nf, n_embd, hg, proj_out);
+                    const float w = wv_all[(size_t)t * (nu + ns) + i];
+                    for (uint32_t v2 = 0; v2 < n_embd; v2++) ff_acc[v2] += w * proj_out[v2];
+                }
+                memcpy(ot, ff_acc, n_embd * sizeof(float));
             }
-            memcpy(ff_out, ff_acc, n_embd * sizeof(float));
-            free(logits);
-            free(ranked);
+
+            /* shared experts batched over tokens */
+            for (uint32_t sx = 0; sx < ns; sx++) {
+                ink_matmat(l->gate_shexp, l->gate_shexp->data + (size_t)sx * nf * sg_rb, n_embd, nf, nT, xn, hg);
+                ink_matmat(l->up_shexp, l->up_shexp->data + (size_t)sx * nf * su_rb, n_embd, nf, nT, xn, hu);
+                for (uint32_t t = 0; t < nT; t++) {
+                    const float gamma = wv_all[(size_t)t * (nu + ns) + nu + sx];
+                    float *hgt = hg + (size_t)t * nf;
+                    const float *hut = hu + (size_t)t * nf;
+                    for (uint32_t v2 = 0; v2 < nf; v2++) hgt[v2] = ink_silu(hgt[v2]) * hut[v2] * gamma;
+                }
+                ink_matmat(l->down_shexp, l->down_shexp->data + (size_t)sx * n_embd * sd_rb, nf, n_embd, nT, hg, proj_out);
+                for (uint32_t i = 0; i < nT * n_embd; i++) ff_out[i] += proj_out[i];
+            }
+            free(logits); free(wv_all); free(sel_all);
         }
 
-        /* mlp output short conv + residual */
-        ink_sconv(l->sc_mlp, conv_l + off_conv_mlp, n_embd, K, ff_out);
-        for (uint32_t i = 0; i < n_embd; i++) x[i] += ff_out[i];
+        for (uint32_t t = 0; t < nT; t++) {
+            float *ft = ff_out + (size_t)t * n_embd;
+            ink_sconv(l->sc_mlp, conv_l + off_conv_mlp, n_embd, K, ft);
+            float *xt = x + (size_t)t * n_embd;
+            for (uint32_t i = 0; i < n_embd; i++) xt[i] += ft[i];
+        }
     }
 
     if (out_logits) {
-        ink_rmsnorm(x, ink_f32(m->out_norm), n_embd, m->rms_eps);
-        for (uint32_t i = 0; i < n_embd; i++) x[i] *= m->logit_scale;
-        ink_matvec(m->output, m->output->data, n_embd, m->n_vocab, x, out_logits);
+        float *xl = x + (size_t)(nT - 1) * n_embd;
+        ink_rmsnorm(xl, ink_f32(m->out_norm), n_embd, m->rms_eps);
+        for (uint32_t i = 0; i < n_embd; i++) xl[i] *= m->logit_scale;
+        ink_matvec(m->output, m->output->data, n_embd, m->n_vocab, xl, out_logits);
         if (m->n_vocab_unpadded > 0) {
             for (uint32_t i = m->n_vocab_unpadded; i < m->n_vocab; i++) out_logits[i] = -INFINITY;
         }
     }
 
     free(x); free(xn); free(q); free(kf); free(vf); free(r); free(rel);
-    free(attn_out); free(proj_out); free(scores); free(hg); free(hu);
-    free(ff_out); free(ff_acc);
+    free(attn_out); free(proj_out); free(hg); free(hu);
+    free(ff_out); free(ff_acc); free(taus);
 }
 
+void ink_forward(ink_model *m, int token, uint32_t pos, float *out_logits) {
+    ink_forward_batch(m, &token, 1, pos, out_logits);
+}
+
+/* ====================== state reset / snapshot ======================= */
+
+void ink_state_reset(ink_model *m) {
+    size_t kv_elem = (size_t)m->n_layer * m->n_ctx * m->kvw_max;
+    memset(m->kcache, 0, kv_elem * sizeof(float));
+    memset(m->vcache, 0, kv_elem * sizeof(float));
+    size_t conv_elem = (size_t)m->n_layer * (m->conv_k - 1) * (2u * m->kvw_max + 2u * m->n_embd);
+    memset(m->conv, 0, conv_elem * sizeof(float));
+}
+
+size_t ink_state_bytes(const ink_model *m) {
+    size_t kv_elem = (size_t)m->n_layer * m->n_ctx * m->kvw_max;
+    size_t conv_elem = (size_t)m->n_layer * (m->conv_k - 1) * (2u * m->kvw_max + 2u * m->n_embd);
+    return sizeof(uint32_t) + (2 * kv_elem + conv_elem) * sizeof(float);
+}
+
+void ink_state_save(const ink_model *m, uint32_t pos, void *buf) {
+    uint8_t *p = buf;
+    size_t kv_elem = (size_t)m->n_layer * m->n_ctx * m->kvw_max;
+    size_t conv_elem = (size_t)m->n_layer * (m->conv_k - 1) * (2u * m->kvw_max + 2u * m->n_embd);
+    memcpy(p, &pos, sizeof(uint32_t)); p += sizeof(uint32_t);
+    memcpy(p, m->kcache, kv_elem * sizeof(float)); p += kv_elem * sizeof(float);
+    memcpy(p, m->vcache, kv_elem * sizeof(float)); p += kv_elem * sizeof(float);
+    memcpy(p, m->conv, conv_elem * sizeof(float));
+}
+
+uint32_t ink_state_load(ink_model *m, const void *buf) {
+    const uint8_t *p = buf;
+    uint32_t pos;
+    size_t kv_elem = (size_t)m->n_layer * m->n_ctx * m->kvw_max;
+    size_t conv_elem = (size_t)m->n_layer * (m->conv_k - 1) * (2u * m->kvw_max + 2u * m->n_embd);
+    memcpy(&pos, p, sizeof(uint32_t)); p += sizeof(uint32_t);
+    memcpy(m->kcache, p, kv_elem * sizeof(float)); p += kv_elem * sizeof(float);
+    memcpy(m->vcache, p, kv_elem * sizeof(float)); p += kv_elem * sizeof(float);
+    memcpy(m->conv, p, conv_elem * sizeof(float));
+    return pos;
+}
+
+/* =========================== chat template ===========================
+ * Hand-rendered form of the artifact's jinja chat template for the
+ * text-only v1 path (no tool calls, no thinking-effort control blocks
+ * beyond the system message llama.cpp also renders):
+ *   system:    <|message_system|><|content_text|>TEXT<|end_message|>
+ *   user:      <|message_user|><|content_text|>TEXT<|end_message|>
+ *   assistant: <|message_model|><|content_text|>TEXT<|end_message|>
+ *              <|content_model_end_sampling|>
+ *   generation prefix: <|message_model|>
+ * Verified against llama.cpp --jinja rendering of the same GGUF. */
+
+int ink_token_lookup(const ink_tokenizer *tk, const char *text) {
+    return ink_map_get(&tk->vocab, text, (uint32_t)strlen(text));
+}
+
+static void ink_push_special(const ink_model *m, ink_ids *out, const char *tok) {
+    int id = ink_token_lookup(&m->tk, tok);
+    if (id < 0) ink_die("chat special token missing from vocab");
+    ink_ids_push(out, id);
+}
+
+void ink_chat_append(const ink_model *m, ink_ids *out,
+                     const char *role, const char *content) {
+    const char *hdr = NULL;
+    if (strcmp(role, "system") == 0) hdr = "<|message_system|>";
+    else if (strcmp(role, "user") == 0) hdr = "<|message_user|>";
+    else if (strcmp(role, "assistant") == 0 || strcmp(role, "model") == 0) hdr = "<|message_model|>";
+    else hdr = "<|message_user|>";
+    ink_push_special(m, out, hdr);
+    ink_push_special(m, out, "<|content_text|>");
+    ink_tokenize(&m->tk, content, out);
+    ink_push_special(m, out, "<|end_message|>");
+    if (hdr[10] == 'o') { /* model turn: closed with the sampling-end token */
+        ink_push_special(m, out, "<|content_model_end_sampling|>");
+    }
+}
+
+void ink_chat_append_model_prefix(const ink_model *m, ink_ids *out) {
+    ink_push_special(m, out, "<|message_model|>");
+}
+
+#ifndef DS4_INKLING_NO_MAIN
 /* ================================ CLI ================================ */
 
 int main(int argc, char **argv) {
@@ -1457,12 +1480,17 @@ int main(int argc, char **argv) {
     float *logits = ink_malloc((size_t)m.n_vocab * sizeof(float));
     FILE *lf = logits_path ? fopen(logits_path, "wb") : NULL;
 
-    /* prefill (token by token; conv states advance every position) */
-    for (int i = 0; i < ids.len; i++) {
-        double ts = now_sec();
-        bool last = i == ids.len - 1;
-        ink_forward(&m, ids.ids[i], (uint32_t)i, last ? logits : NULL);
-        fprintf(stderr, "prefill %d/%d token %d: %.1fs\n", i + 1, ids.len, ids.ids[i], now_sec() - ts);
+    /* batched prefill in chunks */
+    {
+        const int chunk = 32;
+        for (int i = 0; i < ids.len; i += chunk) {
+            double ts = now_sec();
+            int n = ids.len - i < chunk ? ids.len - i : chunk;
+            bool last = i + n == ids.len;
+            ink_forward_batch(&m, ids.ids + i, (uint32_t)n, (uint32_t)i,
+                              last ? logits : NULL);
+            fprintf(stderr, "prefill %d..%d/%d: %.1fs\n", i, i + n, ids.len, now_sec() - ts);
+        }
     }
 
     int pos = ids.len;
@@ -1491,3 +1519,4 @@ int main(int argc, char **argv) {
     if (lf) fclose(lf);
     return 0;
 }
+#endif /* DS4_INKLING_NO_MAIN */
