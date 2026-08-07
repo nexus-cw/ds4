@@ -67,4 +67,57 @@ ds4 core has F32/Q8_0/Q4_K-family and IQ2_XXS; IQ3_XXS/IQ2_S/IQ4_XS CPU
 dequant ported from llama.cpp ggml-quants.c (MIT, attributed) into the
 module so it stays self-contained.
 
-## M2 CUDA survey — see bottom of this file once M1 lands.
+## M1 parity result (robo-dog, 2026-08-07)
+
+Artifact: /data/gguf/inkling/Inkling-Small-UD-IQ2_XXS.gguf (82.3GB, SATA
+mmap). Prompt "The capital of France is", temp 0, n_ctx 512, 5 tokens.
+
+- Tokenizer: ds4-inkling and llama-completion (branch add-inkling,
+  3fd7901, CPU build) both produce [976, 9029, 328, 10128, 382].
+- Greedy generation, token by token:
+    ds4-inkling: 12650 ' Paris' / 13 '.' / 12650 ' Paris' / 382 ' is' /
+                 290 ' the'   (greedy logits 18.54 / 19.40 / 13.79 /
+                 18.74 / 18.99)
+    llama.cpp:   "The capital of France is Paris. Paris is the"
+  => top-1 agreement 5/5. Full-logit max-abs-diff not captured:
+  llama-completion has no logits dump; ds4-inkling wrote its logits to
+  ink_logits.bin for a future eval-callback comparison.
+- Speed: ds4-inkling ~120-190s/token (8 threads, scalar dequant,
+  SATA-bound), llama.cpp ~118s/token eval — both dominated by the 82GB
+  mmap stream from SATA.
+
+## M2 CUDA path survey (write-up only; no CUDA work in this run)
+
+What full-speed inkling on the GB10 CUDA path needs, in dependency order:
+
+1. IQ dequant/matvec kernels: ds4_cuda.cu has IQ2_XXS (routed experts,
+   ds4_iq2_tables_cuda.inc). Missing: IQ3_XXS (all routed ffn_down_exps),
+   IQ2_S + IQ4_XS (one UD layer each), Q5_K/Q6_K matvec coverage for the
+   dense/attention/shexp tensors if not already generic. The iq3xxs_grid
+   and iq2s_grid tables port the same way as the existing IQ2 tables.
+2. Attention kernel: no RoPE anywhere (remove that stage), GQA 32/8
+   head_dim 128 with an additive per-(head,query) relative bias vector of
+   length rel_extent indexed by pos_q - pos_k, plus SWA masking per the
+   per-layer pattern and log-N tau scaling of q and bias on global
+   layers. Closest existing donor is the deepseek4 SWA decode kernel;
+   the bias lookup is the only new element (llama.cpp does it as a
+   banded flash-attn extension, ggml_flash_attn_ext_banded).
+3. Short convolutions: 4 small depthwise conv1d states per layer
+   (k/v/attn/mlp). Trivial kernels, but they add a recurrent state
+   object to the session (snapshot/restore, rewind: states must be
+   recomputable or checkpointed per position -- rewind support needs
+   per-position state history or replay, same problem class as GLM MTP
+   rollback).
+4. MoE routing: the sigmoid+bias top-k selection reuses the deepseek4
+   noaux-tc machinery; new pieces are the logsigmoid-softmax weighting
+   over topk+shared logits, the score-weighted shared experts (2-expert
+   mul_mat_id bank), and per-block ffn_gscale.
+5. Expert streaming (SSD path): the routed experts are IQ2_XXS/IQ3_XXS
+   in a 3D bank layout identical to deepseek4's, so ds4_ssd.c expert
+   extraction should apply with a new tensor-name map.
+6. Output head: logit_scale + unpadded-vocab -inf mask in the sampler
+   or logits kernel.
+
+Estimated order: kernels (1) are mechanical; (2)+(3) are the real work;
+(3) interacts with session snapshot/rewind semantics and needs a design
+decision before implementation.
