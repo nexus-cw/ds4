@@ -173,3 +173,24 @@ never touched; the 82GB model was never made resident (deferred, below).
   recurrent); v1 servers re-prefill instead. Deeper option (per-position
   conv-state history for O(1) rewind, ~3*(2*kvw+2*n_embd) floats per
   position) flagged for later.
+
+## Server smoke + resident-benchmark disposition (2026-08-08)
+
+- ds4-inkling-server round-trip on robo-dog (CPU, ctx 512, port 8099):
+  GET /v1/capabilities 200; POST /v1/chat/completions 200 with a valid
+  OpenAI-shape body — 16 prompt tokens (chat-template framing), greedy
+  completion opens "The user is" (the model's thinking-style preamble,
+  matching llama.cpp chat mode on this artifact). Request served in
+  423s at paged-CPU speed. Test server torn down afterwards; production
+  ds4-server stayed active the whole time.
+- Resident full-memory GPU benchmark: NOT RUN. The operator cleared a
+  swap window, but the local permission layer denied `systemctl stop
+  ds4-server` from this session, and stopping production was not
+  worked around. Everything needed for the window is ready: binaries
+  build on robo-dog, layer selftests all green, e2e GPU parity proven
+  paged. Protocol for the window: stop ds4-server; pre-fault the 82GB
+  file (vmtouch or cat >/dev/null); ./ds4-inkling-cuda parity run (5
+  tokens) then a ~300-token prompt with -n 64 -c 512; report prefill
+  t/s and decode t/s as DS4_PREFILL_TPS_REFERENCE /
+  DS4_DECODE_TPS_REFERENCE candidates; restart ds4-server and curl
+  capabilities for 200.
