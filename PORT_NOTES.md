@@ -121,3 +121,55 @@ What full-speed inkling on the GB10 CUDA path needs, in dependency order:
 Estimated order: kernels (1) are mechanical; (2)+(3) are the real work;
 (3) interacts with session snapshot/rewind semantics and needs a design
 decision before implementation.
+
+## M3 results (CUDA v1, robo-dog 2026-08-08)
+
+Design: kernels dereference the mmap'd GGUF directly (GB10
+cudaDevAttrPageableMemoryAccess=1 verified) — no weight copies, no
+pinning, page cache is the streaming layer. Production ds4-server was
+never touched; the 82GB model was never made resident (deferred, below).
+
+- Kernel correctness gate (ds4-inkling-cuda --selftest N, real weights,
+  double-accumulation reference; PASS = GPU no farther from the exact
+  dot than CPU-fp32 is, 4x allowance):
+  layers 0 (dense Q5_K/Q6_K/Q8_0/Q4_K), 2 (MoE IQ2_XXS/IQ3_XXS + shexp
+  Q5_K/Q6_K + router F32), 40 (IQ4_XS down), 41 (IQ2_S gate/up +
+  IQ4_XS down): ALL PASS. Typical numbers: gpu_vs_ref ~1-4e-6 vs
+  cpu_vs_ref ~1.3-6.7e-5 — the GPU tree reduction is ~10x closer to the
+  exact dot than the CPU's sequential fp32 accumulation. All 9 artifact
+  quant types covered.
+- End-to-end GPU greedy ("The capital of France is", n=5, c=512):
+  ids 12650/13/12650/382/290 = " Paris. Paris is the" — identical to
+  the CPU path and the llama.cpp reference; logits match CPU within
+  ~2e-5. Timing (paged, production co-resident): prefill 137s,
+  decode 41-81s/token.
+- DEFERRED: full-speed resident benchmark (weights pre-faulted into
+  unified memory) waits for the operator-scheduled production swap
+  window. Nothing in the code needs to change for it: residency is a
+  page-cache/prefault property, not an engine mode.
+
+## M4 results
+
+- Serving shape chosen: separate binary `ds4-inkling-server` wrapping
+  ds4_inkling.c. ds4_server.c was judged too entangled with the
+  deepseek4 engine (ds4_engine/ds4_session API is deepseek-shaped:
+  MTP/GLM/expert-streaming switches through every handler) to reuse
+  without touching the hot path. Endpoints: POST /v1/chat/completions
+  (greedy or temperature sampling; stop on eos/<|end_message|>; JSON
+  errors; streaming 400s in v1), GET /v1/capabilities, GET /v1/models.
+  Single-session, serialized requests, no auth changes.
+- Batched prefill: ink_forward_batch — weight rows dequantized once per
+  batch (ink_matmat), causal in-batch attention, sequential shortconv
+  advance. 5-token prefill went from ~15min (token-by-token) to 137s.
+- Chat template: hand-rendered v1 of the artifact's jinja
+  (message_system/user/model + content_text framing, model turns closed
+  with <|content_model_end_sampling|>), verified against llama.cpp
+  --jinja rendering of the same GGUF. Tool calls / thinking-effort
+  blocks are NOT implemented (flagged for later).
+- Shortconv state x KV snapshot decision (v1): the 4-tap rolling states
+  are part of the session state exactly like KV; ink_state_save/load
+  snapshot pos + KV + all conv states as one blob at chain boundaries.
+  Rewind to an arbitrary position is NOT supported (conv states are
+  recurrent); v1 servers re-prefill instead. Deeper option (per-position
+  conv-state history for O(1) rewind, ~3*(2*kvw+2*n_embd) floats per
+  position) flagged for later.
