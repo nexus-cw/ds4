@@ -423,3 +423,7 @@ q4k-dot-test: tests/test_q4k_dot.c
 
 clean:
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+
+# Standalone inkling CPU inference CLI (self-contained; see PORT_NOTES.md).
+ds4-inkling: ds4_inkling.c ds4_inkling_tables.inc
+	$(CC) -O2 -Wall -Wextra -fopenmp -o $@ ds4_inkling.c -lm
