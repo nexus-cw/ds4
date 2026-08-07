@@ -717,17 +717,29 @@ static bool ink_test_tensor(const char *name, const ink_tensor *t, const uint8_t
     ink_matvec(t, base, in, out, x, ycpu);
     ink_cuda_matvec(t, base, in, out, x, ygpu);
 
-    double maxabs = 0.0, maxrel = 0.0;
+    /* double-accumulation reference from the SAME dequantized rows: both
+     * the fp32 CPU path and the GPU path are compared against it, so
+     * accumulation-order noise is measured instead of guessed. */
+    float *row = (float *)ink_malloc(in * sizeof(float));
+    double err_cpu = 0.0, err_gpu = 0.0, maxabs = 0.0;
     for (uint64_t i = 0; i < out; i++) {
+        ink_row_f32(t, base, i, in, row);
+        double ref = 0.0;
+        for (uint64_t k = 0; k < in; k++) ref += (double)row[k] * (double)x[k];
+        double ec = fabs((double)ycpu[i] - ref);
+        double eg = fabs((double)ygpu[i] - ref);
         double a = fabs((double)ygpu[i] - (double)ycpu[i]);
-        double rel = a / fmax(1e-6, fabs((double)ycpu[i]));
+        if (ec > err_cpu) err_cpu = ec;
+        if (eg > err_gpu) err_gpu = eg;
         if (a > maxabs) maxabs = a;
-        if (rel > maxrel) maxrel = rel;
     }
-    bool pass = maxrel <= 2e-4 || maxabs <= 2e-5;
-    printf("%-24s type=%2u in=%-6llu out=%-6llu maxabsdiff=%.6g maxreldiff=%.6g %s\n",
+    free(row);
+    /* pass when the GPU is no farther from the exact dot than the fp32
+     * CPU path is, modulo a 4x reordering allowance */
+    bool pass = err_gpu <= fmax(4.0 * err_cpu, 1e-5);
+    printf("%-24s type=%2u in=%-6llu out=%-6llu gpu_vs_cpu=%.3g cpu_vs_ref=%.3g gpu_vs_ref=%.3g %s\n",
            name, t->type, (unsigned long long)in, (unsigned long long)out,
-           maxabs, maxrel, pass ? "PASS" : "FAIL");
+           maxabs, err_cpu, err_gpu, pass ? "PASS" : "FAIL");
 
     free(x); free(ycpu); free(ygpu);
     return pass;
