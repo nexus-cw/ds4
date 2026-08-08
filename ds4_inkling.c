@@ -1357,6 +1357,27 @@ uint64_t ink_tensor_bytes(const ink_tensor *t) {
     return elems / be * bb;
 }
 
+uint64_t ink_model_make_resident_ex(ink_model *m, uint64_t budget_bytes,
+                                    void *(*alloc_fn)(size_t, const ink_tensor *),
+                                    void (*copy_fn)(void *dst, const void *src, size_t n),
+                                    uint64_t *n_resident_out) {
+    uint64_t copied = 0, n_res = 0;
+    for (uint64_t i = 0; i < m->gg.n_tensors; i++) {
+        ink_tensor *t = &m->gg.tensors[i];
+        uint64_t nb = ink_tensor_bytes(t);
+        if (budget_bytes && copied + nb > budget_bytes) continue;
+        void *dst = alloc_fn((size_t)nb, t);
+        if (!dst) continue;    /* alloc_fn chose to skip this tensor */
+        if (copy_fn) copy_fn(dst, t->data, (size_t)nb);
+        else memcpy(dst, t->data, (size_t)nb);
+        t->data = (const uint8_t *)dst;
+        copied += nb;
+        n_res++;
+    }
+    if (n_resident_out) *n_resident_out = n_res;
+    return copied;
+}
+
 uint64_t ink_model_make_resident(ink_model *m, uint64_t budget_bytes,
                                  void *(*alloc_fn)(size_t),
                                  uint64_t *n_resident_out) {

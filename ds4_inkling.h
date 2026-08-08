@@ -156,6 +156,15 @@ void ink_model_open(ink_model *m, const char *path, uint32_t n_ctx);
 uint64_t ink_model_make_resident(ink_model *m, uint64_t budget_bytes,
                                  void *(*alloc_fn)(size_t),
                                  uint64_t *n_resident_out);
+/* Per-tensor variant: alloc_fn sees the tensor and may return NULL to
+ * SKIP it (tensor stays mmap-backed); a failed allocation should die
+ * inside alloc_fn.  copy_fn performs the transfer into the returned
+ * arena (pass NULL for plain memcpy); needed when the arena is not
+ * host-writable (e.g. cudaMalloc device memory). */
+uint64_t ink_model_make_resident_ex(ink_model *m, uint64_t budget_bytes,
+                                    void *(*alloc_fn)(size_t, const ink_tensor *),
+                                    void (*copy_fn)(void *dst, const void *src, size_t n),
+                                    uint64_t *n_resident_out);
 /* Total bytes of one tensor's data. */
 uint64_t ink_tensor_bytes(const ink_tensor *t);
 /* Die with a diagnostic if the logits vector is NaN-poisoned or the
