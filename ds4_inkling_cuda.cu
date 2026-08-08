@@ -1053,6 +1053,16 @@ extern "C" void ink_forward_gpu(ink_model *m, const int *tokens, uint32_t n_tok,
     float *hu = (float *)ink_malloc((size_t)nT * big_ff * sizeof(float));
     float *ff_out = (float *)ink_malloc((size_t)nT * n_embd * sizeof(float));
     float *taus = (float *)ink_malloc(nT * sizeof(float));
+    /* MoE per-layer temporaries, hoisted out of the layer loop so they can
+     * be freed only after the final stream sync (async kernels read them). */
+    const uint32_t nE_h = m->n_expert, nu_h = m->n_expert_used, ns_h = m->n_shexp;
+    const uint32_t nf_h = m->n_ff_exp;
+    float *logits = (float *)ink_malloc((size_t)nT * (nE_h + ns_h) * sizeof(float));
+    float *wv_all = (float *)ink_malloc((size_t)nT * (nu_h + ns_h) * sizeof(float));
+    int *sel_all = (int *)ink_malloc((size_t)nT * nu_h * sizeof(int));
+    float *hg_g = (float *)ink_malloc((size_t)nu_h * nf_h * sizeof(float));
+    float *hu_g = (float *)ink_malloc((size_t)nu_h * nf_h * sizeof(float));
+    float *proj_g = (float *)ink_malloc((size_t)nu_h * n_embd * sizeof(float));
 
     /* Embedding row fetch stays host (table lookup against the mmap'd
      * GGUF, once per token); tau is pure host arithmetic.  tok_norm is a
@@ -1152,7 +1162,6 @@ extern "C" void ink_forward_gpu(ink_model *m, const int *tokens, uint32_t n_tok,
         } else {
             const uint32_t nE = m->n_expert, nu = m->n_expert_used, ns = m->n_shexp;
             const uint32_t nf = m->n_ff_exp;
-            float *logits = (float *)ink_malloc((size_t)nT * (nE + ns) * sizeof(float));
             ink_cuda_matmat(l->gate_inp, l->gate_inp->data, n_embd, nE + ns, nT, xn, logits);
             const float *bias = ink_f32(l->probs_b);
 
@@ -1163,8 +1172,6 @@ extern "C" void ink_forward_gpu(ink_model *m, const int *tokens, uint32_t n_tok,
             size_t su_rb = (n_embd / ink_type_block_elems(l->up_shexp->type)) * ink_type_block_bytes(l->up_shexp->type);
             size_t sd_rb = (nf / ink_type_block_elems(l->down_shexp->type)) * ink_type_block_bytes(l->down_shexp->type);
 
-            float *wv_all = (float *)ink_malloc((size_t)nT * (nu + ns) * sizeof(float));
-            int *sel_all = (int *)ink_malloc((size_t)nT * nu * sizeof(int));
 
             /* ---- SYNC (1 of 2 per-call sync points): host needs `logits`
              * for the top-k routing qsort below. ---- */
@@ -1209,9 +1216,6 @@ extern "C" void ink_forward_gpu(ink_model *m, const int *tokens, uint32_t n_tok,
              * shared x for exactly this reason). */
             if (nu > INK_GROUP_HOST_MAX)
                 ink_die("ink_forward_gpu: n_expert_used exceeds host group-batch array cap");
-            float *hg_g = (float *)ink_malloc((size_t)nu * nf * sizeof(float));
-            float *hu_g = (float *)ink_malloc((size_t)nu * nf * sizeof(float));
-            float *proj_g = (float *)ink_malloc((size_t)nu * n_embd * sizeof(float));
             const uint8_t *gate_bases[INK_GROUP_HOST_MAX];
             const uint8_t *up_bases[INK_GROUP_HOST_MAX];
             const uint8_t *down_bases[INK_GROUP_HOST_MAX];
@@ -1251,8 +1255,11 @@ extern "C" void ink_forward_gpu(ink_model *m, const int *tokens, uint32_t n_tok,
                 ink_cuda_matmat(l->down_shexp, l->down_shexp->data + (size_t)sx * n_embd * sd_rb, nf, n_embd, nT, hg, proj_out);
                 ink_cuda_add(ff_out, proj_out, (uint64_t)nT * n_embd);
             }
-            free(logits); free(wv_all); free(sel_all);
-            free(hg_g); free(hu_g); free(proj_g);
+            /* NOTE: logits/wv_all/sel_all/hg_g/hu_g/proj_g are allocated
+             * once per forward call and freed after the final sync --
+             * freeing here would race the still-queued shexp/down/
+             * accumulate kernels that read them (this exact bug produced
+             * heap corruption; see M7 notes). */
         }
 
         for (uint32_t t = 0; t < nT; t++) {
@@ -1287,6 +1294,9 @@ extern "C" void ink_forward_gpu(ink_model *m, const int *tokens, uint32_t n_tok,
      * above already covers this; when it's NULL (mid-prompt prefill
      * chunks) this is the only sync in the whole call. */
     ink_cuda_sync();
+
+    free(logits); free(wv_all); free(sel_all);
+    free(hg_g); free(hu_g); free(proj_g);
 
     free(x); free(xn); free(q); free(kf); free(vf); free(r); free(rel);
     free(attn_out); free(proj_out); free(hg); free(hu);
