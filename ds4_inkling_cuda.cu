@@ -1185,6 +1185,56 @@ static int ink_run_selftest(const char *model_path, int layer) {
     uint64_t out_o = m.output->dims[1] < 4096 ? m.output->dims[1] : 4096;
     all_pass &= ink_test_tensor("output", m.output, m.output->data, n_embd, out_o);
 
+    /* batch (matmat) and grouped-matvec checks against the CPU engine */
+    {
+        const uint32_t NT = 5;
+        uint64_t in = n_embd, outn = hn;
+        float *X = (float *)ink_malloc((size_t)NT * in * sizeof(float));
+        ink_fill_rand(X, (size_t)NT * in, 0xBEEF01u);
+        float *Yc = (float *)ink_malloc((size_t)NT * outn * sizeof(float));
+        float *Yg = (float *)ink_malloc((size_t)NT * outn * sizeof(float));
+        ink_matmat(l->wq, l->wq->data, in, outn, NT, X, Yc);
+        ink_cuda_matmat(l->wq, l->wq->data, in, outn, NT, X, Yg);
+        double mx = 0.0;
+        for (uint64_t i = 0; i < (uint64_t)NT * outn; i++) {
+            double a = fabs((double)Yg[i] - (double)Yc[i]);
+            if (a > mx) mx = a;
+        }
+        bool bp = mx <= 5e-4;
+        printf("matmat(wq,n_tok=5)       maxabsdiff=%.3g %s\n", mx, bp ? "PASS" : "FAIL");
+        all_pass &= bp;
+        free(X); free(Yc); free(Yg);
+    }
+    if ((uint32_t)layer >= m.n_dense) {
+        const uint32_t NG = 6;
+        uint64_t in = n_embd, outn = m.n_ff_exp;
+        size_t rb = (in / ink_type_block_elems(l->gate_exps->type)) * ink_type_block_bytes(l->gate_exps->type);
+        const uint8_t *bases[NG];
+        const float *xs[NG];
+        float *ys_g[NG];
+        float *x1 = (float *)ink_malloc(in * sizeof(float));
+        ink_fill_rand(x1, in, 0xFACE02u);
+        float *yc = (float *)ink_malloc(outn * sizeof(float));
+        double mx = 0.0;
+        for (uint32_t g2 = 0; g2 < NG; g2++) {
+            bases[g2] = l->gate_exps->data + (size_t)(g2 * 37 + 1) * outn * rb;
+            xs[g2] = x1;
+            ys_g[g2] = (float *)ink_malloc(outn * sizeof(float));
+        }
+        ink_cuda_matvec_group(l->gate_exps, bases, in, outn, xs, ys_g, NG);
+        for (uint32_t g2 = 0; g2 < NG; g2++) {
+            ink_matvec(l->gate_exps, bases[g2], in, outn, x1, yc);
+            for (uint64_t i = 0; i < outn; i++) {
+                double a = fabs((double)ys_g[g2][i] - (double)yc[i]);
+                if (a > mx) mx = a;
+            }
+            free(ys_g[g2]);
+        }
+        bool gp = mx <= 5e-4;
+        printf("group-matvec(gate_exps,6) maxabsdiff=%.3g %s\n", mx, gp ? "PASS" : "FAIL");
+        all_pass &= gp;
+        free(x1); free(yc);
+    }
     printf(all_pass ? "SELFTEST PASS (layer %d)\n" : "SELFTEST FAIL (layer %d)\n", layer);
     return all_pass ? 0 : 1;
 }
