@@ -240,3 +240,56 @@ Window rerun invocation (update /data/gguf/inkling-window.sh):
   3. Benchmark: append a second run with the ~300-token prompt and
      -n 64 -c 512 --resident; report prefill s and decode s/token.
   4. sudo systemctl start ds4-server && curl -s localhost:8080/v1/... 200.
+
+## M6: kernel optimization pass (2026-08-08)
+
+Baseline (operator window, fully resident, v1 scalar kernels): decode
+0.197s/token (5.1 t/s, ~13GB/s effective of 273GB/s), prefill 3.3 t/s
+(32-token chunks re-walking weights with per-element dequant).
+
+Changes: warp-per-row matvec/matmat kernels with whole-32-subgroup
+register dequant (adapted llama.cpp CUDA vecdot patterns, MIT),
+shared-memory activation cache (in <= 4096), batched matmat that
+dequantizes each weight row once per chunk with an 8-token register
+unroll (chunk cap 32 -> 128), grouped MoE expert launches (3 per stage
+instead of 18; host keeps the microsecond top-k qsort), per-stage
+cudaEvent accounting (--bench / INK_BENCH=1), and --bench-layers L
+(resident per-tensor kernel GB/s, disk-independent).
+
+Correctness: full selftest matrix PASS on all 9 quant types incl. new
+batch-matmat and grouped-matvec checks (max abs diff 4.6e-5 / 3.8e-5 vs
+CPU); e2e parity ' Paris' reproduced paged, partial-resident, and
+partial-resident+bench.
+
+Kernel microbenchmarks (resident copies, layer 2; old kernels were
+~13GB/s effective end-to-end): Q5_K 53-66 GB/s, Q8_0 60, F32 111,
+Q4_K ~66, Q6_K/IQ3_XXS ~38, IQ2_XXS 22-24 GB/s. Single-tensor launches
+(2048 rows) underutilize the GPU; real decode uses 6-expert grouped
+launches, so these are lower bounds.
+
+Full-model decode estimate from per-tensor bytes/rates: routed experts
+~68ms + attention ~20ms + shared experts ~9ms + head ~7ms + dense/router
+~6ms => ~110ms/token, ~9 t/s (conservative; grouped-launch occupancy
+should land it in 9-15 t/s). The dominant remaining lever is the
+IQ2_XXS kernel (carries most decode bytes at only ~22GB/s — needs
+wider/vectorized block loads and 2 rows/warp). Prefill becomes
+weight-reuse-bound: each row dequantized once per 128 tokens, so
+prefill t/s should now exceed decode t/s; measured properly only at the
+next window.
+
+One NaN incident during M6 validation (partial-resident + warm page
+cache): the logits guard aborted exactly as designed; the identical
+config passes deterministically with normal cache state — consistent
+with the M5 paged-read-under-reclaim root cause, NOT a kernel bug
+(selftests + reruns pass). Full residency avoids the class entirely.
+
+Window invocation for the M6 verification run (same as M5 protocol,
+plus bench self-reporting):
+  env OMP_NUM_THREADS=8 INK_BENCH=1 ./ds4-inkling-cuda \
+    -m /data/gguf/inkling/Inkling-Small-UD-IQ2_XXS.gguf \
+    -p "The capital of France is" -n 5 -c 512 --resident \
+    > /data/gguf/inkling-window-m6a.log 2>&1
+  then the ~300-token prompt with -n 64 -c 512 --resident, INK_BENCH=1
+    > /data/gguf/inkling-window-m6b.log 2>&1
+  Parity bar unchanged (" Paris" "." " Paris" " is" " the"); the bench
+  report at exit gives per-stage ms + GB/s for the before/after table.
