@@ -977,9 +977,21 @@ extern "C" void ink_cuda_moe_accumulate(float *ff_acc, const float *proj_g, cons
  * kc/vc, without a host sync in between. cudaMemcpyDefault relies on
  * unified virtual addressing (both src and dst are coherently-mapped host
  * pointers here, same as everywhere else in this file). */
+__global__ void ink_kernel_copy(float *dst, const float *src, uint64_t n) {
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (uint64_t)gridDim.x * blockDim.x)
+        dst[i] = src[i];
+}
+
+/* Stream-ordered copy KERNEL, not cudaMemcpyAsync: an async memcpy between
+ * two PAGEABLE host pointers is executed synchronously by the calling
+ * thread, i.e. potentially BEFORE the queued kernels that produce `src`
+ * have run -- which is exactly the stale-KV corruption this replaced
+ * memcpy caused (M7 parity break, ' Paris' -> 'es'). A kernel launch is
+ * always ordered on g_stream. */
 extern "C" void ink_cuda_kv_copy(float *dst, const float *src, uint64_t n_floats) {
     if (n_floats == 0) return;
-    CUDA_CHECK(cudaMemcpyAsync(dst, src, n_floats * sizeof(float), cudaMemcpyDefault, g_stream));
+    ink_kernel_copy<<<ink_flat_blocks(n_floats, 256), 256, 0, g_stream>>>(dst, src, n_floats);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 /* ============================== GPU forward ==============================
