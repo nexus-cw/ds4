@@ -1693,7 +1693,10 @@ static void ink_bench_one_tensor(const char *name, const ink_tensor *t, const ui
     float *mx = (float *)ink_cuda_managed_alloc(in * sizeof(float));
     float *my = (float *)ink_cuda_managed_alloc(out * sizeof(float));
     if (!mbase || !mx || !my) { fprintf(stderr, "  (skip %s: cudaMallocManaged failed)\n", name); return; }
-    memcpy(mbase, base, bytes);
+    /* base may be a cudaMalloc device pointer when --resident placed this
+     * tensor in the device arena -- host memcpy would fault; UVA copy
+     * handles host/device/managed sources alike. */
+    CUDA_CHECK(cudaMemcpy(mbase, base, bytes, cudaMemcpyDefault));
     ink_fill_rand(mx, in, 0xBEEFu);
 
     for (int i = 0; i < 5; i++) ink_cuda_matvec(t, mbase, in, out, mx, my);
@@ -1744,7 +1747,7 @@ static void ink_bench_group6(const char *name, const ink_tensor *t, const uint8_
     if (!resident_active) {
         mbase = (uint8_t *)ink_cuda_managed_alloc(span);
         if (!mbase) { fprintf(stderr, "  (skip %s-group6: cudaMallocManaged failed)\n", name); return; }
-        memcpy(mbase, live_base, span);
+        CUDA_CHECK(cudaMemcpy(mbase, live_base, span, cudaMemcpyDefault)); /* see note above */
         base_for_bench = mbase;
     }
 
