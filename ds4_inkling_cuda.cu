@@ -1304,6 +1304,7 @@ static bool ink_test_tensor(const char *name, const ink_tensor *t, const uint8_t
 
     ink_matvec(t, base, in, out, x, ycpu);
     ink_cuda_matvec(t, base, in, out, x, ygpu);
+    ink_cuda_sync();   /* async wrappers: sync before host reads/frees */
     ink_cuda_sync(); /* M7: wrappers no longer sync internally -- read ygpu only after this */
 
     /* double-accumulation reference from the SAME dequantized rows: both
@@ -1406,6 +1407,7 @@ static int ink_run_selftest(const char *model_path, int layer) {
         float *Yg = (float *)ink_malloc((size_t)NT * outn * sizeof(float));
         ink_matmat(l->wq, l->wq->data, in, outn, NT, X, Yc);
         ink_cuda_matmat(l->wq, l->wq->data, in, outn, NT, X, Yg);
+        ink_cuda_sync();
         double mx = 0.0;
         for (uint64_t i = 0; i < (uint64_t)NT * outn; i++) {
             double a = fabs((double)Yg[i] - (double)Yc[i]);
@@ -1433,6 +1435,7 @@ static int ink_run_selftest(const char *model_path, int layer) {
             ys_g[g2] = (float *)ink_malloc(outn * sizeof(float));
         }
         ink_cuda_matvec_group(l->gate_exps, bases, in, outn, xs, ys_g, NG);
+        ink_cuda_sync();
         for (uint32_t g2 = 0; g2 < NG; g2++) {
             ink_matvec(l->gate_exps, bases[g2], in, outn, x1, yc);
             for (uint64_t i = 0; i < outn; i++) {
