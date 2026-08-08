@@ -52,6 +52,23 @@ typedef struct {
 static ink_tables g_tables;
 static int g_tables_ready = 0;
 
+/* ============================ M7: single-stream execution ================
+ * All kernel launches / async memcpys in this file go on g_stream.  Per-
+ * call wrappers no longer cudaDeviceSynchronize(); ordering between
+ * dependent GPU ops is guaranteed by stream program order alone.  The host
+ * only synchronizes at the few points it actually reads GPU-written data:
+ * MoE routing (needs `logits` for host qsort) and the final output-logits
+ * readback in ink_forward_gpu().  cudaGetLastError() after every launch
+ * still catches *launch-configuration* errors immediately (it does not
+ * require a sync); it does not catch asynchronous kernel-body errors,
+ * which will surface at the next ink_cuda_sync() or CUDA_CHECK that does
+ * sync (matches the tradeoff of any async-stream design). */
+static cudaStream_t g_stream = 0;
+
+extern "C" void ink_cuda_sync(void) {
+    CUDA_CHECK(cudaStreamSynchronize(g_stream));
+}
+
 static void *ink_cuda_upload(const void *src, size_t bytes) {
     void *dst = NULL;
     CUDA_CHECK(cudaMalloc(&dst, bytes));
@@ -79,6 +96,8 @@ extern "C" void ink_cuda_init(void) {
     g_tables.kmask_iq2xs  = (const uint8_t *)ink_cuda_upload(kmask_iq2xs, sizeof(kmask_iq2xs));
     g_tables.kvalues_iq4nl = (const int8_t *)ink_cuda_upload(kvalues_iq4nl, sizeof(kvalues_iq4nl));
     g_tables_ready = 1;
+
+    CUDA_CHECK(cudaStreamCreate(&g_stream));
 }
 
 /* ========================= device dequantizers =========================
@@ -346,19 +365,36 @@ __device__ __forceinline__ void ink_dq_load32(uint32_t type, const uint8_t *rowp
 /* ============================ bench instrumentation ======================
  * Per-stage cudaEvent timing, accumulated across the whole run, gated by
  * --bench / INK_BENCH=1.  Cheap when disabled (single int check, no event
- * create/record/sync). */
+ * create/record/sync, no stream sync -- the whole point of M7 is that
+ * ordinary (non-bench) runs never block the host on a per-kernel basis).
+ *
+ * M7: split into two phases -- PREFILL (n_tok>1) and DECODE (n_tok==1).
+ * ink_forward_gpu() sets g_bench_phase once per call based on n_tok; every
+ * wrapper below records into g_bench_*[g_bench_phase].  NOTE: turning
+ * --bench on reintroduces a host sync after every timed launch (events are
+ * recorded on g_stream but read back via cudaEventSynchronize), because
+ * that is the only way to attribute ms to an individual kernel -- so
+ * --bench numbers include real kernel time only, NOT the async-pipeline
+ * benefit M7 gives normal (non-bench) runs; a plain run's wall-clock
+ * decode t/s is the number that reflects the sync-elision win. */
 
 #define INK_BENCH_NTYPES 9
+#define INK_BENCH_NPHASE 2
+#define INK_BENCH_PREFILL 0
+#define INK_BENCH_DECODE 1
 
 static int g_bench = 0;
+static int g_bench_phase = INK_BENCH_DECODE;
 static cudaEvent_t g_bench_ev0, g_bench_ev1;
 static int g_bench_ev_ready = 0;
 
 typedef struct { double ms; double bytes; uint64_t calls; } ink_bench_stat;
-static ink_bench_stat g_bench_matvec[INK_BENCH_NTYPES];
-static ink_bench_stat g_bench_attn;
-static ink_bench_stat g_bench_sconv;
-static ink_bench_stat g_bench_group;
+static ink_bench_stat g_bench_matvec[INK_BENCH_NPHASE][INK_BENCH_NTYPES];
+static ink_bench_stat g_bench_attn[INK_BENCH_NPHASE];
+static ink_bench_stat g_bench_sconv[INK_BENCH_NPHASE];
+static ink_bench_stat g_bench_group[INK_BENCH_NPHASE];
+
+static const char *ink_bench_phase_name(int p) { return p == INK_BENCH_PREFILL ? "prefill" : "decode"; }
 
 static int ink_bench_type_idx(uint32_t type) {
     switch (type) {
@@ -392,12 +428,12 @@ static void ink_bench_ensure_events(void) {
 static inline void ink_bench_begin(void) {
     if (!g_bench) return;
     ink_bench_ensure_events();
-    CUDA_CHECK(cudaEventRecord(g_bench_ev0));
+    CUDA_CHECK(cudaEventRecord(g_bench_ev0, g_stream));
 }
 
 static inline void ink_bench_end(ink_bench_stat *st, double bytes) {
     if (!g_bench) return;
-    CUDA_CHECK(cudaEventRecord(g_bench_ev1));
+    CUDA_CHECK(cudaEventRecord(g_bench_ev1, g_stream));
     CUDA_CHECK(cudaEventSynchronize(g_bench_ev1));
     float ms = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&ms, g_bench_ev0, g_bench_ev1));
@@ -406,11 +442,11 @@ static inline void ink_bench_end(ink_bench_stat *st, double bytes) {
     st->calls += 1;
 }
 
-static void ink_bench_report(void) {
-    if (!g_bench) return;
-    fprintf(stderr, "\n=== ds4-inkling-cuda --bench report ===\n");
+static void ink_bench_report_phase(int p) {
+    fprintf(stderr, "--- phase=%s (ms includes launch overhead only where --bench forces syncs) ---\n",
+            ink_bench_phase_name(p));
     for (int i = 0; i < INK_BENCH_NTYPES; i++) {
-        ink_bench_stat *s = &g_bench_matvec[i];
+        ink_bench_stat *s = &g_bench_matvec[p][i];
         if (s->calls == 0) continue;
         double gbps = s->ms > 0 ? (s->bytes / 1.0e9) / (s->ms / 1000.0) : 0.0;
         fprintf(stderr, "matvec[%-8s] calls=%-8llu total_ms=%-10.1f bytes=%.3fGiB  %.2f GB/s\n",
@@ -418,23 +454,30 @@ static void ink_bench_report(void) {
                 s->bytes / 1073741824.0, gbps);
     }
     {
-        ink_bench_stat *s = &g_bench_attn;
+        ink_bench_stat *s = &g_bench_attn[p];
         double gbps = s->ms > 0 ? (s->bytes / 1.0e9) / (s->ms / 1000.0) : 0.0;
         fprintf(stderr, "attention          calls=%-8llu total_ms=%-10.1f bytes=%.3fGiB  %.2f GB/s\n",
                 (unsigned long long)s->calls, s->ms, s->bytes / 1073741824.0, gbps);
     }
     {
-        ink_bench_stat *s = &g_bench_sconv;
+        ink_bench_stat *s = &g_bench_sconv[p];
         double gbps = s->ms > 0 ? (s->bytes / 1.0e9) / (s->ms / 1000.0) : 0.0;
         fprintf(stderr, "sconv               calls=%-8llu total_ms=%-10.1f bytes=%.3fGiB  %.2f GB/s\n",
                 (unsigned long long)s->calls, s->ms, s->bytes / 1073741824.0, gbps);
     }
     {
-        ink_bench_stat *s = &g_bench_group;
+        ink_bench_stat *s = &g_bench_group[p];
         double gbps = s->ms > 0 ? (s->bytes / 1.0e9) / (s->ms / 1000.0) : 0.0;
         fprintf(stderr, "group-matvec        calls=%-8llu total_ms=%-10.1f bytes=%.3fGiB  %.2f GB/s\n",
                 (unsigned long long)s->calls, s->ms, s->bytes / 1073741824.0, gbps);
     }
+}
+
+static void ink_bench_report(void) {
+    if (!g_bench) return;
+    fprintf(stderr, "\n=== ds4-inkling-cuda --bench report ===\n");
+    ink_bench_report_phase(INK_BENCH_PREFILL);
+    ink_bench_report_phase(INK_BENCH_DECODE);
 }
 
 /* ======================= warp-per-row matvec/matmat kernels =============
@@ -592,12 +635,10 @@ extern "C" void ink_cuda_matvec(const ink_tensor *t, const uint8_t *base,
     if (!g_tables_ready) ink_die("ink_cuda: ink_cuda_init() was not called");
     uint32_t blocks = ink_cuda_row_blocks(out);
     ink_bench_begin();
-    ink_kernel_matvec<<<blocks, 256>>>(t->type, base, in, out, x, y, g_tables);
+    ink_kernel_matvec<<<blocks, 256, 0, g_stream>>>(t->type, base, in, out, x, y, g_tables);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
     int bi = ink_bench_type_idx(t->type);
-    if (bi >= 0) ink_bench_end(&g_bench_matvec[bi], ink_matvec_bytes(t->type, in, out));
-    else if (g_bench) { CUDA_CHECK(cudaEventRecord(g_bench_ev1)); }
+    if (bi >= 0) ink_bench_end(&g_bench_matvec[g_bench_phase][bi], ink_matvec_bytes(t->type, in, out));
 }
 
 extern "C" void ink_cuda_matmat(const ink_tensor *t, const uint8_t *base,
@@ -609,13 +650,11 @@ extern "C" void ink_cuda_matmat(const ink_tensor *t, const uint8_t *base,
     if (n_tok > INK_CUDA_MAX_TOK) ink_die("ink_cuda: n_tok exceeds GPU kernel's fixed max (128)");
     uint32_t blocks = ink_cuda_row_blocks(out);
     ink_bench_begin();
-    ink_kernel_matmat<<<blocks, 256>>>(t->type, base, in, out, X, Y, n_tok, g_tables);
+    ink_kernel_matmat<<<blocks, 256, 0, g_stream>>>(t->type, base, in, out, X, Y, n_tok, g_tables);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
     int bi = ink_bench_type_idx(t->type);
     double bytes = ink_matvec_bytes(t->type, in, out) * (((n_tok + INK_MATMAT_UNROLL - 1) / INK_MATMAT_UNROLL));
-    if (bi >= 0) ink_bench_end(&g_bench_matvec[bi], bytes);
-    else if (g_bench) { CUDA_CHECK(cudaEventRecord(g_bench_ev1)); }
+    if (bi >= 0) ink_bench_end(&g_bench_matvec[g_bench_phase][bi], bytes);
 }
 
 /* Host-side selection (top-k routing, qsort over the expert logits) stays
@@ -636,12 +675,11 @@ extern "C" void ink_cuda_matvec_group(const ink_tensor *t, const uint8_t *const 
         for (uint32_t i = 0; i < ng; i++) { pb.p[i] = bases[g0 + i]; px.p[i] = xs[g0 + i]; py.p[i] = ys[g0 + i]; }
         for (uint32_t i = ng; i < INK_GROUP_MAX; i++) { pb.p[i] = NULL; px.p[i] = NULL; py.p[i] = NULL; }
         dim3 grid(blocks, ng);
-        ink_kernel_matvec_group<<<grid, 256>>>(t->type, pb, in, out, px, py, ng, g_tables);
+        ink_kernel_matvec_group<<<grid, 256, 0, g_stream>>>(t->type, pb, in, out, px, py, ng, g_tables);
         CUDA_CHECK(cudaGetLastError());
         total_bytes += ink_matvec_bytes(t->type, in, out) * ng;
     }
-    CUDA_CHECK(cudaDeviceSynchronize());
-    ink_bench_end(&g_bench_group, total_bytes);
+    ink_bench_end(&g_bench_group[g_bench_phase], total_bytes);
 }
 
 /* ================================ attention =============================
@@ -741,13 +779,12 @@ extern "C" void ink_cuda_attention(const float *q, const float *kc, const float 
     ink_cuda_ensure_scratch((size_t)n_head * len);
     float inv_hd = 1.0f / (float)hd;
     ink_bench_begin();
-    ink_kernel_attention<<<n_head, 128>>>(q, kc, vc, rel, hd, kvw_max, pos, j0, rel_extent, gqa,
+    ink_kernel_attention<<<n_head, 128, 0, g_stream>>>(q, kc, vc, rel, hd, kvw_max, pos, j0, rel_extent, gqa,
                                            inv_hd, len, g_attn_scratch, attn_out);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
     /* bytes touched: this token's K/V window across all kv-heads, read once */
     double bytes = (double)len * (double)n_head_kv * (double)hd * 2.0 * sizeof(float);
-    ink_bench_end(&g_bench_attn, bytes);
+    ink_bench_end(&g_bench_attn[g_bench_phase], bytes);
 }
 
 /* ================================ shortconv ==============================
@@ -771,11 +808,178 @@ extern "C" void ink_cuda_sconv(const ink_tensor *kernel, float *state, uint32_t 
     uint32_t threads = 256;
     uint32_t blocks = (C + threads - 1) / threads;
     ink_bench_begin();
-    ink_kernel_sconv<<<blocks, threads>>>(w, state, C, K, x);
+    ink_kernel_sconv<<<blocks, threads, 0, g_stream>>>(w, state, C, K, x);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
     double bytes = (double)C * (double)K * sizeof(float) * 2.0; /* weights + state r/w */
-    ink_bench_end(&g_bench_sconv, bytes);
+    ink_bench_end(&g_bench_sconv[g_bench_phase], bytes);
+}
+
+/* ============================ M7: fused small kernels =====================
+ * rmsnorm/silu-mul/residual-add/scale/rel-projection/MoE-accumulate, moved
+ * onto the GPU so a whole layer of ink_forward_gpu() can run without a host
+ * round-trip between GPU ops (see ink_cuda_sync() note above).  Every
+ * kernel here keeps the SAME formula and the SAME per-output-element
+ * accumulation order as its ds4_inkling.c host counterpart (ink_rmsnorm,
+ * ink_silu, the rel_proj loop, the MoE weighted-sum loop): elementwise
+ * kernels (silu-mul, add, scale) are trivially order-independent (one
+ * output per thread, no reduction).  ink_kernel_moe_accumulate and
+ * ink_kernel_relproj both reduce over an OUTER loop (expert index / d_rel)
+ * ascending for a fixed output element, bit-for-bit the same order as the
+ * host loops they replace.  The one deliberate exception is the rmsnorm
+ * sum-of-squares, which uses a block-wide tree reduction instead of the
+ * host's sequential accumulation (parallelizing a scalar reduction cannot
+ * preserve sequential FP order) -- this is the same class of reordering
+ * the existing matvec/matmat warp-reduction kernels already introduce
+ * relative to ink_matvec()'s per-element CPU sum, which is exactly what
+ * ink_test_tensor()'s "4x reordering allowance" tolerance already exists
+ * to absorb; flagged here for the record. */
+
+static uint32_t ink_flat_blocks(uint64_t n, uint32_t threads) {
+    uint64_t b = (n + threads - 1) / threads;
+    if (b < 1) b = 1;
+    if (b > 65535) b = 65535; /* grid-stride loop covers the remainder */
+    return (uint32_t)b;
+}
+
+/* One block per vector; dst may alias src (in-place norm: all of src is
+ * reduced into `local` before any element of dst is written). */
+__global__ void ink_kernel_rmsnorm(float *dst, const float *src, const float *w, uint32_t n, float eps) {
+    uint32_t v = blockIdx.x;
+    const float *s = src + (size_t)v * n;
+    float *d = dst + (size_t)v * n;
+    __shared__ float sred[256];
+    float local = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) local += s[i] * s[i];
+    sred[threadIdx.x] = local;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) sred[threadIdx.x] += sred[threadIdx.x + stride];
+        __syncthreads();
+    }
+    float scale = 1.0f / sqrtf(sred[0] / (float)n + eps);
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) d[i] = s[i] * scale * w[i];
+}
+
+extern "C" void ink_cuda_rmsnorm(float *dst, const float *src, const float *w, uint32_t n_vec, uint32_t n, float eps) {
+    if (n_vec == 0) return;
+    ink_kernel_rmsnorm<<<n_vec, 256, 0, g_stream>>>(dst, src, w, n, eps);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void ink_kernel_silu_mul(float *hg, const float *hu, uint64_t n) {
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (uint64_t)gridDim.x * blockDim.x) {
+        float g = hg[i];
+        hg[i] = (g / (1.0f + expf(-g))) * hu[i];
+    }
+}
+
+extern "C" void ink_cuda_silu_mul(float *hg, const float *hu, uint64_t n) {
+    if (n == 0) return;
+    ink_kernel_silu_mul<<<ink_flat_blocks(n, 256), 256, 0, g_stream>>>(hg, hu, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+/* hg[row][i] = silu(hg[row][i]) * hu[row][i] * gamma[row], where gamma[row]
+ * is read from a strided array (gamma_base[row*gamma_stride+gamma_offset])
+ * rather than assumed contiguous -- lets the caller point straight at a
+ * slice of the per-token wv_all[] weight table (gamma_stride = nu+ns,
+ * gamma_offset = nu+sx for the shexp path) without an extra host-side
+ * gather loop. */
+__global__ void ink_kernel_silu_mul_gamma(float *hg, const float *hu, const float *gamma_base,
+                                           uint32_t gamma_stride, uint32_t gamma_offset,
+                                           uint32_t row_len, uint64_t n_total) {
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n_total; i += (uint64_t)gridDim.x * blockDim.x) {
+        uint32_t row = (uint32_t)(i / row_len);
+        float gamma = gamma_base[(size_t)row * gamma_stride + gamma_offset];
+        float g = hg[i];
+        hg[i] = (g / (1.0f + expf(-g))) * hu[i] * gamma;
+    }
+}
+
+extern "C" void ink_cuda_silu_mul_gamma(float *hg, const float *hu, const float *gamma_base,
+                                         uint32_t gamma_stride, uint32_t gamma_offset,
+                                         uint32_t row_len, uint32_t n_rows) {
+    uint64_t n = (uint64_t)row_len * n_rows;
+    if (n == 0) return;
+    ink_kernel_silu_mul_gamma<<<ink_flat_blocks(n, 256), 256, 0, g_stream>>>(
+        hg, hu, gamma_base, gamma_stride, gamma_offset, row_len, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void ink_kernel_add(float *dst, const float *src, uint64_t n) {
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (uint64_t)gridDim.x * blockDim.x)
+        dst[i] += src[i];
+}
+
+extern "C" void ink_cuda_add(float *dst, const float *src, uint64_t n) {
+    if (n == 0) return;
+    ink_kernel_add<<<ink_flat_blocks(n, 256), 256, 0, g_stream>>>(dst, src, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void ink_kernel_scale(float *dst, uint64_t n, float alpha) {
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (uint64_t)gridDim.x * blockDim.x)
+        dst[i] *= alpha;
+}
+
+extern "C" void ink_cuda_scale(float *dst, uint64_t n, float alpha) {
+    if (n == 0) return;
+    ink_kernel_scale<<<ink_flat_blocks(n, 256), 256, 0, g_stream>>>(dst, n, alpha);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+/* rel[h][e] = tau_t * sum_{d=0}^{d_rel-1} pw[d*rel_extent+e] * r[h*d_rel+d]
+ * -- one block per head, d ascending for fixed (h,e), same order as the
+ * host loop it replaces. */
+__global__ void ink_kernel_relproj(const float *pw, const float *r, float *rel,
+                                    uint32_t d_rel, uint32_t rel_extent, float tau_t) {
+    uint32_t h = blockIdx.x;
+    const float *rh = r + (size_t)h * d_rel;
+    float *relh = rel + (size_t)h * rel_extent;
+    for (uint32_t e = threadIdx.x; e < rel_extent; e += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t d = 0; d < d_rel; d++) acc += pw[(size_t)d * rel_extent + e] * rh[d];
+        relh[e] = acc * tau_t;
+    }
+}
+
+extern "C" void ink_cuda_relproj(const float *pw, const float *r, float *rel,
+                                  uint32_t n_head, uint32_t d_rel, uint32_t rel_extent, float tau_t) {
+    if (n_head == 0) return;
+    uint32_t threads = rel_extent < 256 ? (rel_extent < 32 ? 32 : rel_extent) : 256;
+    ink_kernel_relproj<<<n_head, threads, 0, g_stream>>>(pw, r, rel, d_rel, rel_extent, tau_t);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+/* ff_acc[e] = sum_{i=0}^{nu-1} weights[i] * proj_g[i*n_embd+e] -- i
+ * ascending for fixed e, same order as the host "for i: for e: acc[e] +=
+ * w*proj_i[e]" loop it replaces. */
+__global__ void ink_kernel_moe_accumulate(float *ff_acc, const float *proj_g, const float *weights,
+                                           uint32_t n_embd, uint32_t nu) {
+    for (uint32_t e = blockIdx.x * blockDim.x + threadIdx.x; e < n_embd; e += gridDim.x * blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t i = 0; i < nu; i++) acc += weights[i] * proj_g[(size_t)i * n_embd + e];
+        ff_acc[e] = acc;
+    }
+}
+
+extern "C" void ink_cuda_moe_accumulate(float *ff_acc, const float *proj_g, const float *weights,
+                                         uint32_t n_embd, uint32_t nu) {
+    if (n_embd == 0 || nu == 0) return;
+    ink_kernel_moe_accumulate<<<ink_flat_blocks(n_embd, 256), 256, 0, g_stream>>>(ff_acc, proj_g, weights, n_embd, nu);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+/* On-stream copy of this token's k/v short-conv output into the rolling
+ * kv cache at `pos`.  Previously a host memcpy() -- replaced with an async
+ * copy queued on g_stream so it stays correctly ordered against the sconv
+ * kernel that just wrote kt/vt and the attention kernel that will read
+ * kc/vc, without a host sync in between. cudaMemcpyDefault relies on
+ * unified virtual addressing (both src and dst are coherently-mapped host
+ * pointers here, same as everywhere else in this file). */
+extern "C" void ink_cuda_kv_copy(float *dst, const float *src, uint64_t n_floats) {
+    if (n_floats == 0) return;
+    CUDA_CHECK(cudaMemcpyAsync(dst, src, n_floats * sizeof(float), cudaMemcpyDefault, g_stream));
 }
 
 /* ============================== GPU forward ==============================
@@ -784,8 +988,6 @@ extern "C" void ink_cuda_sconv(const ink_tensor *kernel, float *state, uint32_t 
  * expert selection stay on the host (small / branchy); the big matmuls go
  * through ink_cuda_matmat/matvec, shortconvs through ink_cuda_sconv, and
  * the attention inner loop through ink_cuda_attention. */
-
-static float ink_silu_h(float x) { return x / (1.0f + expf(-x)); }
 
 /* Stack-array cap for the host-side pointer arrays ink_forward_gpu builds
  * per token before calling ink_cuda_matvec_group() (n_expert_used is
@@ -801,6 +1003,11 @@ static int ink_scored_cmp_g(const void *a, const void *b) {
     return d > 0 ? 1 : d < 0 ? -1 : 0;
 }
 
+/* M7: whole-forward launch/sync accounting (see report) --  every ink_cuda_*
+ * call below is an async launch on g_stream; ink_cuda_sync() (host
+ * blocking) appears at exactly two kinds of point: once per MoE layer
+ * (host needs `logits` for qsort routing) and once at the very end if the
+ * caller wants out_logits back.  Dense-only layers issue zero syncs. */
 extern "C" void ink_forward_gpu(ink_model *m, const int *tokens, uint32_t n_tok,
                                  uint32_t pos0, float *out_logits) {
     const uint32_t n_embd = m->n_embd;
@@ -811,6 +1018,8 @@ extern "C" void ink_forward_gpu(ink_model *m, const int *tokens, uint32_t n_tok,
     const uint32_t nT = n_tok;
     if (nT == 0) return;
     if (nT > INK_CUDA_MAX_TOK) ink_die("ink_forward_gpu: batch exceeds GPU kernel's fixed max (128 tokens)");
+
+    g_bench_phase = nT > 1 ? INK_BENCH_PREFILL : INK_BENCH_DECODE;
 
     const size_t conv_per_layer = (size_t)(K - 1) * (2u * kvw_max + 2u * n_embd);
     const size_t off_conv_k = 0;
@@ -831,17 +1040,20 @@ extern "C" void ink_forward_gpu(ink_model *m, const int *tokens, uint32_t n_tok,
     float *hg = (float *)ink_malloc((size_t)nT * big_ff * sizeof(float));
     float *hu = (float *)ink_malloc((size_t)nT * big_ff * sizeof(float));
     float *ff_out = (float *)ink_malloc((size_t)nT * n_embd * sizeof(float));
-    float *ff_acc = (float *)ink_malloc(n_embd * sizeof(float));
     float *taus = (float *)ink_malloc(nT * sizeof(float));
 
+    /* Embedding row fetch stays host (table lookup against the mmap'd
+     * GGUF, once per token); tau is pure host arithmetic.  tok_norm is a
+     * single whole-buffer GPU rmsnorm covering all nT tokens at once (x is
+     * allocated exactly nT*n_embd, so the nT row-vectors are contiguous). */
     for (uint32_t t = 0; t < nT; t++) {
         float *xt = x + (size_t)t * n_embd;
         ink_row_f32(m->tok_embd, m->tok_embd->data, (uint64_t)tokens[t], n_embd, xt);
-        ink_rmsnorm(xt, ink_f32(m->tok_norm), n_embd, m->rms_eps);
         taus[t] = (m->log_n_floor > 0)
             ? 1.0f + m->log_alpha * logf(fmaxf((float)(pos0 + t + 1) / (float)m->log_n_floor, 1.0f))
             : 1.0f;
     }
+    ink_cuda_rmsnorm(x, x, ink_f32(m->tok_norm), nT, n_embd, m->rms_eps);
 
     for (uint32_t il = 0; il < m->n_layer; il++) {
         ink_layer *l = &m->layers[il];
@@ -853,15 +1065,19 @@ extern "C" void ink_forward_gpu(ink_model *m, const int *tokens, uint32_t n_tok,
         float *vc = m->vcache + ((size_t)il * m->n_ctx) * kvw_max;
 
         /* ---- attention block ---- */
-        for (uint32_t t = 0; t < nT; t++) {
-            memcpy(xn + (size_t)t * n_embd, x + (size_t)t * n_embd, n_embd * sizeof(float));
-            ink_rmsnorm(xn + (size_t)t * n_embd, ink_f32(l->attn_norm), n_embd, m->rms_eps);
-        }
+        ink_cuda_rmsnorm(xn, x, ink_f32(l->attn_norm), nT, n_embd, m->rms_eps);
 
         ink_cuda_matmat(l->wq, l->wq->data, n_embd, (uint64_t)n_head * hd, nT, xn, q);
         ink_cuda_matmat(l->wk, l->wk->data, n_embd, kvw, nT, xn, kf);
         ink_cuda_matmat(l->wv, l->wv->data, n_embd, kvw, nT, xn, vf);
         ink_cuda_matmat(l->wr, l->wr->data, n_embd, (uint64_t)n_head * m->d_rel, nT, xn, r);
+
+        /* q is allocated exactly nT*n_head*hd (no per-token padding), so
+         * every (t,h) head-vector is contiguous across the WHOLE batch --
+         * one rmsnorm launch for all of it, instead of nT*n_head. kf/vf are
+         * allocated at kvw_max stride per token (pre-existing convention,
+         * unrelated to M7) so k_norm stays per-t below. */
+        ink_cuda_rmsnorm(q, q, ink_f32(l->q_norm), nT * n_head, hd, m->rms_eps);
 
         for (uint32_t t = 0; t < nT; t++) {
             const uint32_t pos = pos0 + t;
@@ -872,17 +1088,12 @@ extern "C" void ink_forward_gpu(ink_model *m, const int *tokens, uint32_t n_tok,
             ink_cuda_sconv(l->sc_k, conv_l + off_conv_k, kvw, K, kt);
             ink_cuda_sconv(l->sc_v, conv_l + off_conv_v, kvw, K, vt);
 
-            for (uint32_t h = 0; h < n_head; h++)
-                ink_rmsnorm(qt + (size_t)h * hd, ink_f32(l->q_norm), hd, m->rms_eps);
-            for (uint32_t h = 0; h < n_head_kv; h++)
-                ink_rmsnorm(kt + (size_t)h * hd, ink_f32(l->k_norm), hd, m->rms_eps);
+            ink_cuda_rmsnorm(kt, kt, ink_f32(l->k_norm), n_head_kv, hd, m->rms_eps);
 
-            if (!l->is_swa && taus[t] != 1.0f) {
-                for (uint32_t i = 0; i < (uint32_t)n_head * hd; i++) qt[i] *= taus[t];
-            }
+            if (!l->is_swa && taus[t] != 1.0f) ink_cuda_scale(qt, (uint64_t)n_head * hd, taus[t]);
 
-            memcpy(kc + (size_t)pos * kvw_max, kt, kvw * sizeof(float));
-            memcpy(vc + (size_t)pos * kvw_max, vt, kvw * sizeof(float));
+            ink_cuda_kv_copy(kc + (size_t)pos * kvw_max, kt, kvw);
+            ink_cuda_kv_copy(vc + (size_t)pos * kvw_max, vt, kvw);
         }
 
         const float *pw = ink_f32(l->rel_proj);
@@ -892,16 +1103,7 @@ extern "C" void ink_forward_gpu(ink_model *m, const int *tokens, uint32_t n_tok,
             const float *rt = r + (size_t)t * n_head * m->d_rel;
             const float tau_t = (!l->is_swa) ? taus[t] : 1.0f;
 
-            for (uint32_t h = 0; h < n_head; h++) {
-                const float *rh = rt + (size_t)h * m->d_rel;
-                float *relh = rel + (size_t)h * rel_extent;
-                for (uint32_t e = 0; e < rel_extent; e++) {
-                    float acc = 0.0f;
-                    for (uint32_t d = 0; d < m->d_rel; d++)
-                        acc += pw[(size_t)d * rel_extent + e] * rh[d];
-                    relh[e] = acc * tau_t;
-                }
-            }
+            ink_cuda_relproj(pw, rt, rel, n_head, m->d_rel, rel_extent, tau_t);
 
             uint32_t j0 = 0;
             if (l->is_swa && pos + 1 > m->n_swa) j0 = pos + 1 - m->n_swa;
@@ -913,27 +1115,28 @@ extern "C" void ink_forward_gpu(ink_model *m, const int *tokens, uint32_t n_tok,
 
         ink_cuda_matmat(l->wo, l->wo->data, (uint64_t)n_head * hd, n_embd, nT, attn_out, proj_out);
 
+        /* sc_attn carries state across t (must stay a sequential per-t
+         * loop); the residual add doesn't, so it happens once, after, as a
+         * single flat kernel over the whole [nT][n_embd] buffer -- correct
+         * because it's issued strictly after all nT sconv launches in
+         * program order on the same stream. */
         for (uint32_t t = 0; t < nT; t++) {
             float *pt = proj_out + (size_t)t * n_embd;
             ink_cuda_sconv(l->sc_attn, conv_l + off_conv_attn, n_embd, K, pt);
-            float *xt = x + (size_t)t * n_embd;
-            for (uint32_t i = 0; i < n_embd; i++) xt[i] += pt[i];
         }
+        ink_cuda_add(x, proj_out, (uint64_t)nT * n_embd);
 
         /* ---- ffn block ---- */
-        for (uint32_t t = 0; t < nT; t++) {
-            memcpy(xn + (size_t)t * n_embd, x + (size_t)t * n_embd, n_embd * sizeof(float));
-            ink_rmsnorm(xn + (size_t)t * n_embd, ink_f32(l->ffn_norm), n_embd, m->rms_eps);
-        }
+        ink_cuda_rmsnorm(xn, x, ink_f32(l->ffn_norm), nT, n_embd, m->rms_eps);
         const float gscale = ink_f32(l->gscale)[0];
 
         if (il < m->n_dense) {
             uint32_t nf = m->n_ff_dense;
             ink_cuda_matmat(l->ffn_gate, l->ffn_gate->data, n_embd, nf, nT, xn, hg);
             ink_cuda_matmat(l->ffn_up, l->ffn_up->data, n_embd, nf, nT, xn, hu);
-            for (uint32_t i = 0; i < nT * nf; i++) hg[i] = ink_silu_h(hg[i]) * hu[i];
+            ink_cuda_silu_mul(hg, hu, (uint64_t)nT * nf);
             ink_cuda_matmat(l->ffn_down, l->ffn_down->data, nf, n_embd, nT, hg, ff_out);
-            for (uint32_t i = 0; i < nT * n_embd; i++) ff_out[i] *= gscale;
+            ink_cuda_scale(ff_out, (uint64_t)nT * n_embd, gscale);
         } else {
             const uint32_t nE = m->n_expert, nu = m->n_expert_used, ns = m->n_shexp;
             const uint32_t nf = m->n_ff_exp;
@@ -950,6 +1153,10 @@ extern "C" void ink_forward_gpu(ink_model *m, const int *tokens, uint32_t n_tok,
 
             float *wv_all = (float *)ink_malloc((size_t)nT * (nu + ns) * sizeof(float));
             int *sel_all = (int *)ink_malloc((size_t)nT * nu * sizeof(int));
+
+            /* ---- SYNC (1 of 2 per-call sync points): host needs `logits`
+             * for the top-k routing qsort below. ---- */
+            ink_cuda_sync();
 
             for (uint32_t t = 0; t < nT; t++) {
                 const float *lg = logits + (size_t)t * (nE + ns);
@@ -980,11 +1187,14 @@ extern "C" void ink_forward_gpu(ink_model *m, const int *tokens, uint32_t n_tok,
             /* Grouped launch: gate_exps/up_exps/down_exps for all nu selected
              * experts of one token go out as ONE kernel launch each
              * (blockIdx.y = expert group) instead of nu sequential
-             * ink_cuda_matvec() calls -- 3 launches per token instead of
-             * 3*nu.  gate/up share the token's xt; down needs each expert's
-             * own silu(gate)*up hidden vector, so it gets a per-group X
-             * array too (ink_cuda_matvec_group takes xs[group] rather than
-             * a single shared x for exactly this reason). */
+             * ink_cuda_matvec() calls.  silu-mul and the weighted MoE
+             * accumulate are single GPU kernels too (ink_cuda_silu_mul,
+             * ink_cuda_moe_accumulate) -- 4 launches per token total
+             * instead of 3*nu matvecs + 2 host loops. gate/up share the
+             * token's xt; down needs each expert's own silu(gate)*up
+             * hidden vector, so it gets a per-group X array too
+             * (ink_cuda_matvec_group takes xs[group] rather than a single
+             * shared x for exactly this reason). */
             if (nu > INK_GROUP_HOST_MAX)
                 ink_die("ink_forward_gpu: n_expert_used exceeds host group-batch array cap");
             float *hg_g = (float *)ink_malloc((size_t)nu * nf * sizeof(float));
@@ -1002,7 +1212,6 @@ extern "C" void ink_forward_gpu(ink_model *m, const int *tokens, uint32_t n_tok,
             for (uint32_t t = 0; t < nT; t++) {
                 const float *xt = xn + (size_t)t * n_embd;
                 float *ot = ff_out + (size_t)t * n_embd;
-                memset(ff_acc, 0, n_embd * sizeof(float));
 
                 for (uint32_t i = 0; i < nu; i++) {
                     const uint32_t e = (uint32_t)sel_all[(size_t)t * nu + i];
@@ -1016,33 +1225,19 @@ extern "C" void ink_forward_gpu(ink_model *m, const int *tokens, uint32_t n_tok,
                 }
                 ink_cuda_matvec_group(l->gate_exps, gate_bases, n_embd, nf, shared_x, gate_ys, nu);
                 ink_cuda_matvec_group(l->up_exps,   up_bases,   n_embd, nf, shared_x, up_ys,   nu);
-                for (uint32_t i = 0; i < nu; i++) {
-                    float *hgi = hg_g + (size_t)i * nf;
-                    const float *hui = hu_g + (size_t)i * nf;
-                    for (uint32_t v2 = 0; v2 < nf; v2++) hgi[v2] = ink_silu_h(hgi[v2]) * hui[v2];
-                    down_x[i] = hgi;
-                }
+                ink_cuda_silu_mul(hg_g, hu_g, (uint64_t)nu * nf);
+                for (uint32_t i = 0; i < nu; i++) down_x[i] = hg_g + (size_t)i * nf;
                 ink_cuda_matvec_group(l->down_exps, down_bases, nf, n_embd, down_x, down_ys, nu);
 
-                for (uint32_t i = 0; i < nu; i++) {
-                    const float w = wv_all[(size_t)t * (nu + ns) + i];
-                    const float *proj_i = proj_g + (size_t)i * n_embd;
-                    for (uint32_t v2 = 0; v2 < n_embd; v2++) ff_acc[v2] += w * proj_i[v2];
-                }
-                memcpy(ot, ff_acc, n_embd * sizeof(float));
+                ink_cuda_moe_accumulate(ot, proj_g, wv_all + (size_t)t * (nu + ns), n_embd, nu);
             }
 
             for (uint32_t sx = 0; sx < ns; sx++) {
                 ink_cuda_matmat(l->gate_shexp, l->gate_shexp->data + (size_t)sx * nf * sg_rb, n_embd, nf, nT, xn, hg);
                 ink_cuda_matmat(l->up_shexp, l->up_shexp->data + (size_t)sx * nf * su_rb, n_embd, nf, nT, xn, hu);
-                for (uint32_t t = 0; t < nT; t++) {
-                    const float gamma = wv_all[(size_t)t * (nu + ns) + nu + sx];
-                    float *hgt = hg + (size_t)t * nf;
-                    const float *hut = hu + (size_t)t * nf;
-                    for (uint32_t v2 = 0; v2 < nf; v2++) hgt[v2] = ink_silu_h(hgt[v2]) * hut[v2] * gamma;
-                }
+                ink_cuda_silu_mul_gamma(hg, hu, wv_all, nu + ns, nu + sx, nf, nT);
                 ink_cuda_matmat(l->down_shexp, l->down_shexp->data + (size_t)sx * n_embd * sd_rb, nf, n_embd, nT, hg, proj_out);
-                for (uint32_t i = 0; i < nT * n_embd; i++) ff_out[i] += proj_out[i];
+                ink_cuda_add(ff_out, proj_out, (uint64_t)nT * n_embd);
             }
             free(logits); free(wv_all); free(sel_all);
             free(hg_g); free(hu_g); free(proj_g);
@@ -1051,24 +1246,39 @@ extern "C" void ink_forward_gpu(ink_model *m, const int *tokens, uint32_t n_tok,
         for (uint32_t t = 0; t < nT; t++) {
             float *ft = ff_out + (size_t)t * n_embd;
             ink_cuda_sconv(l->sc_mlp, conv_l + off_conv_mlp, n_embd, K, ft);
-            float *xt = x + (size_t)t * n_embd;
-            for (uint32_t i = 0; i < n_embd; i++) xt[i] += ft[i];
         }
+        ink_cuda_add(x, ff_out, (uint64_t)nT * n_embd);
     }
 
     if (out_logits) {
         float *xl = x + (size_t)(nT - 1) * n_embd;
-        ink_rmsnorm(xl, ink_f32(m->out_norm), n_embd, m->rms_eps);
-        for (uint32_t i = 0; i < n_embd; i++) xl[i] *= m->logit_scale;
+        ink_cuda_rmsnorm(xl, xl, ink_f32(m->out_norm), 1, n_embd, m->rms_eps);
+        ink_cuda_scale(xl, n_embd, m->logit_scale);
         ink_cuda_matvec(m->output, m->output->data, n_embd, m->n_vocab, xl, out_logits);
+        /* ---- SYNC (2 of 2): caller reads out_logits right after this
+         * call returns (argmax / ink_logits_guard). ---- */
+        ink_cuda_sync();
         if (m->n_vocab_unpadded > 0) {
             for (uint32_t i = m->n_vocab_unpadded; i < m->n_vocab; i++) out_logits[i] = -INFINITY;
         }
     }
 
+    /* MANDATORY sync (not one of the "two per-call sync points" above --
+     * this one is a correctness requirement, not a perf tradeoff): every
+     * ink_cuda_* call in this function is an async launch against these
+     * host-malloc'd temporaries (x, xn, q, kf, vf, r, rel, attn_out,
+     * proj_out, hg, hu, ff_out), including the very last layer's residual
+     * add and kv-cache copies.  free()'ing them while g_stream still has
+     * in-flight work reading/writing them would be a use-after-free race
+     * the moment the allocator hands the same address back out on the
+     * next ink_forward_gpu() call.  When out_logits was requested the sync
+     * above already covers this; when it's NULL (mid-prompt prefill
+     * chunks) this is the only sync in the whole call. */
+    ink_cuda_sync();
+
     free(x); free(xn); free(q); free(kf); free(vf); free(r); free(rel);
     free(attn_out); free(proj_out); free(hg); free(hu);
-    free(ff_out); free(ff_acc); free(taus);
+    free(ff_out); free(taus);
 }
 
 /* ================================ CLI ==================================== */
@@ -1094,6 +1304,7 @@ static bool ink_test_tensor(const char *name, const ink_tensor *t, const uint8_t
 
     ink_matvec(t, base, in, out, x, ycpu);
     ink_cuda_matvec(t, base, in, out, x, ygpu);
+    ink_cuda_sync(); /* M7: wrappers no longer sync internally -- read ygpu only after this */
 
     /* double-accumulation reference from the SAME dequantized rows: both
      * the fp32 CPU path and the GPU path are compared against it, so
@@ -1306,16 +1517,16 @@ static void ink_bench_one_tensor(const char *name, const ink_tensor *t, const ui
     ink_fill_rand(mx, in, 0xBEEFu);
 
     for (int i = 0; i < 5; i++) ink_cuda_matvec(t, mbase, in, out, mx, my);
-    CUDA_CHECK(cudaDeviceSynchronize());
+    ink_cuda_sync(); /* M7: wrappers no longer sync internally */
 
     double total_ms = 0.0;
     for (int i = 0; i < 20; i++) {
         cudaEvent_t s, e;
         CUDA_CHECK(cudaEventCreate(&s));
         CUDA_CHECK(cudaEventCreate(&e));
-        CUDA_CHECK(cudaEventRecord(s));
+        CUDA_CHECK(cudaEventRecord(s, g_stream)); /* must share g_stream with the kernel to bracket it correctly */
         ink_cuda_matvec(t, mbase, in, out, mx, my);
-        CUDA_CHECK(cudaEventRecord(e));
+        CUDA_CHECK(cudaEventRecord(e, g_stream));
         CUDA_CHECK(cudaEventSynchronize(e));
         float ms = 0.0f;
         CUDA_CHECK(cudaEventElapsedTime(&ms, s, e));
@@ -1375,6 +1586,96 @@ static int ink_run_bench_layers(const char *model_path, int layer) {
     return 0;
 }
 
+/* --bench-membw: decide whether the ~15-30 GB/s effective bandwidth seen in
+ * matvec/group-matvec bench numbers is a real managed/pageable-memory
+ * streaming ceiling on this GB10, or just async-launch overhead (which M7
+ * should have mostly eliminated for non-bench runs, but --bench itself
+ * re-adds a sync per launch, see the bench-report header).  Allocates 2 GiB
+ * with cudaMallocManaged (touched from the host first, matching
+ * ink_make_resident's pattern) and 2 GiB with cudaMalloc+cudaMemcpy from a
+ * host buffer, then runs a plain grid-stride sum-reduction kernel over
+ * each, 10x timed (5 warmup), and reports GB/s for both. */
+__global__ void ink_kernel_membw_sum(const float *p, uint64_t n, float *out) {
+    float local = 0.0f;
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (uint64_t)gridDim.x * blockDim.x)
+        local += p[i];
+    __shared__ float sred[256];
+    sred[threadIdx.x] = local;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) sred[threadIdx.x] += sred[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicAdd(out, sred[0]);
+}
+
+static double ink_membw_probe(const char *label, float *p, uint64_t n_floats) {
+    float *dout = NULL;
+    CUDA_CHECK(cudaMalloc(&dout, sizeof(float)));
+    uint32_t blocks = ink_flat_blocks(n_floats, 256);
+
+    for (int i = 0; i < 5; i++) {
+        CUDA_CHECK(cudaMemsetAsync(dout, 0, sizeof(float), g_stream));
+        ink_kernel_membw_sum<<<blocks, 256, 0, g_stream>>>(p, n_floats, dout);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(g_stream));
+
+    double total_ms = 0.0;
+    for (int i = 0; i < 10; i++) {
+        cudaEvent_t s, e;
+        CUDA_CHECK(cudaEventCreate(&s));
+        CUDA_CHECK(cudaEventCreate(&e));
+        CUDA_CHECK(cudaMemsetAsync(dout, 0, sizeof(float), g_stream));
+        CUDA_CHECK(cudaEventRecord(s, g_stream));
+        ink_kernel_membw_sum<<<blocks, 256, 0, g_stream>>>(p, n_floats, dout);
+        CUDA_CHECK(cudaEventRecord(e, g_stream));
+        CUDA_CHECK(cudaEventSynchronize(e));
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, s, e));
+        total_ms += ms;
+        cudaEventDestroy(s);
+        cudaEventDestroy(e);
+    }
+    double ms_per = total_ms / 10.0;
+    double bytes = (double)n_floats * sizeof(float);
+    double gbps = ms_per > 0 ? (bytes / 1.0e9) / (ms_per / 1000.0) : 0.0;
+    printf("%-28s bytes=%.3fGiB ms/iter=%.4f GB/s=%.2f\n", label, bytes / 1073741824.0, ms_per, gbps);
+    cudaFree(dout);
+    return gbps;
+}
+
+static void ink_run_bench_membw(void) {
+    const uint64_t bytes = 2ull << 30; /* 2 GiB */
+    const uint64_t n_floats = bytes / sizeof(float);
+
+    printf("=== ds4-inkling-cuda --bench-membw (2 GiB each) ===\n");
+
+    /* managed: touch from host first, same pattern as ink_make_resident's
+     * managed-memory residency path (first-touch establishes host-side
+     * physical backing before the device streams it). */
+    float *managed = (float *)ink_cuda_managed_alloc(bytes);
+    if (!managed) { fprintf(stderr, "cudaMallocManaged(2 GiB) failed\n"); } else {
+        for (uint64_t i = 0; i < n_floats; i++) managed[i] = 1.0f;
+        ink_membw_probe("managed (host-touched)", managed, n_floats);
+        cudaFree(managed);
+    }
+
+    /* cudaMalloc + explicit cudaMemcpy from a host buffer -- the
+     * conventional "not coherent, but a plain device allocation" ceiling. */
+    float *hostbuf = (float *)ink_malloc(bytes);
+    for (uint64_t i = 0; i < n_floats; i++) hostbuf[i] = 1.0f;
+    float *dev = NULL;
+    cudaError_t err = cudaMalloc(&dev, bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "cudaMalloc(2 GiB) failed: %s\n", cudaGetErrorString(err));
+    } else {
+        CUDA_CHECK(cudaMemcpy(dev, hostbuf, bytes, cudaMemcpyHostToDevice));
+        ink_membw_probe("cudaMalloc+memcpy", dev, n_floats);
+        cudaFree(dev);
+    }
+    free(hostbuf);
+}
+
 int main(int argc, char **argv) {
     const char *model_path = NULL;
     const char *prompt = NULL;
@@ -1385,6 +1686,7 @@ int main(int argc, char **argv) {
     bool resident = false;
     uint64_t resident_budget = 0;
     int bench_layers_layer = -1;
+    bool bench_membw = false;
 
     const char *env_bench = getenv("INK_BENCH");
     if (env_bench && strcmp(env_bench, "0") != 0 && env_bench[0] != '\0') g_bench = 1;
@@ -1403,17 +1705,27 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--bench")) g_bench = 1;
         else if (!strcmp(argv[i], "--bench-layers") && i + 1 < argc) bench_layers_layer = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--bench-membw")) bench_membw = true;
         else {
             fprintf(stderr, "usage: ds4-inkling-cuda -m model.gguf -p prompt [-n N] [-c CTX] [--resident] [--resident-budget GiB] [--dump-tokens] [--bench]\n");
             fprintf(stderr, "       ds4-inkling-cuda -m model.gguf --selftest LAYER\n");
             fprintf(stderr, "       ds4-inkling-cuda -m model.gguf --bench-layers LAYER\n");
+            fprintf(stderr, "       ds4-inkling-cuda --bench-membw\n");
             return 1;
         }
     }
+
+    if (bench_membw) {
+        ink_cuda_init();
+        ink_run_bench_membw();
+        return 0;
+    }
+
     if (!model_path) {
         fprintf(stderr, "usage: ds4-inkling-cuda -m model.gguf -p prompt [-n N] [-c CTX] [--resident] [--resident-budget GiB] [--dump-tokens] [--bench]\n");
         fprintf(stderr, "       ds4-inkling-cuda -m model.gguf --selftest LAYER\n");
         fprintf(stderr, "       ds4-inkling-cuda -m model.gguf --bench-layers LAYER\n");
+        fprintf(stderr, "       ds4-inkling-cuda --bench-membw\n");
         return 1;
     }
 
