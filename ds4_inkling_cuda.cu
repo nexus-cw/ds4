@@ -168,6 +168,40 @@ __device__ __forceinline__ float ink_dq_elem(uint32_t type, const uint8_t *rowp,
 }
 #endif
 
+/* M8: small load/arithmetic helpers shared by the dequantizers below.
+ *
+ * ink_load_u32: alignment-agnostic wide (32-bit) byte-stream read.  Block
+ * structs are not always 4-byte aligned relative to a row's start (e.g.
+ * ink_block_iq2_xxs is 66 bytes, so consecutive blocks' interesting
+ * sub-regions alternate between 2- and 4-byte alignment) -- casting to
+ * `const uint32_t *` and dereferencing would be undefined behavior on a
+ * misaligned pointer, and vector loads (uint2/uint4) actively fault on
+ * some paths if misaligned.  memcpy of a compile-time-constant size into a
+ * register is the portable, well-defined way to get the same single wide
+ * load nvcc would emit for an aligned pointer, without the UB.  Assumes
+ * little-endian byte order (true of every CUDA-capable GPU and of the
+ * GGUF format itself), matching the manual byte-shift reconstruction this
+ * file already did before M8 (bp[0] | bp[1]<<8 | ...) -- same assumption,
+ * just made once here instead of by construction at each call site.
+ *
+ * ink_signed: flips the sign bit of `mag` when `neg` is true.  IEEE-754
+ * multiplication by exactly -1.0f is defined to do nothing but flip the
+ * sign bit (no rounding), so this is bitwise identical to
+ * `neg ? -mag : mag` / `mag * (neg ? -1.f : 1.f)` for every finite value
+ * (and for +-0/+-inf too) -- it just replaces a float compare+select with
+ * an integer XOR, avoiding the per-lane branch. */
+__device__ __forceinline__ uint32_t ink_load_u32(const uint8_t *p) {
+    uint32_t v;
+    memcpy(&v, p, 4);
+    return v;
+}
+
+__device__ __forceinline__ float ink_signed(float mag, bool neg) {
+    uint32_t bits = __float_as_uint(mag);
+    bits ^= neg ? 0x80000000u : 0u;
+    return __uint_as_float(bits);
+}
+
 __device__ __forceinline__ void dq32_f32(const uint8_t *rowp, uint32_t sg, float w[32]) {
     const float *p = (const float *)rowp + (size_t)sg * 32;
 #pragma unroll
@@ -227,23 +261,39 @@ __device__ __forceinline__ void dq32_q6_K(const uint8_t *rowp, uint32_t sg, floa
     const ink_block_q6_K *b = &x[i];
     uint32_t half = local_sg / 4, qsel = local_sg % 4;
     float d = __half2float(__ushort_as_half(b->d));
-    const uint8_t *ql = b->ql + 64 * half;
-    const uint8_t *qh = b->qh + 32 * half;
     const int8_t *sc = b->scales + 8 * half;
     /* is = l/16 in {0,1}; hoist the two possible scale*d values, matching
      * scv = sc[is + {0,2,4,6}] for qsel {0,1,2,3} exactly. */
     int scoff = (int)qsel * 2;
     float dsc0 = d * (float)sc[scoff + 0];
     float dsc1 = d * (float)sc[scoff + 1];
+    /* qsel is loop-invariant (fixed for this whole subgroup), so fold the
+     * ql[l] vs ql[l+32] / nibble-half selection into one base pointer +
+     * shift instead of re-branching per element (nvcc would likely hoist
+     * this anyway via LICM, but making it explicit removes any doubt and
+     * sets up the grouped 32-bit reads below cleanly). */
+    const uint8_t *qlbase = b->ql + 64 * half + ((qsel == 1 || qsel == 3) ? 32 : 0);
+    const uint8_t *qh = b->qh + 32 * half;
+    bool hi_nib = (qsel == 2 || qsel == 3);
+    uint32_t qh_shift = 2 * qsel;
+    /* wide (memcpy-safe) 32-bit reads: 8 groups of 4 bytes cover all 32
+     * ql/qh bytes touched by this subgroup instead of 32 separate byte
+     * loads each; extracting byte `sub` back out of the loaded word gives
+     * the exact same value ql[g*4+sub]/qh[g*4+sub] would have (little-
+     * endian, see ink_load_u32). */
 #pragma unroll
-    for (int l = 0; l < 32; l++) {
-        int val;
-        if (qsel == 0)      val = (ql[l]      & 0xF) | (((qh[l] >> 0) & 3) << 4);
-        else if (qsel == 1) val = (ql[l + 32]  & 0xF) | (((qh[l] >> 2) & 3) << 4);
-        else if (qsel == 2) val = (ql[l]       >> 4) | (((qh[l] >> 4) & 3) << 4);
-        else                val = (ql[l + 32]  >> 4) | (((qh[l] >> 6) & 3) << 4);
-        val -= 32;
-        w[l] = (l < 16 ? dsc0 : dsc1) * (float)val;
+    for (uint32_t g = 0; g < 8; g++) {
+        uint32_t qlw = ink_load_u32(qlbase + g * 4);
+        uint32_t qhw = ink_load_u32(qh + g * 4);
+#pragma unroll
+        for (uint32_t sub = 0; sub < 4; sub++) {
+            uint32_t l = g * 4 + sub;
+            uint8_t qlb = (uint8_t)(qlw >> (8 * sub));
+            uint8_t qhb = (uint8_t)(qhw >> (8 * sub));
+            int val = (hi_nib ? (qlb >> 4) : (qlb & 0xF)) | (((qhb >> qh_shift) & 3) << 4);
+            val -= 32;
+            w[l] = (l < 16 ? dsc0 : dsc1) * (float)val;
+        }
     }
 }
 
@@ -253,8 +303,11 @@ __device__ __forceinline__ void dq32_iq2_xxs(const uint8_t *rowp, uint32_t sg, f
     const ink_block_iq2_xxs *b = &x[i];
     float d = __half2float(__ushort_as_half(b->d));
     const uint8_t *bp = (const uint8_t *)b->qs + 8 * local_sg;
-    uint32_t a0 = (uint32_t)bp[0] | ((uint32_t)bp[1] << 8) | ((uint32_t)bp[2] << 16) | ((uint32_t)bp[3] << 24);
-    uint32_t a1 = (uint32_t)bp[4] | ((uint32_t)bp[5] << 8) | ((uint32_t)bp[6] << 16) | ((uint32_t)bp[7] << 24);
+    /* one 8-byte region -> two wide 32-bit loads instead of 8 byte loads
+     * (block stride is 66 bytes, so `bp` isn't reliably 4-byte aligned --
+     * ink_load_u32 handles that safely, see its comment above). */
+    uint32_t a0 = ink_load_u32(bp);
+    uint32_t a1 = ink_load_u32(bp + 4);
     float db = d * (0.5f + (float)(a1 >> 28)) * 0.25f;
 #pragma unroll
     for (uint32_t lg = 0; lg < 4; lg++) {
@@ -264,7 +317,9 @@ __device__ __forceinline__ void dq32_iq2_xxs(const uint8_t *rowp, uint32_t sg, f
 #pragma unroll
         for (uint32_t j = 0; j < 8; j++) {
             uint8_t gbyte = (uint8_t)((gridv >> (8 * j)) & 0xFF);
-            w[lg * 8 + j] = db * (float)gbyte * ((signs & tb.kmask_iq2xs[j]) ? -1.f : 1.f);
+            /* sign-bit XOR instead of a compare+select multiply by -1.f --
+             * bitwise identical (see ink_signed's comment). */
+            w[lg * 8 + j] = ink_signed(db * (float)gbyte, (signs & tb.kmask_iq2xs[j]) != 0);
         }
     }
 }
@@ -300,7 +355,9 @@ __device__ __forceinline__ void dq32_iq3_xxs(const uint8_t *rowp, uint32_t sg, f
     const ink_block_iq3_xxs *b = &x[i];
     float d = __half2float(__ushort_as_half(b->d));
     const uint8_t *sas = b->qs + QK_K / 4 + 4 * local_sg;
-    uint32_t aux32 = (uint32_t)sas[0] | ((uint32_t)sas[1] << 8) | ((uint32_t)sas[2] << 16) | ((uint32_t)sas[3] << 24);
+    /* one wide 32-bit load instead of 4 byte loads (alignment-agnostic,
+     * see ink_load_u32). */
+    uint32_t aux32 = ink_load_u32(sas);
     float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;
     const uint8_t *qsp = b->qs + 8 * local_sg;
 #pragma unroll
@@ -313,8 +370,10 @@ __device__ __forceinline__ void dq32_iq3_xxs(const uint8_t *rowp, uint32_t sg, f
 #pragma unroll
             for (uint32_t j = 0; j < 4; j++) {
                 uint8_t gbyte = (uint8_t)((gv >> (8 * j)) & 0xFF);
-                w[l4 * 8 + subsel * 4 + j] = db * (float)gbyte *
-                    ((signs & tb.kmask_iq2xs[maskbase + j]) ? -1.f : 1.f);
+                /* sign-bit XOR instead of compare+select*-1.f (bitwise
+                 * identical, see ink_signed's comment). */
+                w[l4 * 8 + subsel * 4 + j] = ink_signed(db * (float)gbyte,
+                                                         (signs & tb.kmask_iq2xs[maskbase + j]) != 0);
             }
         }
     }
@@ -516,9 +575,21 @@ __device__ __forceinline__ void ink_matvec_row_warp(uint32_t type, const uint8_t
         for (uint32_t sg = lane; sg < nsub; sg += 32) {
             float w[32];
             ink_dq_load32(type, rowp, sg, w, tb);
-            const float *xp = xsrc + (size_t)sg * 32;
+            /* float4 reads instead of 32 scalar loads: xsrc + sg*32 is
+             * always a 128-byte-aligned offset (sg*32 floats) from a base
+             * that is itself >=16-byte aligned (sx is __align__(16)
+             * shared memory; X is ink_malloc()/malloc(), 16-byte aligned
+             * on every platform this runs on), so this is safe
+             * unconditionally, not just when `in` happens to be a nice
+             * multiple -- the alignment comes from sg*32 being a multiple
+             * of 4 floats, which it always is. */
+            const float4 *xp4 = reinterpret_cast<const float4 *>(xsrc + (size_t)sg * 32);
 #pragma unroll
-            for (int l = 0; l < 32; l++) acc += w[l] * xp[l];
+            for (int l4 = 0; l4 < 8; l4++) {
+                float4 xv = xp4[l4];
+                acc += w[l4 * 4 + 0] * xv.x + w[l4 * 4 + 1] * xv.y
+                     + w[l4 * 4 + 2] * xv.z + w[l4 * 4 + 3] * xv.w;
+            }
         }
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
@@ -528,7 +599,7 @@ __device__ __forceinline__ void ink_matvec_row_warp(uint32_t type, const uint8_t
 
 __global__ void ink_kernel_matvec(uint32_t type, const uint8_t *rowbase, uint64_t in, uint64_t out,
                                    const float *X, float *Y, ink_tables tb) {
-    __shared__ float sx[INK_MATVEC_SHARED_MAX];
+    __shared__ __align__(16) float sx[INK_MATVEC_SHARED_MAX];
     const float *sxp = NULL;
     if (in <= INK_MATVEC_SHARED_MAX) {
         for (uint64_t i = threadIdx.x; i < in; i += blockDim.x) sx[i] = X[i];
@@ -608,7 +679,7 @@ __global__ void ink_kernel_matvec_group(uint32_t type, ink_ptr8 bases, uint64_t 
     const float *X = xs.p[g];
     float *Y = ys.p[g];
 
-    __shared__ float sx[INK_MATVEC_SHARED_MAX];
+    __shared__ __align__(16) float sx[INK_MATVEC_SHARED_MAX];
     const float *sxp = NULL;
     if (in <= INK_MATVEC_SHARED_MAX) {
         for (uint64_t i = threadIdx.x; i < in; i += blockDim.x) sx[i] = X[i];
@@ -1499,25 +1570,109 @@ static uint64_t ink_sys_available_bytes(void) {
     return kb * 1024;
 }
 
+/* M8: cudaMalloc weight arena.  Everything a GPU KERNEL dereferences
+ * (matvec/matmat/group-matvec/attention/sconv weights) is fine living in
+ * plain device memory -- device memory is faster than managed/pageable
+ * (see --bench-membw: cudaMalloc ~225-237 GB/s vs managed ~162 GB/s on
+ * this box) and none of those tensors are ever read by HOST code.  The
+ * exceptions are the handful of tensors HOST code actually dereferences
+ * directly:
+ *   - token_embd.weight: ink_row_f32() in ink_forward_gpu's embedding
+ *     fetch loop is a host CPU function (memcpy/dequant into `xt`).
+ *   - every F32 tensor: most are only ever handed to a kernel as an
+ *     opaque device-dereferenced pointer (attn_norm, q_norm, k_norm,
+ *     sc_k/v/attn/mlp, rel_proj, ...) and would be fine on-device too, but
+ *     TWO of them are read element-wise on the HOST in ink_forward_gpu:
+ *     `ink_f32(l->gscale)[0]` and `bias[e]` from `ink_f32(l->probs_b)`
+ *     during MoE routing.  Rather than special-case just those two (and
+ *     risk missing a future host read of some other F32 tensor), the
+ *     simplest SAFE rule is: all F32 tensors stay host-resident (malloc).
+ *     They are tiny (norm vectors, scalars, small conv kernels) relative
+ *     to the quantized weight matrices, so this costs effectively nothing.
+ * Kernels can dereference either arena identically (device pointers are
+ * device pointers; host pointers work too under this file's coherent-
+ * pageable-access design) -- the split is purely about which arena is
+ * fastest for who actually reads it. */
+static const ink_tensor *g_resident_tok_embd = NULL;
+static uint64_t g_resident_device_bytes = 0;
+static uint64_t g_resident_host_bytes = 0;
+
+static bool ink_resident_needs_host(const ink_tensor *t) {
+    return t->type == INK_T_F32 || t == g_resident_tok_embd;
+}
+
+static void *ink_cuda_resident_alloc_ex(size_t n, const ink_tensor *t) {
+    if (ink_resident_needs_host(t)) {
+        void *p = malloc(n ? n : 1);
+        if (!p) ink_die("resident arena: host malloc failed");
+        g_resident_host_bytes += n;
+        return p;
+    }
+    void *p = NULL;
+    cudaError_t err = cudaMalloc(&p, n ? n : 1);
+    if (err != cudaSuccess) ink_die("resident arena: cudaMalloc failed (device out of memory?)");
+    g_resident_device_bytes += n;
+    return p;
+}
+
+/* cudaMemcpyDefault: works for host<-host and device<-host alike under
+ * unified virtual addressing (this file already requires
+ * cudaDevAttrPageableMemoryAccess==1, so UVA is guaranteed present). */
+static void ink_cuda_resident_copy(void *dst, const void *src, size_t n) {
+    CUDA_CHECK(cudaMemcpy(dst, src, n, cudaMemcpyDefault));
+}
+
 static void ink_make_resident(ink_model *m, uint64_t budget_bytes) {
-    uint64_t total = 0;
-    for (uint64_t i = 0; i < m->gg.n_tensors; i++) total += ink_tensor_bytes(&m->gg.tensors[i]);
+    uint64_t total = 0, host_est = 0;
+    for (uint64_t i = 0; i < m->gg.n_tensors; i++) {
+        const ink_tensor *t = &m->gg.tensors[i];
+        uint64_t nb = ink_tensor_bytes(t);
+        total += nb;
+        if (t->type == INK_T_F32 || t == m->tok_embd) host_est += nb;
+    }
     uint64_t want = budget_bytes ? (budget_bytes < total ? budget_bytes : total) : total;
+    /* Host-RAM check only covers the F32+token_embd slice that actually
+     * lands in host malloc() -- the rest goes to cudaMalloc device memory,
+     * which doesn't compete with host RAM.  host_est is computed over ALL
+     * tensors regardless of --resident-budget (a conservative upper bound:
+     * budget only ever shrinks what's copied, in file order, never grows
+     * it), so this can only over-estimate host pressure, never under. */
     uint64_t avail = ink_sys_available_bytes();
     const uint64_t margin = 4ull << 30;
-    if (avail && want + margin > avail) {
-        fprintf(stderr, "ds4-inkling-cuda: FATAL --resident budget does not fit: "
-                "need %.1f GiB + %.1f GiB margin, MemAvailable %.1f GiB\n",
-                want / 1073741824.0, margin / 1073741824.0, avail / 1073741824.0);
+    if (avail && host_est + margin > avail) {
+        fprintf(stderr, "ds4-inkling-cuda: FATAL --resident host slice does not fit: "
+                "need %.1f GiB (F32 + token_embd) + %.1f GiB margin, MemAvailable %.1f GiB\n",
+                host_est / 1073741824.0, margin / 1073741824.0, avail / 1073741824.0);
         exit(2);
     }
+    /* Best-effort device free-memory check for the rest (quantized weight
+     * matrices); soft (warn, don't exit) since cudaMemGetInfo's notion of
+     * "free" can be conservative on unified-memory systems and the
+     * per-tensor cudaMalloc in ink_cuda_resident_alloc_ex will die loudly
+     * with a clear message if it actually fails. */
+    size_t dev_free = 0, dev_total = 0;
+    if (cudaMemGetInfo(&dev_free, &dev_total) == cudaSuccess) {
+        uint64_t device_est = want > host_est ? want - host_est : 0;
+        if (device_est + margin > dev_free) {
+            fprintf(stderr, "ds4-inkling-cuda: WARNING --resident device slice may not fit: "
+                    "want ~%.1f GiB, device free %.1f GiB (will fail loudly if it doesn't)\n",
+                    device_est / 1073741824.0, dev_free / 1073741824.0);
+        }
+    }
+
+    g_resident_tok_embd = m->tok_embd;
+    g_resident_device_bytes = 0;
+    g_resident_host_bytes = 0;
     double t0 = ink_now_sec();
     uint64_t n_res = 0;
-    uint64_t copied = ink_model_make_resident(m, budget_bytes, ink_cuda_managed_alloc, &n_res);
+    uint64_t copied = ink_model_make_resident_ex(m, budget_bytes, ink_cuda_resident_alloc_ex,
+                                                  ink_cuda_resident_copy, &n_res);
     fprintf(stderr, "ds4-inkling-cuda: resident %.1f GiB in %llu/%llu tensors "
-            "(managed memory) in %.1fs%s\n",
+            "(%.1f GiB device / %.1f GiB host) in %.1fs%s\n",
             copied / 1073741824.0, (unsigned long long)n_res,
-            (unsigned long long)m->gg.n_tensors, ink_now_sec() - t0,
+            (unsigned long long)m->gg.n_tensors,
+            g_resident_device_bytes / 1073741824.0, g_resident_host_bytes / 1073741824.0,
+            ink_now_sec() - t0,
             budget_bytes && copied < total ? " [PARTIAL: rest stays mmap-paged]" : "");
 }
 
@@ -1567,10 +1722,81 @@ static void ink_bench_one_tensor(const char *name, const ink_tensor *t, const ui
     cudaFree(mbase); cudaFree(mx); cudaFree(my);
 }
 
-static int ink_run_bench_layers(const char *model_path, int layer) {
+/* M8: time the grouped kernel itself, at the real decode shape (6 routed
+ * experts, blockIdx.y grouping) instead of only single-tensor matvecs --
+ * this is the number the M8 report is actually about (group-matvec is the
+ * measured decode bottleneck).  When `resident_active` is false (default),
+ * behaves like ink_bench_one_tensor: copies the 6 experts' contiguous byte
+ * range into one cudaMallocManaged arena so timing is independent of disk/
+ * mmap page faults.  When true (--resident was also requested), benches
+ * directly against the tensor's already-resident data pointer (whatever
+ * arena ink_make_resident put it in -- device cudaMalloc for a non-F32
+ * tensor like gate_exps/down_exps under the M8 arena-split rule) instead
+ * of making a redundant managed copy, so the number reflects the arena
+ * that's actually in play. */
+static void ink_bench_group6(const char *name, const ink_tensor *t, const uint8_t *live_base,
+                              uint64_t in, uint64_t out, size_t row_bytes, bool resident_active) {
+    const uint32_t NG = 6;
+    size_t span = (size_t)NG * out * row_bytes;
+
+    uint8_t *mbase = NULL;
+    const uint8_t *base_for_bench = live_base;
+    if (!resident_active) {
+        mbase = (uint8_t *)ink_cuda_managed_alloc(span);
+        if (!mbase) { fprintf(stderr, "  (skip %s-group6: cudaMallocManaged failed)\n", name); return; }
+        memcpy(mbase, live_base, span);
+        base_for_bench = mbase;
+    }
+
+    float *mx = (float *)ink_cuda_managed_alloc(in * sizeof(float));
+    if (!mx) { fprintf(stderr, "  (skip %s-group6: cudaMallocManaged failed)\n", name); if (mbase) cudaFree(mbase); return; }
+    ink_fill_rand(mx, in, 0xBEEF03u);
+
+    const uint8_t *bases[6];
+    const float *xs[6];
+    float *ys[6];
+    for (uint32_t g = 0; g < NG; g++) {
+        bases[g] = base_for_bench + (size_t)g * out * row_bytes;
+        xs[g] = mx;
+        ys[g] = (float *)ink_cuda_managed_alloc(out * sizeof(float));
+        if (!ys[g]) { fprintf(stderr, "  (skip %s-group6: cudaMallocManaged failed)\n", name); return; }
+    }
+
+    for (int i = 0; i < 5; i++) ink_cuda_matvec_group(t, bases, in, out, xs, ys, NG);
+    ink_cuda_sync();
+
+    double total_ms = 0.0;
+    for (int i = 0; i < 20; i++) {
+        cudaEvent_t s, e;
+        CUDA_CHECK(cudaEventCreate(&s));
+        CUDA_CHECK(cudaEventCreate(&e));
+        CUDA_CHECK(cudaEventRecord(s, g_stream));
+        ink_cuda_matvec_group(t, bases, in, out, xs, ys, NG);
+        CUDA_CHECK(cudaEventRecord(e, g_stream));
+        CUDA_CHECK(cudaEventSynchronize(e));
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, s, e));
+        total_ms += ms;
+        cudaEventDestroy(s);
+        cudaEventDestroy(e);
+    }
+    double ms_per = total_ms / 20.0;
+    size_t be = ink_type_block_elems(t->type), bb = ink_type_block_bytes(t->type);
+    size_t bytes = (size_t)NG * out * (in / be) * bb;
+    double gbps = ms_per > 0 ? (bytes / 1.0e9) / (ms_per / 1000.0) : 0.0;
+    printf("%-24s type=%2u bytes=%-12zu ms/iter=%.4f GB/s=%.2f arena=%s\n",
+           name, t->type, bytes, ms_per, gbps, resident_active ? "resident" : "managed");
+
+    for (uint32_t g = 0; g < NG; g++) cudaFree(ys[g]);
+    cudaFree(mx);
+    if (mbase) cudaFree(mbase);
+}
+
+static int ink_run_bench_layers(const char *model_path, int layer, bool resident, uint64_t resident_budget) {
     ink_model m;
     ink_model_open(&m, model_path, 8);
     if (layer < 0 || (uint32_t)layer >= m.n_layer) ink_die("--bench-layers LAYER out of range");
+    if (resident) ink_make_resident(&m, resident_budget);
     ink_layer *l = &m.layers[layer];
 
     uint64_t n_embd = m.n_embd;
@@ -1606,6 +1832,13 @@ static int ink_run_bench_layers(const char *model_path, int layer) {
             ink_bench_one_tensor(nm, l->up_exps, l->up_exps->data + (size_t)e * nf * u_rb, n_embd, nf);
             snprintf(nm, sizeof(nm), "down_exps[%llu]", (unsigned long long)e);
             ink_bench_one_tensor(nm, l->down_exps, l->down_exps->data + (size_t)e * n_embd * d_rb, nf, n_embd);
+        }
+
+        if (nE >= 6) {
+            printf("--- grouped (6-expert, real decode shape) ---\n");
+            ink_bench_group6("gate_exps", l->gate_exps, l->gate_exps->data, n_embd, nf, g_rb, resident);
+            ink_bench_group6("up_exps",   l->up_exps,   l->up_exps->data,   n_embd, nf, u_rb, resident);
+            ink_bench_group6("down_exps", l->down_exps, l->down_exps->data, nf, n_embd, d_rb, resident);
         }
     }
     return 0;
@@ -1761,7 +1994,7 @@ int main(int argc, char **argv) {
     }
 
     if (bench_layers_layer >= 0) {
-        return ink_run_bench_layers(model_path, bench_layers_layer);
+        return ink_run_bench_layers(model_path, bench_layers_layer, resident, resident_budget);
     }
 
     if (!prompt) {
