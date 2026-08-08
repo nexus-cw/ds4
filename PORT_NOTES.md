@@ -194,3 +194,49 @@ never touched; the 82GB model was never made resident (deferred, below).
   t/s and decode t/s as DS4_PREFILL_TPS_REFERENCE /
   DS4_DECODE_TPS_REFERENCE candidates; restart ds4-server and curl
   capabilities for 200.
+
+## M5: true resident mode (2026-08-08)
+
+Root cause of the window failure (evidence-based hypothesis, not fully
+reproduced): the v1 GPU path dereferenced file-backed mmap pages
+directly via pageable memory access. In the prefaulted, memory-
+saturated state (82GB of page cache on a 128GB unified-memory box) the
+kernel reclaims and refaults those pages continuously; GPU ATS reads
+racing reclaim returned bad data, NaNs propagated through the forward,
+and the (then-unguarded) argmax over an all-NaN/-inf vector emitted
+token id 0 with logit -inf. Under production-normal memory the same
+binary is correct — mmap-paged GPU reads only fail near saturation.
+Active reproduction (re-saturating memory under production) was
+deliberately not attempted. Owned memory removes the failure class.
+
+Changes:
+- `--resident` (ds4-inkling-cuda): copies every tensor into
+  cudaMallocManaged memory once at load, then the forward never touches
+  the file mapping. `--resident-budget GiB` makes a tensor prefix
+  resident and pages the rest (validation mode). Load fails loudly if
+  the request does not fit MemAvailable + 4 GiB margin.
+- `--resident` (ds4-inkling-server): same via malloc (CPU path).
+- `ink_logits_guard`: every decode (CPU CLI, GPU CLI, server) now
+  aborts with a corruption diagnostic on NaN-poisoned or all--inf
+  logits instead of silently emitting token 0. Exit code 3.
+
+Validation under production (robo-dog, serving untouched):
+- `--resident-budget 6`: resident 6.0 GiB in 256/960 tensors (20.8s
+  copy-in), then exact parity: ids 12650/13/12650 with logits matching
+  the M3 run to the last digit. Copy-in + mixed resident/paged forward
+  both correct.
+- Full 82GB resident not run here (does not fit beside production).
+
+Window rerun invocation (update /data/gguf/inkling-window.sh):
+  1. sudo systemctl stop ds4-server
+  2. cd /home/jacinta/src/ds4 && env OMP_NUM_THREADS=8 \
+       ./ds4-inkling-cuda -m /data/gguf/inkling/Inkling-Small-UD-IQ2_XXS.gguf \
+       -p "The capital of France is" -n 5 -c 512 --resident \
+       > /data/gguf/inkling-window-m5.log 2>&1
+     (NO cat-prefault step: --resident does the one-time streamed
+     copy-in itself, ~3-5 min from SATA; expect a "resident 76.x GiB in
+     960/960 tensors" line. Parity bar: " Paris" "." " Paris" " is"
+     " the". Any corruption now aborts with exit 3 instead of token 0.)
+  3. Benchmark: append a second run with the ~300-token prompt and
+     -n 64 -c 512 --resident; report prefill s and decode s/token.
+  4. sudo systemctl start ds4-server && curl -s localhost:8080/v1/... 200.
