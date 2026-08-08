@@ -293,3 +293,60 @@ plus bench self-reporting):
     > /data/gguf/inkling-window-m6b.log 2>&1
   Parity bar unchanged (" Paris" "." " Paris" " is" " the"); the bench
   report at exit gives per-stage ms + GB/s for the before/after table.
+
+## M7: decode-path round 2 (2026-08-08)
+
+Why decode didn't improve in M6: not bandwidth. Measured GB10 read
+ceilings (2GiB grid-stride sum, in-binary --bench-membw + standalone
+probe agree): cudaMallocManaged host-touched 162-164 GB/s, cudaMalloc
+225-237 GB/s, plain malloc (ATS) 165 GB/s. The 27.7/15.3 GB/s pool
+rates in the M6 window were launch+sync overhead: ink_forward_gpu
+issued ~785 kernel launches per decode token, each wrapper ending in
+cudaDeviceSynchronize (~100us+ apiece on Grace) because host-side
+rmsnorm/silu/rel-projection/residual math sat between GPU ops.
+
+Changes: single CUDA stream, wrappers no longer sync; rmsnorm (vector +
+per-head), silu-mul (+gamma variant), residual add, scale,
+rel-projection, and MoE weighted-accumulate became device kernels; KV
+cache writes are stream-ordered copy kernels; host syncs per decode
+token: 1 per MoE layer (top-k routing qsort) + 1 final = ~41, from 785.
+Gate+up+silu fused into fewer grouped launches. Bench report split into
+prefill/decode phase tables (--bench itself re-adds per-launch syncs
+for attribution, so async wins show only in plain wall-clock). Core
+gained ink_model_make_resident_ex (per-tensor allocator choice) so a
+follow-up can place big quant tensors in cudaMalloc (+45% streaming vs
+managed) while host-read tensors (token_embd/gscale/exp_probs_b) stay
+host-accessible - NOT yet wired into --resident.
+
+Two real bugs found by the gate during M7 (both committed as fixes):
+1. Stale-KV race: cudaMemcpyAsync between two pageable host pointers
+   executes synchronously on the calling thread, jumping ahead of the
+   queued sconv/k-norm kernels producing the source; the KV cache read
+   stale data and parity broke (' Paris' -> 'es'). Fixed with a
+   stream-ordered copy kernel.
+2. Use-after-free: per-layer MoE host temporaries were freed while
+   queued kernels still read them (heap corruption). Hoisted to
+   per-forward-call lifetime, freed after the final sync.
+
+Validation (production untouched): selftest matrix all 9 types +
+matmat + grouped PASS; paged e2e parity exact 5/5 (' Paris . Paris is
+the', logits within 2e-5 of CPU); partial-resident (6GiB) parity exact
+with phase-split bench working. Paged decode wall-clock 26-43s/token
+vs 41-81s in M6 under similar cache state (disk-bound; indicative
+only).
+
+Projected resident decode: bytes/token ~2.4GiB; with the sync wall
+removed (785 -> 41) and managed streaming measured at 162 GB/s, decode
+lands at 10-25 t/s depending on the true grouped-kernel rate at decode
+shapes (medium confidence in >=10 t/s; the remaining unknown is kernel
+efficiency, not overhead or bandwidth). If the window still shows the
+group pool slow, next levers are cudaMalloc placement via
+make_resident_ex and IQ2_XXS load vectorization.
+
+M7 window invocation (operator verification): TWO runs -
+  a) plain wall-clock (the real numbers):
+     env OMP_NUM_THREADS=8 ./ds4-inkling-cuda -m .../Inkling-Small-UD-IQ2_XXS.gguf \
+       -p "<300-token prompt>" -n 64 -c 512 --resident > inkling-window-m7a.log 2>&1
+  b) attribution (per-launch syncs forced, slower, per-phase tables):
+     same with INK_BENCH=1 > inkling-window-m7b.log 2>&1
+  Plus the 5-token parity bar first (" Paris" "." " Paris" " is" " the").
