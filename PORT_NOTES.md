@@ -350,3 +350,46 @@ M7 window invocation (operator verification): TWO runs -
   b) attribution (per-launch syncs forced, slower, per-phase tables):
      same with INK_BENCH=1 > inkling-window-m7b.log 2>&1
   Plus the 5-token parity bar first (" Paris" "." " Paris" " is" " the").
+
+## M8: group-matvec gap (2026-08-08)
+
+Changes: vectorized hot dequants (IQ2_XXS u32-pair header loads,
+IQ3_XXS u32, Q6_K 16 u32 loads with folded qsel addressing), sign
+application via IEEE sign-bit XOR (bitwise identical to *-1.f), float4
+X reads in the warp-dot loop; --resident now splits the arena via
+make_resident_ex: non-F32 tensors (minus token_embd) -> cudaMalloc,
+F32/host-read -> host malloc, boot line prints the GiB split;
+--bench-layers adds the 6-expert grouped launch at real decode shape;
+bench copy-in via UVA cudaMemcpy (device-arena tensors faulted host
+memcpy); decode/prefill prints now ms-resolution.
+
+Kernel before/after at decode shapes (bench-layers, layer 2):
+  IQ2_XXS single 22-24 -> 62 GB/s; IQ3_XXS 38 -> 75 (managed) / 98
+  (device arena); grouped 6-expert: gate/up 47-54 GB/s, down 42-45 --
+  ~identical managed vs device arena, so the grouped path is now
+  COMPUTE-bound (dequant ALU), not placement- or bandwidth-bound.
+  Window-effective baseline for the same pool was 28 GB/s.
+
+Decode arithmetic/token from measured rates: routed grouped ~39ms +
+Q5_K pool ~26ms + Q6_K ~5ms + head ~5-7ms + router/attention/sconv/
+sync ~9ms => ~84-90ms/token, ~11-12 t/s. Confidence medium-high for
+the >=10 t/s bar (every component measured at decode shape; residual
+risk is end-to-end interference). Next lever if the window disagrees:
+the grouped kernel lacks the float4/shared-X treatment of the single
+matvec path, and IQ2_XXS dequant ALU (grid+sign unpack) is the
+per-weight cost floor.
+
+Gate: selftest matrix all types + matmat + grouped PASS (float4
+reassociation tightened gpu_vs_ref to ~2e-6); paged parity exact;
+partial-resident split-arena parity exact (5.5 GiB device / 0.5 GiB
+host boot line confirmed). One paged run hit the known
+warm-cache/reclaim NaN class (prefill 19s = fully cached = saturated);
+guard aborted correctly; cold rerun exact. Full residency remains the
+fix for that class.
+
+M8 window invocation: unchanged from M7 (parity bar, then plain
+wall-clock run a, then INK_BENCH=1 run b) -- the binary now prints
+ms-resolution decode lines, and with --resident expect the boot line
+"resident 76.x GiB in 960/960 tensors (NN.N GiB device / NN.N GiB
+host)". Watch device-free: the WARNING line is advisory; cudaMalloc
+failure dies loudly.
