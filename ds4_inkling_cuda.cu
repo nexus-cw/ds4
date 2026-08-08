@@ -811,6 +811,52 @@ static int ink_run_selftest(const char *model_path, int layer) {
     return all_pass ? 0 : 1;
 }
 
+/* --resident: copy tensors out of the file-backed mmap into managed
+ * memory owned by us.  Root cause: GPU pageable access over file-backed
+ * mmap returned bad data under page-cache saturation/reclaim (see
+ * PORT_NOTES.md, resident window 2026-08-08); owned memory sidesteps
+ * file-backed residency entirely. */
+static void *ink_cuda_managed_alloc(size_t n) {
+    void *p = NULL;
+    cudaError_t err = cudaMallocManaged(&p, n, cudaMemAttachGlobal);
+    if (err != cudaSuccess) return NULL;
+    return p;
+}
+
+static uint64_t ink_sys_available_bytes(void) {
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char line[256];
+    uint64_t kb = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "MemAvailable: %llu kB", (unsigned long long *)&kb) == 1) break;
+    }
+    fclose(f);
+    return kb * 1024;
+}
+
+static void ink_make_resident(ink_model *m, uint64_t budget_bytes) {
+    uint64_t total = 0;
+    for (uint64_t i = 0; i < m->gg.n_tensors; i++) total += ink_tensor_bytes(&m->gg.tensors[i]);
+    uint64_t want = budget_bytes ? (budget_bytes < total ? budget_bytes : total) : total;
+    uint64_t avail = ink_sys_available_bytes();
+    const uint64_t margin = 4ull << 30;
+    if (avail && want + margin > avail) {
+        fprintf(stderr, "ds4-inkling-cuda: FATAL --resident budget does not fit: "
+                "need %.1f GiB + %.1f GiB margin, MemAvailable %.1f GiB\n",
+                want / 1073741824.0, margin / 1073741824.0, avail / 1073741824.0);
+        exit(2);
+    }
+    double t0 = ink_now_sec();
+    uint64_t n_res = 0;
+    uint64_t copied = ink_model_make_resident(m, budget_bytes, ink_cuda_managed_alloc, &n_res);
+    fprintf(stderr, "ds4-inkling-cuda: resident %.1f GiB in %llu/%llu tensors "
+            "(managed memory) in %.1fs%s\n",
+            copied / 1073741824.0, (unsigned long long)n_res,
+            (unsigned long long)m->gg.n_tensors, ink_now_sec() - t0,
+            budget_bytes && copied < total ? " [PARTIAL: rest stays mmap-paged]" : "");
+}
+
 int main(int argc, char **argv) {
     const char *model_path = NULL;
     const char *prompt = NULL;
@@ -818,6 +864,8 @@ int main(int argc, char **argv) {
     uint32_t n_ctx = 512;
     bool dump_tokens = false;
     int selftest_layer = -1;
+    bool resident = false;
+    uint64_t resident_budget = 0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) model_path = argv[++i];
@@ -826,14 +874,19 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-c") && i + 1 < argc) n_ctx = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dump-tokens")) dump_tokens = true;
         else if (!strcmp(argv[i], "--selftest") && i + 1 < argc) selftest_layer = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--resident")) resident = true;
+        else if (!strcmp(argv[i], "--resident-budget") && i + 1 < argc) {
+            resident = true;
+            resident_budget = (uint64_t)(atof(argv[++i]) * 1073741824.0);
+        }
         else {
-            fprintf(stderr, "usage: ds4-inkling-cuda -m model.gguf -p prompt [-n N] [-c CTX] [--dump-tokens]\n");
+            fprintf(stderr, "usage: ds4-inkling-cuda -m model.gguf -p prompt [-n N] [-c CTX] [--resident] [--resident-budget GiB] [--dump-tokens]\n");
             fprintf(stderr, "       ds4-inkling-cuda -m model.gguf --selftest LAYER\n");
             return 1;
         }
     }
     if (!model_path) {
-        fprintf(stderr, "usage: ds4-inkling-cuda -m model.gguf -p prompt [-n N] [-c CTX] [--dump-tokens]\n");
+        fprintf(stderr, "usage: ds4-inkling-cuda -m model.gguf -p prompt [-n N] [-c CTX] [--resident] [--resident-budget GiB] [--dump-tokens]\n");
         fprintf(stderr, "       ds4-inkling-cuda -m model.gguf --selftest LAYER\n");
         return 1;
     }
@@ -845,7 +898,7 @@ int main(int argc, char **argv) {
     }
 
     if (!prompt) {
-        fprintf(stderr, "usage: ds4-inkling-cuda -m model.gguf -p prompt [-n N] [-c CTX] [--dump-tokens]\n");
+        fprintf(stderr, "usage: ds4-inkling-cuda -m model.gguf -p prompt [-n N] [-c CTX] [--resident] [--resident-budget GiB] [--dump-tokens]\n");
         return 1;
     }
 
@@ -854,6 +907,7 @@ int main(int argc, char **argv) {
     ink_model_open(&m, model_path, n_ctx);
     fprintf(stderr, "ds4-inkling-cuda: loaded %s (%u layers, %u dense, vocab %u) in %.1fs\n",
             model_path, m.n_layer, m.n_dense, m.n_vocab, ink_now_sec() - t0);
+    if (resident) ink_make_resident(&m, resident_budget);
 
     ink_ids ids = {0};
     ink_tokenize(&m.tk, prompt, &ids);
@@ -886,6 +940,7 @@ int main(int argc, char **argv) {
     int pos = ids.len;
     char buf[512];
     for (int t = 0; t < n_predict; t++) {
+        ink_logits_guard(logits, m.n_vocab, m.n_vocab_unpadded, "gpu decode");
         int best = 0;
         float bestv = -INFINITY;
         for (uint32_t i = 0; i < m.n_vocab; i++) {

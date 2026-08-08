@@ -147,6 +147,22 @@ const float *ink_f32(const ink_tensor *t);
 
 /* model */
 void ink_model_open(ink_model *m, const char *path, uint32_t n_ctx);
+/* Copy tensor data out of the file-backed mmap into owned memory
+ * allocated with alloc_fn (malloc, cudaMallocManaged, ...), repointing
+ * tensor->data.  Tensors are made resident in file order until
+ * budget_bytes is exhausted (0 = everything).  Returns bytes copied;
+ * *n_resident_out (optional) gets the tensor count made resident.
+ * Dies loudly if alloc_fn fails. */
+uint64_t ink_model_make_resident(ink_model *m, uint64_t budget_bytes,
+                                 void *(*alloc_fn)(size_t),
+                                 uint64_t *n_resident_out);
+/* Total bytes of one tensor's data. */
+uint64_t ink_tensor_bytes(const ink_tensor *t);
+/* Die with a diagnostic if the logits vector is NaN-poisoned or the
+ * unpadded range is entirely -inf (both mean upstream data corruption:
+ * never silently emit token 0). */
+void ink_logits_guard(const float *logits, uint32_t n_vocab,
+                      uint32_t n_unpadded, const char *where);
 /* Process n_tok tokens starting at absolute position pos0 (KV/conv state
  * must already cover [0, pos0)).  If out_logits != NULL, logits of the
  * LAST token are written (n_vocab floats). */

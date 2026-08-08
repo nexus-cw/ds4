@@ -1346,6 +1346,56 @@ void ink_forward(ink_model *m, int token, uint32_t pos, float *out_logits) {
     ink_forward_batch(m, &token, 1, pos, out_logits);
 }
 
+/* ================= resident arena + logits guard ==================== */
+
+uint64_t ink_tensor_bytes(const ink_tensor *t) {
+    uint64_t elems = 1;
+    for (uint32_t d = 0; d < t->ndim; d++) elems *= t->dims[d];
+    size_t be = ink_type_block_elems(t->type);
+    size_t bb = ink_type_block_bytes(t->type);
+    if (elems % be) ink_die("tensor size not block aligned");
+    return elems / be * bb;
+}
+
+uint64_t ink_model_make_resident(ink_model *m, uint64_t budget_bytes,
+                                 void *(*alloc_fn)(size_t),
+                                 uint64_t *n_resident_out) {
+    uint64_t copied = 0, n_res = 0;
+    for (uint64_t i = 0; i < m->gg.n_tensors; i++) {
+        ink_tensor *t = &m->gg.tensors[i];
+        uint64_t nb = ink_tensor_bytes(t);
+        if (budget_bytes && copied + nb > budget_bytes) continue;
+        void *dst = alloc_fn((size_t)nb);
+        if (!dst) ink_die("resident arena allocation failed (budget too small for system?)");
+        memcpy(dst, t->data, (size_t)nb);
+        t->data = (const uint8_t *)dst;
+        copied += nb;
+        n_res++;
+    }
+    if (n_resident_out) *n_resident_out = n_res;
+    return copied;
+}
+
+void ink_logits_guard(const float *logits, uint32_t n_vocab,
+                      uint32_t n_unpadded, const char *where) {
+    uint32_t lim = (n_unpadded && n_unpadded < n_vocab) ? n_unpadded : n_vocab;
+    uint32_t nans = 0;
+    float best = -INFINITY;
+    for (uint32_t i = 0; i < lim; i++) {
+        float v = logits[i];
+        if (isnan(v)) nans++;
+        else if (v > best) best = v;
+    }
+    if (nans || !isfinite(best)) {
+        fprintf(stderr,
+            "ds4-inkling: FATAL logits corruption at %s: %u NaN of %u, max finite logit %g\n"
+            "ds4-inkling: refusing to sample (this indicates bad weight reads, e.g.\n"
+            "ds4-inkling: GPU pageable access over file-backed mmap under reclaim; use --resident)\n",
+            where, nans, lim, (double)best);
+        exit(3);
+    }
+}
+
 /* ====================== state reset / snapshot ======================= */
 
 void ink_state_reset(ink_model *m) {
@@ -1496,6 +1546,7 @@ int main(int argc, char **argv) {
     int pos = ids.len;
     char buf[512];
     for (int t = 0; t < n_predict; t++) {
+        ink_logits_guard(logits, m.n_vocab, m.n_vocab_unpadded, "cli decode");
         /* greedy argmax */
         int best = 0;
         float bestv = -INFINITY;

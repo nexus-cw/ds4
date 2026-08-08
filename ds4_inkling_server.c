@@ -704,6 +704,8 @@ static void handle_chat_completions(int fd, const char *body, size_t body_len) {
     uint32_t pos = (uint32_t)ids.len;
 
     for (long t = 0; t < max_tokens; t++) {
+        /* dies loudly on NaN-poisoned or all -inf logits: never emit token 0 */
+        ink_logits_guard(logits, g_model.n_vocab, g_model.n_vocab_unpadded, "server decode");
         int tok = (temperature <= 0.0) ? argmax_logits(logits, g_model.n_vocab)
                                         : sample_logits(logits, g_model.n_vocab, temperature);
         completion_tokens++;
@@ -780,19 +782,21 @@ int main(int argc, char **argv) {
     uint32_t n_ctx = 4096;
     int port = 8090;
     uint32_t max_tokens_cap = 512;
+    bool resident = false;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) model_path = argv[++i];
         else if (!strcmp(argv[i], "-c") && i + 1 < argc) n_ctx = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "-p") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-t") && i + 1 < argc) max_tokens_cap = (uint32_t)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--resident")) resident = true;
         else {
-            fprintf(stderr, "usage: ds4-inkling-server -m model.gguf [-c CTX] [-p PORT] [-t MAX_TOKENS_CAP]\n");
+            fprintf(stderr, "usage: ds4-inkling-server -m model.gguf [-c CTX] [-p PORT] [-t MAX_TOKENS_CAP] [--resident]\n");
             return 1;
         }
     }
     if (!model_path) {
-        fprintf(stderr, "usage: ds4-inkling-server -m model.gguf [-c CTX] [-p PORT] [-t MAX_TOKENS_CAP]\n");
+        fprintf(stderr, "usage: ds4-inkling-server -m model.gguf [-c CTX] [-p PORT] [-t MAX_TOKENS_CAP] [--resident]\n");
         return 1;
     }
     g_max_tokens_cap = max_tokens_cap;
@@ -808,6 +812,12 @@ int main(int argc, char **argv) {
 
     double t0 = ink_now_sec();
     ink_model_open(&g_model, model_path, n_ctx);
+    if (resident) {
+        uint64_t n_res = 0;
+        uint64_t nb = ink_model_make_resident(&g_model, 0, malloc, &n_res);
+        fprintf(stderr, "ds4-inkling-server: resident %.1f GiB in %llu tensors\n",
+                nb / 1073741824.0, (unsigned long long)n_res);
+    }
     fprintf(stderr, "ds4-inkling-server: loaded %s (%u layers, vocab %u, ctx %u) in %.1fs\n",
             model_path, g_model.n_layer, g_model.n_vocab, g_model.n_ctx, ink_now_sec() - t0);
 
