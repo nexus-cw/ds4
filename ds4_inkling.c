@@ -1560,7 +1560,7 @@ int main(int argc, char **argv) {
             bool last = i + n == ids.len;
             ink_forward_batch(&m, ids.ids + i, (uint32_t)n, (uint32_t)i,
                               last ? logits : NULL);
-            fprintf(stderr, "prefill %d..%d/%d: %.1fs\n", i, i + n, ids.len, now_sec() - ts);
+            fprintf(stderr, "prefill %d..%d/%d: %.2fs\n", i, i + n, ids.len, now_sec() - ts);
         }
     }
 
@@ -1586,7 +1586,7 @@ int main(int argc, char **argv) {
         if (t + 1 == n_predict) break;
         double ts = now_sec();
         ink_forward(&m, best, (uint32_t)pos++, logits);
-        fprintf(stderr, "decode %d: %.1fs\n", t + 1, now_sec() - ts);
+        fprintf(stderr, "decode %d: %.3fs\n", t + 1, now_sec() - ts);
     }
     if (lf) fclose(lf);
     return 0;
