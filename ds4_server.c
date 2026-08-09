@@ -13043,6 +13043,10 @@ static void buf_html_escape(buf *b, const char *s) {
  * template halves so the section is correct with JavaScript disabled; JS
  * only adds the live ACTIVITY view (polling /v1/activity) and host-filled
  * CONNECT snippets. */
+static bool sidecar_path_for(const char *gguf, char *out, size_t out_sz);
+static bool sidecar_get(const char *sidecar, const char *key,
+                        char *out, size_t out_sz);
+
 static bool send_console(server *s, int fd) {
     const ds4_capabilities *c = &s->caps;
     buf b = {0};
@@ -13067,6 +13071,33 @@ static bool send_console(server *s, int fd) {
         "</b></div><div class=\"kv ctx\"><span>context</span>"
         "<b>%d configured / %llu trained</b></div>",
         s->ctx_size, trained);
+
+    /* Active model's serving mode, from its sidecar (same rule as
+     * /v1/models/available): streamed flags -> batch, resident -> interactive,
+     * no sidecar -> unknown. */
+    {
+        const char *mode = "unknown";
+        char tps[24] = "";
+        char sc[PATH_MAX + 8], v[1024];
+        if (s->model_realpath[0] &&
+            sidecar_path_for(s->model_realpath, sc, sizeof(sc)) &&
+            access(sc, R_OK) == 0) {
+            const bool streamed =
+                sidecar_get(sc, "DS4_EXTRA_FLAGS", v, sizeof(v)) &&
+                strstr(v, "--ssd-streaming") != NULL;
+            mode = streamed ? "batch" : "interactive";
+            sidecar_get(sc, "DS4_DECODE_TPS_REFERENCE", tps, sizeof(tps));
+        }
+        buf_printf(&b,
+            "<div class=\"kv\"><span>mode</span>"
+            "<b><i class=\"badge %s\">%s</i>", mode, mode);
+        if (tps[0]) {
+            buf_puts(&b, " ");
+            buf_html_escape(&b, tps);
+            buf_puts(&b, " t/s ref");
+        }
+        buf_puts(&b, "</b></div>");
+    }
 
     buf_puts(&b, ds4_console_html_tail);
     bool ok = http_response(fd, s->enable_cors, 200,
@@ -13238,8 +13269,92 @@ typedef struct {
     char quant[32];
     bool active;
     bool has_manifest;
+    bool has_sidecar;
     const char *loadable; /* "yes" | "no" | "unknown" */
+    const char *mode;     /* "interactive" | "batch" | "unknown" */
+    char mode_reason[160];
+    char decode_tps_reference[24]; /* numeric string, "" if none */
 } avail_model;
+
+/* Per-model sidecar env convention: "<model>.gguf.env" next to the gguf.
+ * KEY=VALUE lines (no quoting, no export); recognized keys:
+ *   DS4_CTX, DS4_CACHE_BUDGET, DS4_EXTRA_FLAGS   (applied on select)
+ *   DS4_DECODE_TPS_REFERENCE                     (reported, not applied)
+ * A select copies the launch keys into the unit env file so the restarted
+ * server runs the model's proven flags; the mode tag is derived from
+ * DS4_EXTRA_FLAGS (streamed vs resident). */
+static bool sidecar_path_for(const char *gguf, char *out, size_t out_sz) {
+    return snprintf(out, out_sz, "%s.env", gguf) < (int)out_sz;
+}
+
+/* Read one KEY= value from a sidecar env file.  Returns false if the file
+ * or key is absent.  Trailing newline/CR stripped; value may be empty. */
+static bool sidecar_get(const char *sidecar, const char *key,
+                        char *out, size_t out_sz) {
+    FILE *f = fopen(sidecar, "r");
+    if (!f) return false;
+    const size_t kl = strlen(key);
+    char line[2048];
+    bool found = false;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, key, kl) != 0 || line[kl] != '=') continue;
+        size_t vl = strlen(line + kl + 1);
+        while (vl > 0 && (line[kl + 1 + vl - 1] == '\n' ||
+                          line[kl + 1 + vl - 1] == '\r')) vl--;
+        if (vl >= out_sz) vl = out_sz - 1;
+        memcpy(out, line + kl + 1, vl);
+        out[vl] = '\0';
+        found = true; /* last occurrence wins, like the shell */
+    }
+    fclose(f);
+    return found;
+}
+
+/* Mode tag: honest and simple.  A sidecar records the model's proven launch
+ * flags; --ssd-streaming there means the model runs streamed (big-model
+ * capability, slow decode) -> batch.  A sidecar without it means the model
+ * runs resident (fast decode) -> interactive.  No sidecar, or an arch this
+ * binary cannot load -> unknown. */
+static void model_mode_classify(avail_model *m) {
+    m->mode = "unknown";
+    m->mode_reason[0] = '\0';
+    m->decode_tps_reference[0] = '\0';
+    char sc[PATH_MAX + 8];
+    if (!sidecar_path_for(m->path, sc, sizeof(sc))) return;
+    m->has_sidecar = access(sc, R_OK) == 0;
+    if (!m->has_sidecar) {
+        snprintf(m->mode_reason, sizeof(m->mode_reason),
+                 "no sidecar (.gguf.env absent): serving profile unknown");
+        return;
+    }
+    if (strcmp(m->loadable, "yes") != 0) {
+        snprintf(m->mode_reason, sizeof(m->mode_reason),
+                 "sidecar present but architecture is not loadable here");
+        return;
+    }
+    char v[1024];
+    const bool have_flags = sidecar_get(sc, "DS4_EXTRA_FLAGS", v, sizeof(v));
+    const bool streamed = have_flags && strstr(v, "--ssd-streaming") != NULL;
+    if (streamed) {
+        m->mode = "batch";
+        snprintf(m->mode_reason, sizeof(m->mode_reason),
+                 "sidecar flags use --ssd-streaming: experts stream from "
+                 "disk (big-model capability, slower decode)");
+    } else {
+        m->mode = "interactive";
+        snprintf(m->mode_reason, sizeof(m->mode_reason),
+                 "sidecar flags are resident (no --ssd-streaming): "
+                 "weights fit in memory, fast decode");
+    }
+    if (sidecar_get(sc, "DS4_DECODE_TPS_REFERENCE", v, sizeof(v))) {
+        char *end = NULL;
+        const double tps = strtod(v, &end);
+        if (end && end != v && *end == '\0' && tps > 0) {
+            snprintf(m->decode_tps_reference,
+                     sizeof(m->decode_tps_reference), "%.20s", v);
+        }
+    }
+}
 
 #define AVAIL_MODELS_MAX 256
 #define AVAIL_DIRS_MAX 16
@@ -13293,6 +13408,7 @@ static int scan_dir_for_models(server *s, const char *dir,
         snprintf(man, sizeof(man), "%.*s.accretion.manifest.json",
                  (int)(strlen(canon) - 5), canon);
         m->has_manifest = access(man, R_OK) == 0;
+        model_mode_classify(m);
     }
     closedir(d);
     return len;
@@ -13357,9 +13473,18 @@ static bool send_models_available(server *s, int fd) {
         json_escape(&b, m->quant);
         buf_puts(&b, ",\"architecture\":");
         json_escape(&b, m->architecture[0] ? m->architecture : "unknown");
-        buf_printf(&b, ",\"active\":%s,\"has_manifest\":%s,\"loadable\":\"%s\"}",
+        buf_printf(&b,
+                   ",\"active\":%s,\"has_manifest\":%s,\"has_sidecar\":%s,"
+                   "\"loadable\":\"%s\",\"mode\":\"%s\",\"mode_reason\":",
                    m->active ? "true" : "false",
-                   m->has_manifest ? "true" : "false", m->loadable);
+                   m->has_manifest ? "true" : "false",
+                   m->has_sidecar ? "true" : "false", m->loadable, m->mode);
+        json_escape(&b, m->mode_reason);
+        if (m->decode_tps_reference[0]) {
+            buf_printf(&b, ",\"decode_tps_reference\":%s",
+                       m->decode_tps_reference);
+        }
+        buf_putc(&b, '}');
     }
     buf_puts(&b, "]}\n");
     pthread_mutex_unlock(&scan_mu);
@@ -13390,9 +13515,12 @@ static bool select_body_path(const char *body, char *out, size_t out_sz) {
     return o > 0;
 }
 
-/* Rewrite (or append) the DS4_MODEL= line in the env file; tmp + rename. */
-static bool env_file_set_model(const char *env_file, const char *path,
-                               char *err, size_t err_sz) {
+/* Rewrite (or append) KEY= lines in the env file; tmp + rename.  Keys with
+ * a NULL value are left untouched. */
+#define ENV_SET_KVS_MAX 8
+static bool env_file_set_kvs(const char *env_file, const char *const *keys,
+                             const char *const *vals, int nkv,
+                             char *err, size_t err_sz) {
     FILE *f = fopen(env_file, "r");
     if (!f) {
         snprintf(err, err_sz, "cannot read %s: %s", env_file, strerror(errno));
@@ -13400,19 +13528,28 @@ static bool env_file_set_model(const char *env_file, const char *path,
     }
     buf nb = {0};
     char line[4096];
-    bool replaced = false;
+    bool replaced[ENV_SET_KVS_MAX] = {false};
     while (fgets(line, sizeof(line), f)) {
-        if (!strncmp(line, "DS4_MODEL=", 10)) {
-            buf_printf(&nb, "DS4_MODEL=%s\n", path);
-            replaced = true;
+        int hit = -1;
+        for (int i = 0; i < nkv; i++) {
+            const size_t kl = strlen(keys[i]);
+            if (vals[i] && !strncmp(line, keys[i], kl) && line[kl] == '=') {
+                hit = i;
+                break;
+            }
+        }
+        if (hit >= 0) {
+            buf_printf(&nb, "%s=%s\n", keys[hit], vals[hit]);
+            replaced[hit] = true;
         } else {
             buf_puts(&nb, line);
         }
     }
     fclose(f);
-    if (!replaced) {
+    for (int i = 0; i < nkv; i++) {
+        if (!vals[i] || replaced[i]) continue;
         if (nb.len && nb.ptr[nb.len - 1] != '\n') buf_putc(&nb, '\n');
-        buf_printf(&nb, "DS4_MODEL=%s\n", path);
+        buf_printf(&nb, "%s=%s\n", keys[i], vals[i]);
     }
     char tmp[PATH_MAX + 8];
     snprintf(tmp, sizeof(tmp), "%s.tmp", env_file);
@@ -13499,8 +13636,30 @@ static void handle_models_select(server *s, int fd, const http_request *hr) {
             "this binary cannot load that model's architecture");
         return;
     }
+    /* Compose the new unit environment: DS4_MODEL always; if the model has
+     * a sidecar (<gguf>.env), its launch keys override the base env file so
+     * the restarted server runs that model's proven flags.  DS4_CTX is only
+     * overridden when the sidecar sets it non-empty (an empty ${DS4_CTX}
+     * would leave --ctx eating the next argv word).  With a sidecar present,
+     * DS4_CACHE_BUDGET and DS4_EXTRA_FLAGS are written from it even when
+     * absent there (as empty), so streamed flags never leak onto a resident
+     * model.  Without a sidecar, only DS4_MODEL changes. */
+    char sc[PATH_MAX + 8];
+    char sc_ctx[64], sc_cache[64], sc_flags[1024];
+    const char *keys[4] = {"DS4_MODEL", "DS4_CTX", "DS4_CACHE_BUDGET",
+                           "DS4_EXTRA_FLAGS"};
+    const char *vals[4] = {hit->path, NULL, NULL, NULL};
+    if (sidecar_path_for(hit->path, sc, sizeof(sc)) &&
+        access(sc, R_OK) == 0) {
+        if (sidecar_get(sc, "DS4_CTX", sc_ctx, sizeof(sc_ctx)) && sc_ctx[0])
+            vals[1] = sc_ctx;
+        vals[2] = sidecar_get(sc, "DS4_CACHE_BUDGET", sc_cache,
+                              sizeof(sc_cache)) ? sc_cache : "";
+        vals[3] = sidecar_get(sc, "DS4_EXTRA_FLAGS", sc_flags,
+                              sizeof(sc_flags)) ? sc_flags : "";
+    }
     char err[512];
-    if (!env_file_set_model(s->env_file, hit->path, err, sizeof(err))) {
+    if (!env_file_set_kvs(s->env_file, keys, vals, 4, err, sizeof(err))) {
         pthread_mutex_unlock(&sel_mu);
         send_json_error(fd, s->enable_cors, 500, "env_write_failed", err);
         return;
