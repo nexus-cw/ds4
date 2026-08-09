@@ -1955,6 +1955,18 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) model_path = argv[++i];
         else if (!strcmp(argv[i], "-p") && i + 1 < argc) prompt = argv[++i];
+        else if (!strcmp(argv[i], "--prompt-file") && i + 1 < argc) {
+            FILE *pf = fopen(argv[++i], "rb");
+            if (!pf) ink_die("cannot open --prompt-file");
+            fseek(pf, 0, SEEK_END);
+            long pl = ftell(pf);
+            fseek(pf, 0, SEEK_SET);
+            char *pb = (char *)ink_malloc((size_t)pl + 1);
+            if (fread(pb, 1, (size_t)pl, pf) != (size_t)pl) ink_die("short read on --prompt-file");
+            pb[pl] = 0;
+            fclose(pf);
+            prompt = pb;
+        }
         else if (!strcmp(argv[i], "-n") && i + 1 < argc) n_predict = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-c") && i + 1 < argc) n_ctx = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dump-tokens")) dump_tokens = true;
