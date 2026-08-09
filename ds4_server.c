@@ -13363,6 +13363,15 @@ static void model_mode_classify(avail_model *m) {
 static const char *model_arch_loadable(const char *arch) {
     if (!arch[0]) return "unknown";
     if (!strcmp(arch, "glm-dsa") || !strcmp(arch, "deepseek4")) return "yes";
+    /* This binary cannot load inkling, but when the supervisor runs the
+     * accretion-serve arch wrapper (unit env ACCRETION_ARCH_WRAPPER=1), a
+     * select of an inkling model swaps to ds4-inkling-server via the same
+     * exit-42 restart: report it selectable, honestly gated on the wrapper
+     * actually being armed. */
+    if (!strcmp(arch, "inkling")) {
+        const char *w = getenv("ACCRETION_ARCH_WRAPPER");
+        return (w && w[0] && strcmp(w, "0") != 0) ? "yes" : "no";
+    }
     return "no";
 }
 
@@ -13646,9 +13655,17 @@ static void handle_models_select(server *s, int fd, const http_request *hr) {
      * model.  Without a sidecar, only DS4_MODEL changes. */
     char sc[PATH_MAX + 8];
     char sc_ctx[64], sc_cache[64], sc_flags[1024];
-    const char *keys[4] = {"DS4_MODEL", "DS4_CTX", "DS4_CACHE_BUDGET",
-                           "DS4_EXTRA_FLAGS"};
-    const char *vals[4] = {hit->path, NULL, NULL, NULL};
+    /* DS4_ARCH drives the accretion-serve wrapper: selecting an inkling
+     * model hands off to ds4-inkling-server on the swap restart; selecting
+     * a deepseek4-family model hands back.  The value comes from the
+     * model's GGUF architecture (authoritative), with the sidecar's
+     * DS4_ARCH honored if the header peek was inconclusive. */
+    char sc_arch[64];
+    const char *arch_val = "deepseek4";
+    if (!strcmp(hit->architecture, "inkling")) arch_val = "inkling";
+    const char *keys[5] = {"DS4_MODEL", "DS4_CTX", "DS4_CACHE_BUDGET",
+                           "DS4_EXTRA_FLAGS", "DS4_ARCH"};
+    const char *vals[5] = {hit->path, NULL, NULL, NULL, arch_val};
     if (sidecar_path_for(hit->path, sc, sizeof(sc)) &&
         access(sc, R_OK) == 0) {
         if (sidecar_get(sc, "DS4_CTX", sc_ctx, sizeof(sc_ctx)) && sc_ctx[0])
@@ -13657,9 +13674,14 @@ static void handle_models_select(server *s, int fd, const http_request *hr) {
                               sizeof(sc_cache)) ? sc_cache : "";
         vals[3] = sidecar_get(sc, "DS4_EXTRA_FLAGS", sc_flags,
                               sizeof(sc_flags)) ? sc_flags : "";
+        if (!hit->architecture[0] &&
+            sidecar_get(sc, "DS4_ARCH", sc_arch, sizeof(sc_arch)) &&
+            !strcmp(sc_arch, "inkling")) {
+            vals[4] = "inkling";
+        }
     }
     char err[512];
-    if (!env_file_set_kvs(s->env_file, keys, vals, 4, err, sizeof(err))) {
+    if (!env_file_set_kvs(s->env_file, keys, vals, 5, err, sizeof(err))) {
         pthread_mutex_unlock(&sel_mu);
         send_json_error(fd, s->enable_cors, 500, "env_write_failed", err);
         return;
