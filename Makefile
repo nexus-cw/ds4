@@ -435,6 +435,8 @@ ds4-inkling-cuda: ds4_inkling_cuda.cu ds4_inkling.c ds4_inkling.h ds4_inkling_ta
 	$(CC) -O2 -Wall -Wextra -fopenmp -DDS4_INKLING_NO_MAIN -c ds4_inkling.c -o ds4_inkling_lib.o
 	nvcc -O2 -o $@ ds4_inkling_cuda.cu ds4_inkling_lib.o -Xcompiler -fopenmp -lm
 
-# Standalone OpenAI-compatible HTTP server for the inkling engine.
+# Standalone OpenAI-compatible HTTP server for the inkling engine.  -pthread
+# for the single dedicated inference worker thread + per-connection network
+# threads (see the threading-model comment atop ds4_inkling_server.c).
 ds4-inkling-server: ds4_inkling_server.c ds4_inkling.c ds4_inkling.h ds4_inkling_tables.inc
-	$(CC) -O2 -Wall -Wextra -fopenmp -DDS4_INKLING_NO_MAIN -o $@ ds4_inkling_server.c ds4_inkling.c -lm
+	$(CC) -O2 -Wall -Wextra -fopenmp -DDS4_INKLING_NO_MAIN -pthread -o $@ ds4_inkling_server.c ds4_inkling.c -lm
