@@ -393,3 +393,70 @@ ms-resolution decode lines, and with --resident expect the boot line
 "resident 76.x GiB in 960/960 tensors (NN.N GiB device / NN.N GiB
 host)". Watch device-free: the WARNING line is advisory; cudaMalloc
 failure dies loudly.
+
+## M9: productization (2026-08-09)
+
+Served window decision: 65536 (interactive convention). KV math: 42
+layers x 2 x 1024 floats x 4B = 336 KiB/token -> 21.5 GiB at 65536,
++ ~5 MB conv states; with the 76.0 GiB device arena that is ~98 GiB of
+128, ~25 GiB headroom in a dedicated window. Long-window plumbing
+validated under production at -c 16384 with a 1294-token prompt
+(chunked batched prefill x11, SWA windows past pos 512, global rel
+extents; greedy continuation " Paris." of an "In summary, the capital
+of France is" tail). Full 65536 allocation is window-only (21.5 GiB
+KV does not fit beside production).
+
+Server hardening (ds4_inkling_server.c): FIFO slot pool (one worker
+thread owns the single engine state; slots bound queue depth, 503
+overloaded), OpenAI SSE streaming byte-compatible with ds4-server
+(role delta / content deltas / finish / optional usage / [DONE]),
+auth mirrors ds4-server exactly (completions open; only select gated
+by ACCRETION_ADMIN_TOKEN: 405 admin_disabled unset, 401 wrong),
+/v1/capabilities with configured-vs-trained context (trained 1048576
+read from the header), /v1/activity with measured prefill tps +
+derived eta (omitted until tps>0), /v1/models/available with sidecar
+mode tags, SIGTERM drain (second signal _exit 130). Tested live on
+port 8099 under production (paged): capabilities/models/activity
+shapes, 401/405, 503 overload with 2 slots, SSE frame-exact stream,
+activity mid-prefill, clean drain. usage counts sampled tokens (fix
+committed after the first SSE test showed a skipped special token).
+
+Arch dispatch (the swap): new env key DS4_ARCH (inkling|deepseek4,
+absent=deepseek4) + wrapper /opt/accretion/bin/accretion-serve execd
+by the systemd unit; select in EITHER server writes DS4_MODEL/DS4_ARCH/
+DS4_CTX/DS4_CACHE_BUDGET/DS4_EXTRA_FLAGS and exits 42; Restart=
+on-failure re-runs the wrapper which execs the matching binary.
+Cross-family models report loadable:"yes" only when the unit env sets
+ACCRETION_ARCH_WRAPPER=1 (honest gating on the wrapper being armed).
+ds4-server side: model_arch_loadable + select env-write extended
+(ds4_server.c, commit b83d8a5, on inkling-port after merging latest
+platform which carries the sidecar layer). Inkling side mirrors the
+full select choreography so the console can swap back.
+
+Accretion repo (branch inkling-serve, pushed): build/accretion-serve
+wrapper, unit template ExecStart -> wrapper, install.sh installs
+wrapper + seeds DS4_ARCH/ACCRETION_ARCH_WRAPPER in the env file,
+build-release.sh builds/stages ds4-inkling-server (guarded: aborts
+naming the missing engine sync until inkling-port lands in platform),
+docs/CONSOLE.md architecture-swap section, docs/ARCH_SEAM.md inkling
+row. Engine subtree sync (inkling-port -> platform -> subtree pull) is
+a pending operator step.
+
+Operator steps to make Inkling console-live:
+1. Merge/land ds4 fork inkling-port into platform (or cherry-pick),
+   run accretion scripts/sync-engine.sh, merge accretion inkling-serve.
+2. Release: scripts/build-release.sh; install.sh on robo-dog (installs
+   accretion-serve, refreshes unit to ExecStart wrapper; env file gains
+   DS4_ARCH=deepseek4 + ACCRETION_ARCH_WRAPPER=1 if regenerating -- for
+   the existing env file ADD those two lines by hand).
+3. Ensure the inkling sidecar sits NEXT TO the served gguf as
+   <model>.gguf.env with DS4_ARCH=inkling, DS4_CTX=65536,
+   DS4_DECODE_TPS_REFERENCE=12.3 (the banked file at
+   /data/gguf/models/inkling-small/ has the right keys; note the
+   scanner keys off "<path>.env" of the actual gguf).
+4. systemctl daemon-reload && restart ds4-server (window); then the
+   swap is console-driven: pick Inkling in MODELS -> select -> exit 42
+   -> wrapper starts ds4-inkling-server resident at 65536 (copy-in
+   ~343s before first token; /v1/capabilities appears when up).
+5. Full resident multi-session validation in that window (not
+   testable beside production).
