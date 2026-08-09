@@ -37,3 +37,6 @@ __pycache__/
 # gitignore only the raw traces that exceed 10MB (currently eval12.bin); smaller
 # captures are committed directly, plus a small curated sample of eval12.bin.
 research/gb10/traces/eval12.bin
+ds4-inkling
+ds4-inkling-server
+ds4-inkling-cuda
