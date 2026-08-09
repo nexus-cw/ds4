@@ -1481,12 +1481,12 @@ static void run_job(job *j) {
         int tok = (j->temperature <= 0.0) ? argmax_logits(logits, g_model.n_vocab)
                                             : sample_logits(logits, g_model.n_vocab, j->temperature);
         bool is_stop = (tok == g_model.tk.eos) || (g_end_message_id >= 0 && tok == g_end_message_id);
+        if (!is_stop) completion_tokens++;   /* usage counts SAMPLED tokens */
+        slot->gen_tokens = completion_tokens;
         if (!is_stop) {
             char piece[512];
             int n = ink_detokenize(&g_model.tk, tok, piece, sizeof(piece));
             if (!token_is_special_bracket(piece, n)) {
-                completion_tokens++;
-                slot->gen_tokens = completion_tokens;
                 if (j->stream) {
                     ok = sse_content_frame(j->fd, j->id, now, piece, (size_t)n);
                 } else {
