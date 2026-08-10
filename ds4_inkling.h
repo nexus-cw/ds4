@@ -172,6 +172,23 @@ uint64_t ink_tensor_bytes(const ink_tensor *t);
  * never silently emit token 0). */
 void ink_logits_guard(const float *logits, uint32_t n_vocab,
                       uint32_t n_unpadded, const char *where);
+/* Non-fatal form: logs the same diagnostic and returns false instead of
+ * exiting, so a server can fail ONE request rather than the process. */
+bool ink_logits_ok(const float *logits, uint32_t n_vocab,
+                   uint32_t n_unpadded, const char *where);
+
+/* GPU engine (ds4_inkling_cuda.cu); linked only in CUDA builds. */
+#ifdef DS4_INKLING_CUDA
+void ink_cuda_init(void);
+void ink_cuda_sync(void);
+void ink_forward_gpu(ink_model *m, const int *tokens, uint32_t n_tok,
+                     uint32_t pos0, float *out_logits);
+/* Split-arena resident load (device memory for quantized weights, host for
+ * the tensors host code reads); budget_bytes 0 = whole model. */
+void ink_cuda_make_resident(ink_model *m, uint64_t budget_bytes);
+/* Largest batch ink_forward_gpu accepts. */
+#define INK_GPU_PREFILL_CHUNK 128
+#endif
 /* Process n_tok tokens starting at absolute position pos0 (KV/conv state
  * must already cover [0, pos0)).  If out_logits != NULL, logits of the
  * LAST token are written (n_vocab floats). */

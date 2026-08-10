@@ -1397,8 +1397,8 @@ uint64_t ink_model_make_resident(ink_model *m, uint64_t budget_bytes,
     return copied;
 }
 
-void ink_logits_guard(const float *logits, uint32_t n_vocab,
-                      uint32_t n_unpadded, const char *where) {
+bool ink_logits_ok(const float *logits, uint32_t n_vocab,
+                   uint32_t n_unpadded, const char *where) {
     uint32_t lim = (n_unpadded && n_unpadded < n_vocab) ? n_unpadded : n_vocab;
     uint32_t nans = 0;
     float best = -INFINITY;
@@ -1413,8 +1413,16 @@ void ink_logits_guard(const float *logits, uint32_t n_vocab,
             "ds4-inkling: refusing to sample (this indicates bad weight reads, e.g.\n"
             "ds4-inkling: GPU pageable access over file-backed mmap under reclaim; use --resident)\n",
             where, nans, lim, (double)best);
-        exit(3);
+        return false;
     }
+    return true;
+}
+
+/* Fatal form, kept for the CLIs: a corrupt logits vector there means the
+ * run is worthless, so stop loudly rather than print a wrong token. */
+void ink_logits_guard(const float *logits, uint32_t n_vocab,
+                      uint32_t n_unpadded, const char *where) {
+    if (!ink_logits_ok(logits, n_vocab, n_unpadded, where)) exit(3);
 }
 
 /* ====================== state reset / snapshot ======================= */

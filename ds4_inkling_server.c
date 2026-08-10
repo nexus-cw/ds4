@@ -59,7 +59,34 @@
 
 #define MAX_HEADER_BYTES  (64 * 1024)
 #define MAX_BODY_BYTES    (1 * 1024 * 1024)
-#define PREFILL_CHUNK     32
+#define PREFILL_CHUNK     32   /* CPU engine batch; GPU uses INK_GPU_PREFILL_CHUNK */
+
+/* Backend selection.  A CUDA build defaults to the GPU engine (that is the
+ * whole point of it: the CPU engine runs the same math ~25x slower and is
+ * kept as the correctness reference).  --cpu or DS4_INKLING_BACKEND=cpu
+ * forces the reference path; on a CPU-only build the GPU is unavailable and
+ * the flag is a no-op. */
+static bool g_use_gpu = false;
+
+static const char *backend_name(void) { return g_use_gpu ? "cuda" : "cpu"; }
+
+/* Both engines advance the SAME ink_model state (KV + shortconv), so they
+ * are interchangeable per call; the server picks one at startup and keeps
+ * it for the process lifetime. */
+static void engine_forward_batch(ink_model *m, const int *tokens, uint32_t n_tok,
+                                 uint32_t pos0, float *out_logits) {
+#ifdef DS4_INKLING_CUDA
+    if (g_use_gpu) { ink_forward_gpu(m, tokens, n_tok, pos0, out_logits); return; }
+#endif
+    ink_forward_batch(m, tokens, n_tok, pos0, out_logits);
+}
+
+static int engine_prefill_chunk(void) {
+#ifdef DS4_INKLING_CUDA
+    if (g_use_gpu) return INK_GPU_PREFILL_CHUNK;
+#endif
+    return PREFILL_CHUNK;
+}
 
 /* POST /v1/models/select: a successful select drains and exits with this
  * code so a Restart=on-failure supervisor restarts the process reading the
@@ -916,11 +943,11 @@ static void handle_capabilities(int fd) {
     sbuf_appendf(&out,
         "\",\"architecture\":\"inkling\",\"parameters\":%llu,\"file_bytes\":%llu},"
         "\"context\":{\"configured\":%u,\"trained\":%llu},"
-        "\"serving\":{\"resident\":%s,\"sessions\":%d},"
+        "\"serving\":{\"resident\":%s,\"sessions\":%d,\"backend\":\"%s\"},"
         "\"apis\":{\"openai_chat_completions\":true,\"sse_streaming\":true}",
         (unsigned long long)params, (unsigned long long)g_model.gg.map_len,
         g_model.n_ctx, (unsigned long long)trained,
-        g_resident ? "true" : "false", g_sessions);
+        g_resident ? "true" : "false", g_sessions, backend_name());
     const char *tp = getenv("DS4_CAPS_THROUGHPUT_JSON");
     if (tp && tp[0] == '{') {
         sbuf_appendz(&out, ",\"throughput\":");
@@ -1453,10 +1480,11 @@ static void run_job(job *j) {
     if (!logits) diesys("malloc");
 
     double prefill_t0 = ink_now_sec();
-    for (int i = 0; i < j->n_tokens; i += PREFILL_CHUNK) {
-        int n = j->n_tokens - i < PREFILL_CHUNK ? j->n_tokens - i : PREFILL_CHUNK;
+    const int chunk = engine_prefill_chunk();
+    for (int i = 0; i < j->n_tokens; i += chunk) {
+        int n = j->n_tokens - i < chunk ? j->n_tokens - i : chunk;
         bool last = (i + n == j->n_tokens);
-        ink_forward_batch(&g_model, j->tokens + i, (uint32_t)n, (uint32_t)i, last ? logits : NULL);
+        engine_forward_batch(&g_model, j->tokens + i, (uint32_t)n, (uint32_t)i, last ? logits : NULL);
         slot->prefill_done = i + n;
         double elapsed = ink_now_sec() - prefill_t0;
         slot->prefill_tps = elapsed > 0.0 ? (double)slot->prefill_done / elapsed : 0.0;
@@ -1464,7 +1492,21 @@ static void run_job(job *j) {
 
     slot->state = 2; /* decode */
 
+    /* Corruption check BEFORE any bytes go out (streaming headers included),
+     * so the common case fails the request cleanly instead of the process. */
+    if (!ink_logits_ok(logits, g_model.n_vocab, g_model.n_vocab_unpadded,
+                       "server prefill")) {
+        free(logits);
+        slot->state = 0;
+        http_send_error(j->fd, 500, "Internal Server Error",
+                        "logits corruption detected: refusing to sample "
+                        "(see server log; engine state has been reset)");
+        j->status = 500;
+        return;
+    }
+
     bool ok = true;
+    bool corrupt = false;
     if (j->stream) {
         ok = sse_send_headers(j->fd);
         if (ok) ok = sse_first_frame(j->fd, j->id, now);
@@ -1476,8 +1518,9 @@ static void run_job(job *j) {
     uint32_t pos = (uint32_t)j->n_tokens;
 
     for (long t = 0; ok && t < j->max_tokens; t++) {
-        /* dies loudly on NaN-poisoned or all -inf logits: never emit token 0 */
-        ink_logits_guard(logits, g_model.n_vocab, g_model.n_vocab_unpadded, "server decode");
+        /* never emit token 0 off a NaN-poisoned vector: stop this request */
+        if (!ink_logits_ok(logits, g_model.n_vocab, g_model.n_vocab_unpadded,
+                           "server decode")) { corrupt = true; break; }
         int tok = (j->temperature <= 0.0) ? argmax_logits(logits, g_model.n_vocab)
                                             : sample_logits(logits, g_model.n_vocab, j->temperature);
         bool is_stop = (tok == g_model.tk.eos) || (g_end_message_id >= 0 && tok == g_end_message_id);
@@ -1496,7 +1539,7 @@ static void run_job(job *j) {
         }
         if (is_stop) { finish_reason = "stop"; break; }
         if (t + 1 == j->max_tokens) { finish_reason = "length"; break; }
-        ink_forward(&g_model, tok, pos++, logits);
+        engine_forward_batch(&g_model, &tok, 1, pos++, logits);
     }
     free(logits);
     slot->state = 0;
@@ -1505,6 +1548,25 @@ static void run_job(job *j) {
     j->prompt_tokens = prompt_tokens;
     j->completion_tokens = completion_tokens;
     j->finish_reason = finish_reason;
+
+    if (corrupt) {
+        /* Mid-generation corruption: streaming already sent frames, so the
+         * only honest close is an SSE error event; non-streaming can still
+         * return a real 500. */
+        if (j->stream) {
+            sse_error_event(j->fd, "logits corruption detected mid-generation: "
+                                   "generation aborted");
+            send_all(j->fd, "data: [DONE]\n\n", 14);
+            j->status = 200;
+        } else {
+            http_send_error(j->fd, 500, "Internal Server Error",
+                            "logits corruption detected mid-generation: "
+                            "generation aborted");
+            j->status = 500;
+        }
+        sbuf_free(&text);
+        return;
+    }
 
     if (j->stream) {
         if (ok) ok = sse_finish_frame(j->fd, j->id, now, finish_reason);
@@ -1713,6 +1775,7 @@ int main(int argc, char **argv) {
     int sessions = 2;
     bool have_sessions_flag = false;
     bool resident = false;
+    bool force_cpu = false;
     uint64_t resident_budget_bytes = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -1722,6 +1785,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-H") && i + 1 < argc) host = argv[++i];
         else if (!strcmp(argv[i], "-t") && i + 1 < argc) max_tokens_cap = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "-s") && i + 1 < argc) { sessions = atoi(argv[++i]); have_sessions_flag = true; }
+        else if (!strcmp(argv[i], "--cpu")) force_cpu = true;
         else if (!strcmp(argv[i], "--resident")) resident = true;
         else if (!strcmp(argv[i], "--resident-budget") && i + 1 < argc) {
             resident = true;
@@ -1729,14 +1793,14 @@ int main(int argc, char **argv) {
         } else {
             fprintf(stderr,
                 "usage: ds4-inkling-server -m model.gguf [-c CTX] [-p PORT] [-H HOST] "
-                "[-t MAX_TOKENS_CAP] [-s SESSIONS] [--resident] [--resident-budget GiB]\n");
+                "[-t MAX_TOKENS_CAP] [-s SESSIONS] [--resident] [--resident-budget GiB] [--cpu]\n");
             return 1;
         }
     }
     if (!model_path) {
         fprintf(stderr,
             "usage: ds4-inkling-server -m model.gguf [-c CTX] [-p PORT] [-H HOST] "
-            "[-t MAX_TOKENS_CAP] [-s SESSIONS] [--resident] [--resident-budget GiB]\n");
+            "[-t MAX_TOKENS_CAP] [-s SESSIONS] [--resident] [--resident-budget GiB] [--cpu]\n");
         return 1;
     }
     if (!have_ctx_flag) {
@@ -1774,15 +1838,39 @@ int main(int argc, char **argv) {
     if (g_rng_state == 0) g_rng_state = 1;
 
     double t0 = ink_now_sec();
+    {
+        const char *be = getenv("DS4_INKLING_BACKEND");
+        if (be && !strcmp(be, "cpu")) force_cpu = true;
+#ifdef DS4_INKLING_CUDA
+        if (!force_cpu) {
+            ink_cuda_init();     /* dies with a clear message if unusable */
+            g_use_gpu = true;
+        }
+#else
+        (void)force_cpu;
+#endif
+        fprintf(stderr, "ds4-inkling-server: backend %s\n", backend_name());
+    }
+
     ink_model_open(&g_model, model_path, n_ctx);
     if (!realpath(model_path, g_model_realpath)) {
         snprintf(g_model_realpath, sizeof(g_model_realpath), "%s", model_path);
     }
     if (resident) {
-        uint64_t n_res = 0;
-        uint64_t nb = ink_model_make_resident(&g_model, resident_budget_bytes, malloc, &n_res);
-        fprintf(stderr, "ds4-inkling-server: resident %.1f GiB in %llu tensors\n",
-                nb / 1073741824.0, (unsigned long long)n_res);
+#ifdef DS4_INKLING_CUDA
+        if (g_use_gpu) {
+            /* Split arena: quantized weights into device memory, host-read
+             * tensors on the host -- identical to what ds4-inkling-cuda
+             * proves out, and it prints its own GiB split line. */
+            ink_cuda_make_resident(&g_model, resident_budget_bytes);
+        } else
+#endif
+        {
+            uint64_t n_res = 0;
+            uint64_t nb = ink_model_make_resident(&g_model, resident_budget_bytes, malloc, &n_res);
+            fprintf(stderr, "ds4-inkling-server: resident %.1f GiB in %llu tensors (host)\n",
+                    nb / 1073741824.0, (unsigned long long)n_res);
+        }
     }
     fprintf(stderr, "ds4-inkling-server: loaded %s (%u layers, vocab %u, ctx %u) in %.1fs\n",
             model_path, g_model.n_layer, g_model.n_vocab, g_model.n_ctx, ink_now_sec() - t0);

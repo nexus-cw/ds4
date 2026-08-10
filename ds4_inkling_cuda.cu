@@ -1622,6 +1622,9 @@ static void ink_cuda_resident_copy(void *dst, const void *src, size_t n) {
     CUDA_CHECK(cudaMemcpy(dst, src, n, cudaMemcpyDefault));
 }
 
+/* Exported for the server (which links this TU without its main()). */
+extern "C" void ink_cuda_make_resident(ink_model *m, uint64_t budget_bytes);
+
 static void ink_make_resident(ink_model *m, uint64_t budget_bytes) {
     uint64_t total = 0, host_est = 0;
     for (uint64_t i = 0; i < m->gg.n_tensors; i++) {
@@ -1674,6 +1677,10 @@ static void ink_make_resident(ink_model *m, uint64_t budget_bytes) {
             g_resident_device_bytes / 1073741824.0, g_resident_host_bytes / 1073741824.0,
             ink_now_sec() - t0,
             budget_bytes && copied < total ? " [PARTIAL: rest stays mmap-paged]" : "");
+}
+
+extern "C" void ink_cuda_make_resident(ink_model *m, uint64_t budget_bytes) {
+    ink_make_resident(m, budget_bytes);
 }
 
 /* --bench-layers L: measure raw kernel throughput independent of disk.
@@ -1937,6 +1944,7 @@ static void ink_run_bench_membw(void) {
     free(hostbuf);
 }
 
+#ifndef DS4_INKLING_NO_MAIN
 int main(int argc, char **argv) {
     const char *model_path = NULL;
     const char *prompt = NULL;
@@ -2073,3 +2081,4 @@ int main(int argc, char **argv) {
     ink_bench_report();
     return 0;
 }
+#endif /* DS4_INKLING_NO_MAIN */

@@ -438,5 +438,15 @@ ds4-inkling-cuda: ds4_inkling_cuda.cu ds4_inkling.c ds4_inkling.h ds4_inkling_ta
 # Standalone OpenAI-compatible HTTP server for the inkling engine.  -pthread
 # for the single dedicated inference worker thread + per-connection network
 # threads (see the threading-model comment atop ds4_inkling_server.c).
-ds4-inkling-server: ds4_inkling_server.c ds4_inkling.c ds4_inkling.h ds4_inkling_tables.inc
+# Default build links the CUDA engine: the server exists to serve, and the
+# CPU engine is ~25x slower (it is the correctness reference, not a serving
+# path).  Runtime --cpu / DS4_INKLING_BACKEND=cpu still selects it.  On hosts
+# without nvcc, build ds4-inkling-server-cpu instead (same binary name minus
+# the GPU: /v1/capabilities reports which backend is live).
+ds4-inkling-server: ds4_inkling_server.c ds4_inkling.c ds4_inkling_cuda.cu ds4_inkling.h ds4_inkling_tables.inc
+	$(CC) -O2 -Wall -Wextra -fopenmp -DDS4_INKLING_NO_MAIN -DDS4_INKLING_CUDA -pthread -c ds4_inkling_server.c -o ds4_inkling_server_cuda.o
+	$(CC) -O2 -Wall -Wextra -fopenmp -DDS4_INKLING_NO_MAIN -c ds4_inkling.c -o ds4_inkling_lib.o
+	nvcc -O2 -DDS4_INKLING_NO_MAIN -DDS4_INKLING_CUDA -o $@ ds4_inkling_cuda.cu ds4_inkling_server_cuda.o ds4_inkling_lib.o -Xcompiler -fopenmp -Xcompiler -pthread -lm
+
+ds4-inkling-server-cpu: ds4_inkling_server.c ds4_inkling.c ds4_inkling.h ds4_inkling_tables.inc
 	$(CC) -O2 -Wall -Wextra -fopenmp -DDS4_INKLING_NO_MAIN -pthread -o $@ ds4_inkling_server.c ds4_inkling.c -lm
