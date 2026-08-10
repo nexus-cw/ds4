@@ -69,6 +69,14 @@ extern "C" void ink_cuda_sync(void) {
     CUDA_CHECK(cudaStreamSynchronize(g_stream));
 }
 
+/* M11: runtime A/B lever between the exact float-dequant path (our
+ * correctness oracle, unconditionally used by --selftest regardless of the
+ * env var -- see ink_run_selftest) and the fast int8-dp4a path for
+ * IQ2_XXS/IQ3_XXS group-matvec (the measured decode bottleneck).
+ * INK_EXACT_DEQUANT=1 forces the exact path everywhere; default (unset/0)
+ * is the fast path. */
+static int g_exact_dequant = 0;
+
 static void *ink_cuda_upload(const void *src, size_t bytes) {
     void *dst = NULL;
     CUDA_CHECK(cudaMalloc(&dst, bytes));
@@ -98,6 +106,9 @@ extern "C" void ink_cuda_init(void) {
     g_tables_ready = 1;
 
     CUDA_CHECK(cudaStreamCreate(&g_stream));
+
+    const char *ex = getenv("INK_EXACT_DEQUANT");
+    g_exact_dequant = (ex && strcmp(ex, "0") != 0 && ex[0] != '\0') ? 1 : 0;
 }
 
 /* ========================= device dequantizers =========================
@@ -377,6 +388,111 @@ __device__ __forceinline__ void dq32_iq3_xxs(const uint8_t *rowp, uint32_t sg, f
             }
         }
     }
+}
+
+/* ===================== M11: int8/dp4a fast dot products =================
+ * Port of llama.cpp's IQ2_XXS/IQ3_XXS vec_dot technique (MIT license,
+ * ggml/src/ggml-cuda/vecdotq.cuh, vec_dot_iq2_xxs_q8_1 / vec_dot_iq3_xxs_q8_1
+ * -- https://github.com/ggml-org/llama.cpp), adapted to this file's
+ * per-subgroup dequant structure and using FLOAT scaling throughout
+ * (deliberately NOT llama.cpp's `sumi*ls/8` integer-truncating scale
+ * approximation -- there is no reason to accept that extra error here, so
+ * the weight-subgroup scale `db` is computed exactly as the existing
+ * float-path dq32_iq2_xxs/dq32_iq3_xxs do, and multiplied in as a float
+ * after the integer dot product).
+ *
+ * The one piece actually ported byte-for-byte is the grid-byte layout and
+ * the __dp4a accumulation: instead of extracting each of the 32 weight
+ * bytes into a float register and doing 32 scalar FMAs against the
+ * activation vector, the activation is pre-quantized to int8 (see
+ * ink_kernel_quantize_act*, "reuse the same block-of-32 activation
+ * quantization the weight side already groups by"), and each 4-byte grid
+ * chunk is dot-producted against the matching 4 activation bytes with one
+ * __dp4a() call (8 calls total per 32-wide subgroup, vs 32 float FMAs).
+ *
+ * Sign application: rather than port __vcmpne4/__vsub4 (SIMD-video
+ * intrinsics whose exact semantics I could not verify without a compiler
+ * here), ink_pack_signed4 does the equivalent per-byte conditional negate
+ * with plain integer ops from the SAME already-verified sign table
+ * (tb.ksigns_iq2xs / tb.kmask_iq2xs) the exact float path uses -- lower
+ * risk, same result, and a much smaller diff to reason about by hand. */
+
+/* Conditionally negate each of the 4 packed bytes in `grid4` (byte i =
+ * bits 8*i, little-endian, matching ink_load_u32) based on bit
+ * (maskbase+i) of `signs` -- same semantics as the float path's
+ * `ink_signed(db*gbyte, (signs & kmask_iq2xs[maskbase+i]) != 0)`, just
+ * producing a packed int32 of signed int8 lanes for __dp4a instead of 4
+ * separate floats. */
+__device__ __forceinline__ int32_t ink_pack_signed4(uint32_t grid4, uint8_t signs, uint8_t maskbase) {
+    uint32_t out = 0;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        uint8_t b = (uint8_t)(grid4 >> (8 * i));
+        bool neg = (signs & (1u << (maskbase + i))) != 0;
+        int8_t sb = neg ? (int8_t)(-(int)b) : (int8_t)b;
+        out |= ((uint32_t)(uint8_t)sb) << (8 * i);
+    }
+    return (int32_t)out;
+}
+
+/* Returns sumi * db for this 32-wide subgroup (caller still multiplies by
+ * the activation block's own float scale `dx`, same as `db*dx*sumi` in the
+ * task's spec) -- NOT yet the final per-subgroup contribution.  `aq` points
+ * at this subgroup's 32 already-quantized int8 activation values. */
+__device__ __forceinline__ float ink_dp4a_dot32_iq2_xxs(const uint8_t *rowp, uint32_t sg,
+                                                          const int8_t *aq, ink_tables tb) {
+    const ink_block_iq2_xxs *x = (const ink_block_iq2_xxs *)rowp;
+    uint32_t i = sg / 8, local_sg = sg % 8;
+    const ink_block_iq2_xxs *b = &x[i];
+    float d = __half2float(__ushort_as_half(b->d));
+    const uint8_t *bp = (const uint8_t *)b->qs + 8 * local_sg;
+    uint32_t a0 = ink_load_u32(bp);
+    uint32_t a1 = ink_load_u32(bp + 4);
+    float db = d * (0.5f + (float)(a1 >> 28)) * 0.25f;
+
+    int sumi = 0;
+#pragma unroll
+    for (uint32_t lg = 0; lg < 4; lg++) {
+        uint8_t byte_l = (uint8_t)(a0 >> (8 * lg));
+        uint64_t gridv = tb.iq2xxs_grid[byte_l];
+        uint8_t signs = tb.ksigns_iq2xs[(a1 >> (7 * lg)) & 127];
+        int32_t sglo = ink_pack_signed4((uint32_t)gridv, signs, 0);
+        int32_t sghi = ink_pack_signed4((uint32_t)(gridv >> 32), signs, 4);
+        const uint8_t *aqp = (const uint8_t *)(aq + lg * 8);
+        int32_t u0 = (int32_t)ink_load_u32(aqp);
+        int32_t u1 = (int32_t)ink_load_u32(aqp + 4);
+        sumi = __dp4a(sglo, u0, sumi);
+        sumi = __dp4a(sghi, u1, sumi);
+    }
+    return (float)sumi * db;
+}
+
+__device__ __forceinline__ float ink_dp4a_dot32_iq3_xxs(const uint8_t *rowp, uint32_t sg,
+                                                          const int8_t *aq, ink_tables tb) {
+    const ink_block_iq3_xxs *x = (const ink_block_iq3_xxs *)rowp;
+    uint32_t i = sg / 8, local_sg = sg % 8;
+    const ink_block_iq3_xxs *b = &x[i];
+    float d = __half2float(__ushort_as_half(b->d));
+    const uint8_t *sas = b->qs + QK_K / 4 + 4 * local_sg;
+    uint32_t aux32 = ink_load_u32(sas);
+    float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;
+    const uint8_t *qsp = b->qs + 8 * local_sg;
+
+    int sumi = 0;
+#pragma unroll
+    for (uint32_t l4 = 0; l4 < 4; l4++) {
+        uint8_t signs = tb.ksigns_iq2xs[(aux32 >> (7 * l4)) & 127];
+        uint32_t gv0 = tb.iq3xxs_grid[qsp[2 * l4 + 0]];
+        uint32_t gv1 = tb.iq3xxs_grid[qsp[2 * l4 + 1]];
+        int32_t sg0 = ink_pack_signed4(gv0, signs, 0);
+        int32_t sg1 = ink_pack_signed4(gv1, signs, 4);
+        const uint8_t *aqp = (const uint8_t *)(aq + l4 * 8);
+        int32_t u0 = (int32_t)ink_load_u32(aqp);
+        int32_t u1 = (int32_t)ink_load_u32(aqp + 4);
+        sumi = __dp4a(sg0, u0, sumi);
+        sumi = __dp4a(sg1, u1, sumi);
+    }
+    return (float)sumi * db;
 }
 
 __device__ __forceinline__ void dq32_iq4_xs(const uint8_t *rowp, uint32_t sg, float w[32], ink_tables tb) {
@@ -689,6 +805,158 @@ __global__ void ink_kernel_matvec_group(uint32_t type, ink_ptr8 bases, uint64_t 
     ink_matvec_row_warp(type, rowbase, in, out, X, Y, tb, sxp);
 }
 
+/* ===================== M11: activation int8 quantizer ====================
+ * Quantizes an activation vector into blocks of 32 (int8 qs + fp32 scale
+ * d = max|x|/127 per block), matching the weight side's 32-wide subgroup
+ * granularity exactly so ink_dp4a_dot32_* can dot a weight subgroup
+ * against the matching activation block with one scale multiply.  Grouped
+ * variant quantizes up to INK_GROUP_MAX activation vectors (one per
+ * blockIdx.y) in a single launch -- called ONCE per ink_cuda_matvec_group()
+ * call, not once per row, and the result is reused by every row/warp of
+ * every group in that launch (this is the "quantize once, reuse across all
+ * 6 expert groups / all rows" the fast path depends on for its win). */
+__global__ void ink_kernel_quantize_act_group(ink_fptr8 xs, uint32_t nsub, int8_t *qs_out, float *d_out,
+                                               uint32_t n_group) {
+    uint32_t g = blockIdx.y;
+    if (g >= n_group) return;
+    const float *x = xs.p[g];
+    int8_t *qsg = qs_out + (size_t)g * nsub * 32;
+    float *dg = d_out + (size_t)g * nsub;
+    for (uint32_t sg = threadIdx.x; sg < nsub; sg += blockDim.x) {
+        const float *xp = x + (size_t)sg * 32;
+        float amax = 0.0f;
+#pragma unroll
+        for (int l = 0; l < 32; l++) amax = fmaxf(amax, fabsf(xp[l]));
+        float scale = amax * (1.0f / 127.0f);
+        float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
+        int8_t *qp = qsg + (size_t)sg * 32;
+#pragma unroll
+        for (int l = 0; l < 32; l++) qp[l] = (int8_t)lrintf(xp[l] * inv);
+        dg[sg] = scale;
+    }
+}
+
+static int8_t *g_actq_scratch = NULL;
+static float *g_actd_scratch = NULL;
+static size_t g_actq_cap = 0, g_actd_cap = 0;
+
+static void ink_cuda_ensure_actq_scratch(size_t qs_need, size_t d_need) {
+    if (qs_need > g_actq_cap) {
+        if (g_actq_scratch) CUDA_CHECK(cudaFree(g_actq_scratch));
+        CUDA_CHECK(cudaMalloc(&g_actq_scratch, qs_need));
+        g_actq_cap = qs_need;
+    }
+    if (d_need > g_actd_cap) {
+        if (g_actd_scratch) CUDA_CHECK(cudaFree(g_actd_scratch));
+        CUDA_CHECK(cudaMalloc(&g_actd_scratch, d_need * sizeof(float)));
+        g_actd_cap = d_need;
+    }
+}
+
+/* ---- fast (dp4a) grouped matvec: same shape/contract as
+ * ink_kernel_matvec_group, but for IQ2_XXS/IQ3_XXS rows dots against the
+ * pre-quantized int8 activation via __dp4a instead of the float path.
+ * Non-eligible types (Q4_K/Q5_K/Q6_K/IQ2_S/IQ4_XS/Q8_0/F32) fall back to
+ * the exact float dq32_* path unchanged within the SAME launch/kernel --
+ * this kernel is only ever selected when the whole group's tensor type is
+ * dp4a-eligible (see ink_cuda_matvec_group), so in practice the fallback
+ * branch is dead code for IQ2_XXS/IQ3_XXS launches, but keeping it here
+ * (rather than a separate kernel) means one code path handles "is this
+ * type eligible" instead of duplicating the whole row/warp loop. */
+__device__ __forceinline__ void ink_matvec_row_warp_fast(uint32_t type, const uint8_t *rowbase,
+                                                           uint64_t in, uint64_t out,
+                                                           const float *X, float *Y, ink_tables tb,
+                                                           const float *sx,
+                                                           const int8_t *aq, const float *ad) {
+    uint32_t tid = threadIdx.x;
+    uint32_t warp_id = tid / 32, lane = tid % 32;
+    uint32_t nwarp_total = (blockDim.x / 32) * gridDim.x;
+    uint64_t warp_global = (uint64_t)blockIdx.x * (blockDim.x / 32) + warp_id;
+
+    size_t be = ink_dev_block_elems(type);
+    size_t bb = ink_dev_block_bytes(type);
+    uint64_t rowstride_blocks = in / be;
+    uint32_t nsub = (uint32_t)(in / 32);
+    const float *xsrc = sx ? sx : X;
+    bool use_dp4a = (type == INK_T_IQ2_XXS || type == INK_T_IQ3_XXS);
+
+    for (uint64_t row = warp_global; row < out; row += nwarp_total) {
+        const uint8_t *rowp = rowbase + (size_t)row * rowstride_blocks * bb;
+        float acc = 0.0f;
+        for (uint32_t sg = lane; sg < nsub; sg += 32) {
+            if (use_dp4a) {
+                const int8_t *aqp = aq + (size_t)sg * 32;
+                float dx = ad[sg];
+                float part = (type == INK_T_IQ2_XXS)
+                    ? ink_dp4a_dot32_iq2_xxs(rowp, sg, aqp, tb)
+                    : ink_dp4a_dot32_iq3_xxs(rowp, sg, aqp, tb);
+                acc += part * dx;
+            } else {
+                float w[32];
+                ink_dq_load32(type, rowp, sg, w, tb);
+                const float4 *xp4 = reinterpret_cast<const float4 *>(xsrc + (size_t)sg * 32);
+#pragma unroll
+                for (int l4 = 0; l4 < 8; l4++) {
+                    float4 xv = xp4[l4];
+                    acc += w[l4 * 4 + 0] * xv.x + w[l4 * 4 + 1] * xv.y
+                         + w[l4 * 4 + 2] * xv.z + w[l4 * 4 + 3] * xv.w;
+                }
+            }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+        if (lane == 0) Y[row] = acc;
+    }
+}
+
+__global__ void ink_kernel_matvec_group_fast(uint32_t type, ink_ptr8 bases, uint64_t in, uint64_t out,
+                                              ink_fptr8 xs, ink_fptr8_mut ys, uint32_t n_group,
+                                              const int8_t *actq, const float *actd, uint32_t nsub_act,
+                                              ink_tables tb) {
+    uint32_t g = blockIdx.y;
+    if (g >= n_group) return;
+    const uint8_t *rowbase = bases.p[g];
+    const float *X = xs.p[g];
+    float *Y = ys.p[g];
+    const int8_t *gqs = actq + (size_t)g * nsub_act * 32;
+    const float *gd = actd + (size_t)g * nsub_act;
+
+    /* M11 item 3: stage the codebooks this kernel actually dot-products
+     * against in shared memory -- iq2xxs_grid (2KB) + iq3xxs_grid (1KB) +
+     * ksigns_iq2xs (128B) + kmask_iq2xs (8B) = ~3.1KB, cheap next to the
+     * 16KB X cache below.  Per-lane grid/sign indices are data-dependent
+     * (divergent), so these would otherwise be serialized/uncoalesced
+     * global loads; shared memory tolerates that pattern far better. */
+    __shared__ uint64_t s_iq2xxs_grid[256];
+    __shared__ uint32_t s_iq3xxs_grid[256];
+    __shared__ uint8_t s_ksigns[128];
+    __shared__ uint8_t s_kmask[8];
+    ink_tables tbl = tb;
+    bool use_dp4a = (type == INK_T_IQ2_XXS || type == INK_T_IQ3_XXS);
+    if (use_dp4a) {
+        for (uint32_t idx = threadIdx.x; idx < 256; idx += blockDim.x) {
+            s_iq2xxs_grid[idx] = tb.iq2xxs_grid[idx];
+            s_iq3xxs_grid[idx] = tb.iq3xxs_grid[idx];
+        }
+        for (uint32_t idx = threadIdx.x; idx < 128; idx += blockDim.x) s_ksigns[idx] = tb.ksigns_iq2xs[idx];
+        if (threadIdx.x < 8) s_kmask[threadIdx.x] = tb.kmask_iq2xs[threadIdx.x];
+        __syncthreads();
+        tbl.iq2xxs_grid = s_iq2xxs_grid;
+        tbl.iq3xxs_grid = s_iq3xxs_grid;
+        tbl.ksigns_iq2xs = s_ksigns;
+        tbl.kmask_iq2xs = s_kmask;
+    }
+
+    __shared__ __align__(16) float sx[INK_MATVEC_SHARED_MAX];
+    const float *sxp = NULL;
+    if (!use_dp4a && in <= INK_MATVEC_SHARED_MAX) {
+        for (uint64_t idx = threadIdx.x; idx < in; idx += blockDim.x) sx[idx] = X[idx];
+        __syncthreads();
+        sxp = sx;
+    }
+    ink_matvec_row_warp_fast(type, rowbase, in, out, X, Y, tbl, sxp, gqs, gd);
+}
+
 static uint32_t ink_cuda_row_blocks(uint64_t out) {
     uint64_t blocks = (out + 7) / 8; /* 8 warps/block -> 8 rows/block/grid-pass */
     if (blocks < 1) blocks = 1;
@@ -739,6 +1007,12 @@ extern "C" void ink_cuda_matvec_group(const ink_tensor *t, const uint8_t *const 
     if (n_group == 0) return;
     uint32_t blocks = ink_cuda_row_blocks(out);
     double total_bytes = 0.0;
+    /* M11: IQ2_XXS/IQ3_XXS (decode's measured bottleneck) get the int8/dp4a
+     * fast path by default; INK_EXACT_DEQUANT=1 forces the exact float
+     * path everywhere (this is also what --selftest always uses,
+     * regardless of the env var -- see ink_run_selftest). */
+    bool fast = !g_exact_dequant && (t->type == INK_T_IQ2_XXS || t->type == INK_T_IQ3_XXS);
+    uint32_t nsub = (uint32_t)(in / 32);
     ink_bench_begin();
     for (uint32_t g0 = 0; g0 < n_group; g0 += INK_GROUP_MAX) {
         uint32_t ng = n_group - g0 < INK_GROUP_MAX ? n_group - g0 : INK_GROUP_MAX;
@@ -746,7 +1020,24 @@ extern "C" void ink_cuda_matvec_group(const ink_tensor *t, const uint8_t *const 
         for (uint32_t i = 0; i < ng; i++) { pb.p[i] = bases[g0 + i]; px.p[i] = xs[g0 + i]; py.p[i] = ys[g0 + i]; }
         for (uint32_t i = ng; i < INK_GROUP_MAX; i++) { pb.p[i] = NULL; px.p[i] = NULL; py.p[i] = NULL; }
         dim3 grid(blocks, ng);
-        ink_kernel_matvec_group<<<grid, 256, 0, g_stream>>>(t->type, pb, in, out, px, py, ng, g_tables);
+        if (fast) {
+            /* Quantize each of this chunk's (<=8) activation vectors ONCE,
+             * reused by every row/warp of every group below -- not once
+             * per row.  (Groups that happen to share the same x pointer,
+             * e.g. gate_exps/up_exps's shared token vector, get requantized
+             * redundantly per group here rather than deduplicated by
+             * pointer identity; that redundant work is a few KB of int8
+             * quantization, negligible next to the matvec itself, and
+             * keeping the quantize step uniform per-group is simpler and
+             * safer than pointer-aliasing detection.) */
+            ink_cuda_ensure_actq_scratch((size_t)INK_GROUP_MAX * nsub * 32, (size_t)INK_GROUP_MAX * nsub);
+            ink_kernel_quantize_act_group<<<dim3(1, ng), 256, 0, g_stream>>>(px, nsub, g_actq_scratch, g_actd_scratch, ng);
+            CUDA_CHECK(cudaGetLastError());
+            ink_kernel_matvec_group_fast<<<grid, 256, 0, g_stream>>>(t->type, pb, in, out, px, py, ng,
+                                                                      g_actq_scratch, g_actd_scratch, nsub, g_tables);
+        } else {
+            ink_kernel_matvec_group<<<grid, 256, 0, g_stream>>>(t->type, pb, in, out, px, py, ng, g_tables);
+        }
         CUDA_CHECK(cudaGetLastError());
         total_bytes += ink_matvec_bytes(t->type, in, out) * ng;
     }
@@ -1428,11 +1719,70 @@ static bool ink_test_tensor(const char *name, const ink_tensor *t, const uint8_t
     return pass;
 }
 
+/* M11: fast-path (int8/dp4a) INFO check.  Runs the SAME 6-group probe as
+ * the exact-path group-matvec check above, but with g_exact_dequant forced
+ * to 0 (fast), and reports error vs the CPU f32 reference against a loose
+ * bound (rel 5e-3) WITHOUT failing the selftest -- int8 activation
+ * quantization is expected to move the answer by more than the tight
+ * exact-path bound tolerates; this check exists to print the actual
+ * numbers, not to gate on them.  No-op for tensor types the fast path
+ * doesn't touch. */
+static void ink_selftest_fast_check(const char *name, const ink_tensor *t, uint64_t in, uint64_t out) {
+    if (t->type != INK_T_IQ2_XXS && t->type != INK_T_IQ3_XXS) return;
+    const uint32_t NG = 6;
+    size_t row_bytes = (in / ink_type_block_elems(t->type)) * ink_type_block_bytes(t->type);
+    const uint8_t *bases[NG];
+    const float *xs[NG];
+    float *ys_g[NG];
+    float *x1 = (float *)ink_malloc(in * sizeof(float));
+    ink_fill_rand(x1, in, 0xFACE03u);
+    float *yc = (float *)ink_malloc(out * sizeof(float));
+    for (uint32_t g2 = 0; g2 < NG; g2++) {
+        bases[g2] = t->data + (size_t)(g2 * 37 + 1) * out * row_bytes;
+        xs[g2] = x1;
+        ys_g[g2] = (float *)ink_malloc(out * sizeof(float));
+    }
+
+    int prev = g_exact_dequant;
+    g_exact_dequant = 0;
+    ink_cuda_matvec_group(t, bases, in, out, xs, ys_g, NG);
+    ink_cuda_sync();
+    g_exact_dequant = prev;
+
+    double maxabs = 0.0, maxrel = 0.0, sumabs = 0.0;
+    uint64_t n = 0;
+    for (uint32_t g2 = 0; g2 < NG; g2++) {
+        ink_matvec(t, bases[g2], in, out, x1, yc); /* CPU f32 exact reference */
+        for (uint64_t i = 0; i < out; i++) {
+            double ref = (double)yc[i], got = (double)ys_g[g2][i];
+            double a = fabs(got - ref);
+            double rel = a / fmax(fabs(ref), 1e-6);
+            if (a > maxabs) maxabs = a;
+            if (rel > maxrel) maxrel = rel;
+            sumabs += a; n++;
+        }
+        free(ys_g[g2]);
+    }
+    bool loose_ok = maxrel <= 5e-3;
+    printf("group-matvec(%s,6,FAST-dp4a) maxabsdiff=%.3g maxreldiff=%.3g meanabsdiff=%.3g "
+           "%s (INFO only -- loose bound 5e-3 rel, does not affect PASS/FAIL)\n",
+           name, maxabs, maxrel, n ? sumabs / (double)n : 0.0, loose_ok ? "within-loose-bound" : "OUTSIDE-loose-bound");
+    free(x1); free(yc);
+}
+
 static int ink_run_selftest(const char *model_path, int layer) {
     ink_model m;
     ink_model_open(&m, model_path, 8);
     if (layer < 0 || (uint32_t)layer >= m.n_layer) ink_die("--selftest LAYER out of range");
     ink_layer *l = &m.layers[layer];
+
+    /* Every exact-path check below (ink_test_tensor, matmat/group-matvec
+     * comparisons) must keep passing at its original tight bound
+     * regardless of the fast path's env-var default -- selftest is the
+     * correctness oracle, so force the exact float path for its duration
+     * and restore whatever was configured on the way out. */
+    int saved_exact = g_exact_dequant;
+    g_exact_dequant = 1;
 
     bool all_pass = true;
     uint64_t n_embd = m.n_embd;
@@ -1541,7 +1891,14 @@ static int ink_run_selftest(const char *model_path, int layer) {
         printf("group-matvec(gate_exps,6) maxabsdiff=%.3g %s\n", mx, gp ? "PASS" : "FAIL");
         all_pass &= gp;
         free(x1); free(yc);
+
+        /* M11 fast-path (int8/dp4a) INFO checks -- see ink_selftest_fast_check.
+         * No-ops for tensors whose type isn't IQ2_XXS/IQ3_XXS. */
+        ink_selftest_fast_check("gate_exps", l->gate_exps, n_embd, m.n_ff_exp);
+        ink_selftest_fast_check("up_exps",   l->up_exps,   n_embd, m.n_ff_exp);
+        ink_selftest_fast_check("down_exps", l->down_exps, m.n_ff_exp, n_embd);
     }
+    g_exact_dequant = saved_exact;
     printf(all_pass ? "SELFTEST PASS (layer %d)\n" : "SELFTEST FAIL (layer %d)\n", layer);
     return all_pass ? 0 : 1;
 }
@@ -1744,8 +2101,16 @@ static void ink_bench_one_tensor(const char *name, const ink_tensor *t, const ui
  * tensor like gate_exps/down_exps under the M8 arena-split rule) instead
  * of making a redundant managed copy, so the number reflects the arena
  * that's actually in play. */
+/* M11: `force_exact` selects which path this bench run measures (the
+ * label printed is "FAST" when g_exact_dequant ends up 0 -- i.e. always,
+ * unless the tensor type isn't dp4a-eligible, in which case FAST and EXACT
+ * are the same kernel/numbers and that's expected).  Restores whatever
+ * g_exact_dequant was set to on the way out. */
 static void ink_bench_group6(const char *name, const ink_tensor *t, const uint8_t *live_base,
-                              uint64_t in, uint64_t out, size_t row_bytes, bool resident_active) {
+                              uint64_t in, uint64_t out, size_t row_bytes, bool resident_active,
+                              bool force_exact) {
+    int saved_exact = g_exact_dequant;
+    g_exact_dequant = force_exact ? 1 : 0;
     const uint32_t NG = 6;
     size_t span = (size_t)NG * out * row_bytes;
 
@@ -1753,13 +2118,18 @@ static void ink_bench_group6(const char *name, const ink_tensor *t, const uint8_
     const uint8_t *base_for_bench = live_base;
     if (!resident_active) {
         mbase = (uint8_t *)ink_cuda_managed_alloc(span);
-        if (!mbase) { fprintf(stderr, "  (skip %s-group6: cudaMallocManaged failed)\n", name); return; }
+        if (!mbase) { fprintf(stderr, "  (skip %s-group6: cudaMallocManaged failed)\n", name); g_exact_dequant = saved_exact; return; }
         CUDA_CHECK(cudaMemcpy(mbase, live_base, span, cudaMemcpyDefault)); /* see note above */
         base_for_bench = mbase;
     }
 
     float *mx = (float *)ink_cuda_managed_alloc(in * sizeof(float));
-    if (!mx) { fprintf(stderr, "  (skip %s-group6: cudaMallocManaged failed)\n", name); if (mbase) cudaFree(mbase); return; }
+    if (!mx) {
+        fprintf(stderr, "  (skip %s-group6: cudaMallocManaged failed)\n", name);
+        if (mbase) cudaFree(mbase);
+        g_exact_dequant = saved_exact;
+        return;
+    }
     ink_fill_rand(mx, in, 0xBEEF03u);
 
     const uint8_t *bases[6];
@@ -1769,7 +2139,7 @@ static void ink_bench_group6(const char *name, const ink_tensor *t, const uint8_
         bases[g] = base_for_bench + (size_t)g * out * row_bytes;
         xs[g] = mx;
         ys[g] = (float *)ink_cuda_managed_alloc(out * sizeof(float));
-        if (!ys[g]) { fprintf(stderr, "  (skip %s-group6: cudaMallocManaged failed)\n", name); return; }
+        if (!ys[g]) { fprintf(stderr, "  (skip %s-group6: cudaMallocManaged failed)\n", name); g_exact_dequant = saved_exact; return; }
     }
 
     for (int i = 0; i < 5; i++) ink_cuda_matvec_group(t, bases, in, out, xs, ys, NG);
@@ -1794,12 +2164,15 @@ static void ink_bench_group6(const char *name, const ink_tensor *t, const uint8_
     size_t be = ink_type_block_elems(t->type), bb = ink_type_block_bytes(t->type);
     size_t bytes = (size_t)NG * out * (in / be) * bb;
     double gbps = ms_per > 0 ? (bytes / 1.0e9) / (ms_per / 1000.0) : 0.0;
-    printf("%-24s type=%2u bytes=%-12zu ms/iter=%.4f GB/s=%.2f arena=%s\n",
-           name, t->type, bytes, ms_per, gbps, resident_active ? "resident" : "managed");
+    bool eligible = (t->type == INK_T_IQ2_XXS || t->type == INK_T_IQ3_XXS);
+    printf("%-24s type=%2u path=%-5s bytes=%-12zu ms/iter=%.4f GB/s=%.2f arena=%s\n",
+           name, t->type, eligible ? (force_exact ? "EXACT" : "FAST") : "n/a",
+           bytes, ms_per, gbps, resident_active ? "resident" : "managed");
 
     for (uint32_t g = 0; g < NG; g++) cudaFree(ys[g]);
     cudaFree(mx);
     if (mbase) cudaFree(mbase);
+    g_exact_dequant = saved_exact;
 }
 
 static int ink_run_bench_layers(const char *model_path, int layer, bool resident, uint64_t resident_budget) {
@@ -1845,10 +2218,18 @@ static int ink_run_bench_layers(const char *model_path, int layer, bool resident
         }
 
         if (nE >= 6) {
-            printf("--- grouped (6-expert, real decode shape) ---\n");
-            ink_bench_group6("gate_exps", l->gate_exps, l->gate_exps->data, n_embd, nf, g_rb, resident);
-            ink_bench_group6("up_exps",   l->up_exps,   l->up_exps->data,   n_embd, nf, u_rb, resident);
-            ink_bench_group6("down_exps", l->down_exps, l->down_exps->data, nf, n_embd, d_rb, resident);
+            /* M11: both paths in one run so the before/after table is
+             * self-generating -- FAST (default int8/dp4a for IQ2_XXS/
+             * IQ3_XXS, identical kernel to EXACT for everything else) and
+             * EXACT (INK_EXACT_DEQUANT=1 forced, the M6-M8 float path). */
+            printf("--- grouped (6-expert, real decode shape), FAST path ---\n");
+            ink_bench_group6("gate_exps", l->gate_exps, l->gate_exps->data, n_embd, nf, g_rb, resident, false);
+            ink_bench_group6("up_exps",   l->up_exps,   l->up_exps->data,   n_embd, nf, u_rb, resident, false);
+            ink_bench_group6("down_exps", l->down_exps, l->down_exps->data, nf, n_embd, d_rb, resident, false);
+            printf("--- grouped (6-expert, real decode shape), EXACT path ---\n");
+            ink_bench_group6("gate_exps", l->gate_exps, l->gate_exps->data, n_embd, nf, g_rb, resident, true);
+            ink_bench_group6("up_exps",   l->up_exps,   l->up_exps->data,   n_embd, nf, u_rb, resident, true);
+            ink_bench_group6("down_exps", l->down_exps, l->down_exps->data, nf, n_embd, d_rb, resident, true);
         }
     }
     return 0;
