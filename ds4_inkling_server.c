@@ -56,6 +56,7 @@
 #include <unistd.h>
 
 #include "ds4_inkling.h"
+#include "ds4_console.h"
 
 #define MAX_HEADER_BYTES  (64 * 1024)
 #define MAX_BODY_BYTES    (1 * 1024 * 1024)
@@ -923,6 +924,77 @@ static bool sse_error_event(int fd, const char *msg) {
 
 /* ============================ request handlers ========================= */
 
+static bool sidecar_path_for(const char *gguf, char *out, size_t out_sz);
+static bool sidecar_get(const char *sidecar, const char *key, char *out, size_t out_sz);
+
+/* GET / and /console: the SAME accretion console page ds4-server serves,
+ * rendered through the shared ds4_console_render() in ds4_console.h -- not
+ * a fork, so the two servers cannot drift.  Sections this backend does not
+ * implement (routing telemetry, expert cache, prewarm) are declared absent
+ * and the page says so rather than polling endpoints that 404.
+ *
+ * This exists because selecting Inkling from the browser used to remove the
+ * browser interface: box operations are supposed to be clicks, and the
+ * model picker has to work in BOTH directions from BOTH servers. */
+static void console_sbuf_write(void *ud, const char *str) {
+    sbuf_appendz((sbuf *)ud, str);
+}
+
+static void handle_console(int fd) {
+    char name[128];
+    ink_str name_s;
+    if (ink_get_str(&g_model.gg, "general.name", &name_s) && name_s.len) {
+        size_t n = name_s.len < sizeof(name) - 1 ? name_s.len : sizeof(name) - 1;
+        memcpy(name, name_s.ptr, n);
+        name[n] = '\0';
+    } else {
+        snprintf(name, sizeof(name), "inkling-small");
+    }
+    uint64_t trained;
+    if (!read_kv_u64(&g_model.gg, "inkling.context_length", &trained)) trained = 1048576;
+
+    /* Serving mode + recorded references come from the active model's
+     * sidecar, by the same rule /v1/models/available uses. */
+    const char *mode = "unknown";
+    char dtps[24] = "", ptps[24] = "";
+    {
+        char sc[PATH_MAX + 8], v[1024];
+        if (g_model_path && sidecar_path_for(g_model_path, sc, sizeof(sc)) &&
+            access(sc, R_OK) == 0) {
+            const bool streamed =
+                sidecar_get(sc, "DS4_EXTRA_FLAGS", v, sizeof(v)) &&
+                strstr(v, "--ssd-streaming") != NULL;
+            mode = streamed ? "batch" : "interactive";
+            sidecar_get(sc, "DS4_DECODE_TPS_REFERENCE", dtps, sizeof(dtps));
+            sidecar_get(sc, "DS4_PREFILL_TPS_REFERENCE", ptps, sizeof(ptps));
+        }
+    }
+
+    ds4_console_facts f;
+    memset(&f, 0, sizeof(f));
+    f.model_name = name;
+    f.architecture = "inkling";
+    f.quant_summary = NULL;      /* not summarized on this backend */
+    f.backend = backend_name();
+    f.resident = g_resident;
+    f.resident_known = true;
+    f.sessions = g_sessions;
+    f.ctx_configured = g_model.n_ctx;
+    f.ctx_trained = trained;
+    f.mode = mode;
+    f.decode_tps_ref = dtps;
+    f.prefill_tps_ref = ptps;
+    f.has_routing_stats = false;   /* honest: not implemented here */
+    f.has_expert_cache = false;
+    f.has_prewarm = false;
+
+    sbuf out; sbuf_init(&out);
+    ds4_console_render(&f, console_sbuf_write, &out);
+    http_send_status(fd, 200, "OK", "text/html; charset=utf-8", out.p ? out.p : "", out.len);
+    sbuf_free(&out);
+    fprintf(stderr, "GET /console 200 - - -\n");
+}
+
 static void handle_capabilities(int fd) {
     ink_str name_s;
     char name[256];
@@ -1701,6 +1773,9 @@ static void handle_connection(int fd) {
     }
 
     if (!strcmp(req.method, "GET") &&
+        (!strcmp(req.path, "/") || !strcmp(req.path, "/console"))) {
+        handle_console(fd);
+    } else if (!strcmp(req.method, "GET") &&
         (!strcmp(req.path, "/v1/capabilities") || !strcmp(req.path, "/capabilities"))) {
         handle_capabilities(fd);
     } else if (!strcmp(req.method, "GET") && !strcmp(req.path, "/v1/models")) {

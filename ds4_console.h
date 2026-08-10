@@ -148,6 +148,11 @@ static const char ds4_console_html_tail[] =
     "  }).catch(function(){});\n"
     "}\n"
     "function pollRouting(){\n"
+    /* Sections below exist only on backends that implement them; the server
+     * declares what it has in window.DS4C (see ds4_console_render) so the
+     * page degrades honestly instead of polling a 404 and sitting blank. */
+    "  if(!(window.DS4C&&DS4C.routing)){\n"
+    "    document.getElementById(\"rt-summary\").textContent=\"not available for this architecture\";return;}\n"
     "  fetch(\"/v1/routing-stats\").then(function(r){return r.json();}).then(function(rs){\n"
     "    if(!rs.enabled||!rs.totals||!rs.totals.selections){\n"
     "      document.getElementById(\"rt-summary\").textContent=\"routing counters \"+(rs.enabled?\"warming (no selections yet)\":\"disabled\");return;}\n"
@@ -224,5 +229,123 @@ static const char ds4_console_html_tail[] =
     "</body>\n"
     "</html>\n"
     "\n";
+
+/* ---------------------------------------------------------------------
+ * Shared server-side rendering.
+ *
+ * Both ds4-server and ds4-inkling-server serve this page, and neither may
+ * fork it: they populate ds4_console_facts and call ds4_console_render(),
+ * which emits head + STATUS + capability declaration + tail through a
+ * caller-supplied writer (the two servers have different buffer types, so
+ * the writer is a callback rather than a shared buf).  Fields left
+ * NULL/0/false are simply not rendered, so a backend never has to
+ * fabricate a value it does not have. */
+
+typedef void (*ds4_console_write_fn)(void *ud, const char *str);
+
+typedef struct {
+    const char *model_name;         /* required */
+    const char *architecture;       /* e.g. "deepseek4" / "inkling" */
+    const char *quant_summary;      /* pre-joined, may be NULL */
+    const char *backend;            /* "cuda" / "cpu" / NULL if n/a */
+    const char *mode;               /* "interactive" / "batch" / "unknown" */
+    const char *decode_tps_ref;     /* "" or NULL when unknown */
+    const char *prefill_tps_ref;
+    unsigned long long ctx_configured;
+    unsigned long long ctx_trained;
+    int sessions;                   /* 0 = do not render */
+    bool resident;
+    bool resident_known;
+    /* Backend capabilities the page's JS keys off (honest degradation). */
+    bool has_routing_stats;
+    bool has_expert_cache;
+    bool has_prewarm;
+} ds4_console_facts;
+
+static void ds4_console_esc(ds4_console_write_fn w, void *ud, const char *s) {
+    char tmp[2];
+    tmp[1] = 0;
+    if (!s) return;
+    for (; *s; s++) {
+        switch (*s) {
+        case '&': w(ud, "&amp;"); break;
+        case '<': w(ud, "&lt;"); break;
+        case '>': w(ud, "&gt;"); break;
+        case '"': w(ud, "&quot;"); break;
+        default: tmp[0] = *s; w(ud, tmp); break;
+        }
+    }
+}
+
+static void ds4_console_kv(ds4_console_write_fn w, void *ud,
+                           const char *label, const char *value) {
+    if (!value || !value[0]) return;
+    w(ud, "<div class=\"kv\"><span>");
+    ds4_console_esc(w, ud, label);
+    w(ud, "</span><b>");
+    ds4_console_esc(w, ud, value);
+    w(ud, "</b></div>");
+}
+
+static void ds4_console_render(const ds4_console_facts *f,
+                               ds4_console_write_fn w, void *ud) {
+    char num[128];
+
+    w(ud, ds4_console_html_head);
+
+    ds4_console_kv(w, ud, "model", f->model_name);
+    ds4_console_kv(w, ud, "architecture", f->architecture);
+    ds4_console_kv(w, ud, "quantization", f->quant_summary);
+
+    if (f->ctx_configured || f->ctx_trained) {
+        snprintf(num, sizeof(num), "%llu configured / %llu trained",
+                 f->ctx_configured, f->ctx_trained);
+        w(ud, "<div class=\"kv ctx\"><span>context</span><b>");
+        ds4_console_esc(w, ud, num);
+        w(ud, "</b></div>");
+    }
+
+    if (f->backend && f->backend[0]) {
+        w(ud, "<div class=\"kv\"><span>backend</span><b><i class=\"badge\">");
+        ds4_console_esc(w, ud, f->backend);
+        w(ud, "</i>");
+        if (f->resident_known) w(ud, f->resident ? " resident" : " streamed");
+        w(ud, "</b></div>");
+    }
+
+    if (f->sessions > 0) {
+        snprintf(num, sizeof(num), "%d", f->sessions);
+        ds4_console_kv(w, ud, "sessions", num);
+    }
+
+    if (f->mode && f->mode[0]) {
+        w(ud, "<div class=\"kv\"><span>mode</span><b><i class=\"badge ");
+        ds4_console_esc(w, ud, f->mode);
+        w(ud, "\">");
+        ds4_console_esc(w, ud, f->mode);
+        w(ud, "</i>");
+        if (f->decode_tps_ref && f->decode_tps_ref[0]) {
+            w(ud, " ");
+            ds4_console_esc(w, ud, f->decode_tps_ref);
+            w(ud, " t/s decode ref");
+        }
+        if (f->prefill_tps_ref && f->prefill_tps_ref[0]) {
+            w(ud, " &middot; ");
+            ds4_console_esc(w, ud, f->prefill_tps_ref);
+            w(ud, " t/s prefill ref");
+        }
+        w(ud, "</b></div>");
+    }
+
+    /* Capability declaration consumed by the page's JS. */
+    snprintf(num, sizeof(num),
+             "<script>window.DS4C={routing:%s,expert_cache:%s,prewarm:%s};</script>",
+             f->has_routing_stats ? "true" : "false",
+             f->has_expert_cache ? "true" : "false",
+             f->has_prewarm ? "true" : "false");
+    w(ud, num);
+
+    w(ud, ds4_console_html_tail);
+}
 
 #endif /* DS4_CONSOLE_H */

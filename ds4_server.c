@@ -13047,37 +13047,37 @@ static bool sidecar_path_for(const char *gguf, char *out, size_t out_sz);
 static bool sidecar_get(const char *sidecar, const char *key,
                         char *out, size_t out_sz);
 
+/* Writer adapter: the shared renderer in ds4_console.h speaks a callback,
+ * this server speaks buf. */
+static void console_buf_write(void *ud, const char *str) {
+    buf_puts((buf *)ud, str);
+}
+
 static bool send_console(server *s, int fd) {
     const ds4_capabilities *c = &s->caps;
     buf b = {0};
-    buf_puts(&b, ds4_console_html_head);
-
-    buf_puts(&b, "<div class=\"kv\"><span>model</span><b>");
-    buf_html_escape(&b, c->model_name);
-    buf_puts(&b, "</b></div><div class=\"kv\"><span>quantization</span><b>");
-    bool first = true;
+    char quant[256];
+    size_t qn = 0;
+    quant[0] = 0;
     for (int i = 0; i < c->quant_category_count; i++) {
         if (c->quant[i].tensors == 0) continue;
-        if (!first) buf_puts(&b, " &middot; ");
-        first = false;
-        buf_html_escape(&b, c->quant[i].category);
-        buf_putc(&b, ' ');
-        buf_html_escape(&b, c->quant[i].quants);
+        int n = snprintf(quant + qn, sizeof(quant) - qn, "%s%s %s",
+                         qn ? " \xc2\xb7 " : "", c->quant[i].category,
+                         c->quant[i].quants);
+        if (n < 0 || (size_t)n >= sizeof(quant) - qn) break;
+        qn += (size_t)n;
     }
+
     const unsigned long long trained =
         c->rope_original_context_length ? c->rope_original_context_length
                                         : c->trained_context_length;
-    buf_printf(&b,
-        "</b></div><div class=\"kv ctx\"><span>context</span>"
-        "<b>%d configured / %llu trained</b></div>",
-        s->ctx_size, trained);
 
     /* Active model's serving mode, from its sidecar (same rule as
-     * /v1/models/available): streamed flags -> batch, resident -> interactive,
-     * no sidecar -> unknown. */
+     * /v1/models/available): streamed flags -> batch, resident ->
+     * interactive, no sidecar -> unknown. */
+    const char *mode = "unknown";
+    char tps[24] = "";
     {
-        const char *mode = "unknown";
-        char tps[24] = "";
         char sc[PATH_MAX + 8], v[1024];
         if (s->model_realpath[0] &&
             sidecar_path_for(s->model_realpath, sc, sizeof(sc)) &&
@@ -13088,18 +13088,21 @@ static bool send_console(server *s, int fd) {
             mode = streamed ? "batch" : "interactive";
             sidecar_get(sc, "DS4_DECODE_TPS_REFERENCE", tps, sizeof(tps));
         }
-        buf_printf(&b,
-            "<div class=\"kv\"><span>mode</span>"
-            "<b><i class=\"badge %s\">%s</i>", mode, mode);
-        if (tps[0]) {
-            buf_puts(&b, " ");
-            buf_html_escape(&b, tps);
-            buf_puts(&b, " t/s ref");
-        }
-        buf_puts(&b, "</b></div>");
     }
 
-    buf_puts(&b, ds4_console_html_tail);
+    ds4_console_facts f;
+    memset(&f, 0, sizeof(f));
+    f.model_name = c->model_name;
+    f.architecture = c->architecture;
+    f.quant_summary = quant;
+    f.ctx_configured = (unsigned long long)s->ctx_size;
+    f.ctx_trained = trained;
+    f.mode = mode;
+    f.decode_tps_ref = tps;
+    f.has_routing_stats = true;
+    f.has_expert_cache = true;
+    f.has_prewarm = true;
+    ds4_console_render(&f, console_buf_write, &b);
     bool ok = http_response(fd, s->enable_cors, 200,
                             "text/html; charset=utf-8", b.ptr);
     buf_free(&b);
