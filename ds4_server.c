@@ -13026,16 +13026,6 @@ static bool send_activity(server *s, int fd) {
     return ok;
 }
 
-static void buf_html_escape(buf *b, const char *s) {
-    for (; s && *s; s++) {
-        switch (*s) {
-        case '&': buf_puts(b, "&amp;"); break;
-        case '<': buf_puts(b, "&lt;"); break;
-        case '>': buf_puts(b, "&gt;"); break;
-        default: buf_putc(b, *s); break;
-        }
-    }
-}
 
 /* GET / and /console: the accretion web console.  A single self-contained
  * HTML page embedded in the binary (ds4_console.h) -- no external assets,
