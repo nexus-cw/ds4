@@ -460,3 +460,74 @@ Operator steps to make Inkling console-live:
    ~343s before first token; /v1/capabilities appears when up).
 5. Full resident multi-session validation in that window (not
    testable beside production).
+
+## M10: the server was running the CPU engine (task #36, 2026-08-10)
+
+The bug: Makefile built ds4-inkling-server from ds4_inkling_server.c +
+ds4_inkling.c with $(CC) and NO CUDA translation unit, so console-live
+Inkling was served by the correctness-reference CPU engine -- ~2.1 s/
+token and 0.88 t/s prefill against the CLI's 81.5 ms/token and 11.0
+t/s. The banked 12.3 t/s sidecar value was a CLI number the server
+could never deliver. It was invisible because nothing in the API
+reported which engine was live; the M9 API gate checked response
+SHAPES and never timed a token.
+
+Fixes:
+- ds4-inkling-server now links ds4_inkling_cuda.cu via nvcc (main()
+  gated by DS4_INKLING_NO_MAIN) and dispatches prefill AND decode
+  through ink_forward_gpu with the split device arena
+  (ink_cuda_make_resident, exported for the server). Prefill batches at
+  the GPU chunk (128), not 32.
+- --cpu / DS4_INKLING_BACKEND=cpu selects the reference engine;
+  ds4-inkling-server-cpu builds it CUDA-free for hosts without nvcc.
+  The CPU engine is NOT deleted -- it is the correctness oracle.
+- /v1/capabilities reports serving.backend ("cuda"|"cpu") so this class
+  of mistake is visible from the console instead of a stopwatch.
+- accretion scripts/build-release.sh refuses to cut a release without
+  nvcc rather than silently shipping a CPU-linked server.
+- Logits corruption now fails the REQUEST, not the process:
+  ink_logits_ok() is the non-fatal form; checked once after prefill
+  (clean 500, nothing sent yet) and per decode step (500, or an SSE
+  error event when frames are already streaming). CLIs keep the fatal
+  ink_logits_guard.
+
+Verified beside production (could not restart it, see below):
+- Server starts on the GPU engine: "backend cuda", split arena line
+  "3.5 GiB device / 0.5 GiB host", /v1/capabilities serving.backend
+  "cuda".
+- --cpu path starts and serves: "backend cpu", API returns content
+  "The user" for {"messages":[{"role":"user","content":"Capital of
+  France?"}],"max_tokens":3,"temperature":0} (286.9 s -- the CPU
+  engine's real speed, and the reference string for the window check).
+- Guard-to-500 proven for real: the paged test instance tripped the
+  known reclaim-NaN class and returned
+  {"error":{"message":"logits corruption detected..."}} with HTTP 500,
+  and the PROCESS SURVIVED (capabilities 200, activity idle, pid
+  alive). Before this change that was exit(3).
+
+NOT measured: through-the-API decode/prefill t/s. That needs the
+service restarted onto the new binary, which this session's permission
+layer denies (systemctl blocked, as in M5/M9). The binary is staged at
+/opt/accretion/bin/ds4-inkling-server.new. The sidecar's
+DS4_DECODE_TPS_REFERENCE=12.3 / prefill 11.0 remain CLI-measured
+numbers and should be REPLACED with the through-API measurements from
+the run below; expect them slightly under the CLI (per-request state
+reset, chat-template tokens, HTTP framing).
+
+Operator steps (deploy + measure):
+  sudo install -m 755 /opt/accretion/bin/ds4-inkling-server.new \
+      /opt/accretion/bin/ds4-inkling-server
+  sudo systemctl restart ds4-server
+  # confirm the engine is the GPU one BEFORE trusting any number:
+  curl -s localhost:8000/v1/capabilities   # serving.backend must be "cuda"
+  # correctness (must return content "The user"):
+  curl -s -X POST localhost:8000/v1/chat/completions \
+    -H Content-Type:application/json \
+    -d '{"messages":[{"role":"user","content":"Capital of France?"}],"max_tokens":3,"temperature":0}'
+  # decode t/s through the API (32 tokens, watch total time):
+  time curl -s -X POST localhost:8000/v1/chat/completions \
+    -H Content-Type:application/json \
+    -d '{"messages":[{"role":"user","content":"Write one paragraph about rivers."}],"max_tokens":32,"temperature":0}'
+  # prefill t/s through the API: poll /v1/activity during a long-prompt
+  # request and read prefill.tokens_per_second.
+Then update the sidecar DS4_DECODE_TPS_REFERENCE to the measured value.
