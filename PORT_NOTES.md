@@ -531,3 +531,73 @@ Operator steps (deploy + measure):
   # prefill t/s through the API: poll /v1/activity during a long-prompt
   # request and read prefill.tokens_per_second.
 Then update the sidecar DS4_DECODE_TPS_REFERENCE to the measured value.
+
+## M11: int8/dp4a fast path -- fast, numerically sound, and NOT SHIPPABLE
+
+Built (llama.cpp ggml-cuda/vecdotq.cuh technique, MIT, adapted): the
+grouped expert matvecs quantize the activation once per grouped call to
+int8 blocks of 32, then do 8 __dp4a integer dots per 32 weights instead
+of 32 float FMAs, with the codebooks staged in shared memory. Applied
+to IQ2_XXS + IQ3_XXS (the decode carriers) only. Scaling stays pure
+float with the verified db formulas (deliberately not llama.cpp's
+integer sumi*ls/8). Sign application uses a scalar per-byte negate, not
+__vcmpne4/__vsub4 -- a known perf residual.
+
+Speed (bench-layers 2, 6-expert grouped, real decode shape):
+  gate_exps IQ2_XXS  FAST 69.3 GB/s  vs EXACT 50.8  (+36%)
+  up_exps   IQ2_XXS  FAST 69.3       vs EXACT 44.8  (+55%)
+  down_exps IQ3_XXS  FAST 60.5       vs EXACT 42.5  (+42%)
+
+Numerics at matvec granularity: err/ref_rms = 0.297-0.300% against the
+CPU f32 reference, with ref_rms ~4.8-5.5 -- i.e. EXACTLY the int8
+activation-quantization floor. The kernel is not buggy at this level.
+(The harness now prints ref_rms/ref_absmax so this is read off, not
+inferred: an earlier reading of mine called maxreldiff=39.7 "noise near
+zero" and moved on, which was the wrong instinct -- the loose-bound
+flag was right to fire.)
+
+END-TO-END, HOWEVER, IT CHANGES GENERATIONS:
+  prompt "The capital of France is" -> FAST and EXACT identical
+    (12650/13/12650/382/290, " Paris. Paris is the")
+  prompt "The three largest planets in the solar system are"
+    EXACT: " the three largest planets"  (top-1 logit 14.52)
+    FAST:  "The user is asking"          (top-1 logit 12.22)
+A 2.3-logit, 16%-lower top-1 is not what 0.3% per-matvec noise looks
+like after one layer; it is what it looks like after 40 MoE layers of
+accumulation into a 2-bit model's residual stream, or what an
+only-in-full-forward bug looks like. Both hypotheses are open.
+DEFAULT IS THEREFORE THE EXACT PATH (committed); INK_FAST_DEQUANT=1
+opts in for investigation only. Nothing was deployed: the staged
+/opt/accretion/bin/ds4-inkling-server.new is the exact-default build
+(an earlier staging with FAST as default was replaced -- do not deploy
+any binary built before 2026-08-10 18:05).
+
+Projected gain had it been shippable: grouped pool ~39ms -> ~28ms of an
+81.5ms CLI decode => ~70ms CLI, ~10.3 t/s through the API (+12% over
+9.2). Modest, because the remaining decode time is now dominated by
+pools dp4a never touched: Q5_K attention/shexp (~26ms) and the Q4_K
+output head (~7ms).
+
+Answer to the "is it an ALU wall / should we repack to MXFP4" question:
+NOT YET, and the evidence says the ALU levers are not exhausted. Even
+on the fast path the kernels sit ~3.3x below the 225 GB/s device
+ceiling, and three known-unexhausted causes remain, in my order of
+expected value:
+  1. scalar sign construction (ink_pack_signed4 does a 4-iteration
+     per-byte negate where llama.cpp does __vcmpne4 + XOR + __vsub4 --
+     roughly 4x the ALU ops in the innermost loop);
+  2. no ILP/occupancy work at all (rows-per-warp, wider per-thread
+     work; the builder deferred it as too risky to write blind);
+  3. redundant requantization -- gate and up quantize the SAME
+     activation vector twice per layer.
+MXFP4 repacking doubles bytes/token (2.4 -> ~4.8 GiB) to buy near-free
+dequant; at a realistic 150-200 GB/s that is ~24-32ms/token, which a
+fully-optimized dp4a path (2.4 GiB at 120-150 GB/s = 16-20ms) should
+still beat. I would exhaust 1-3 before scoping a prepare-pipeline
+change.
+
+Next-round recommendation (in order): fix the divergence (bisect by
+running the fast path in ONE layer at a time to see whether error
+accumulates smoothly or jumps -- that discriminates accumulation from
+bug); then SIMD sign construction; then extend dp4a to the K-quants,
+which is where the remaining decode time actually is.
