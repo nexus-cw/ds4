@@ -767,3 +767,66 @@ Operator steps to measure M13 through the API:
 If decode does NOT improve, revert ONLY the ILP hunk (keep the Q5_K
 wide loads and the iq2_s sign XOR, which are strict wins) -- the ILP is
 the only change whose benefit depends on the streaming regime.
+
+## M14: the console follows the model (task #37)
+
+The gap: ds4_console.h was wired only into ds4-server, so with Inkling
+serving, GET / answered "no such endpoint". Selecting Inkling from the
+browser removed the browser -- the swap-back API worked, but only by
+curl. Accretion's rule is that box operations are clicks.
+
+Fix, one implementation not two: ds4_console.h gained
+ds4_console_render(), which takes a backend-neutral ds4_console_facts
+struct and writes through a caller-supplied ds4_console_write_fn (the
+two servers have different buffer types, so a callback rather than a
+shared buf). ds4-server's inline rendering moved onto it; its now-dead
+buf_html_escape was removed. ds4-inkling-server gained GET / and
+/console using the same call. Neither server can fork the page.
+
+Honest degradation: the page's JS polled /v1/routing-stats
+unconditionally, which the inkling backend does not implement. The
+renderer now emits window.DS4C={routing,expert_cache,prewarm} from the
+facts, and the routing section reports "not available for this
+architecture" instead of polling a 404 and sitting blank. Nothing is
+fabricated -- fields left NULL/0 are simply not rendered.
+
+Gate (test instance on :8099 beside production):
+- GET / and GET /console -> 200, 12090 bytes, contains "ds4 console".
+- Rendered facts match the JSON: architecture inkling; backend cuda;
+  sessions 2 == /v1/capabilities serving.sessions; "2048 configured /
+  1048576 trained" == context.configured/trained; resident rendered as
+  "streamed" for a non---resident test instance (truthful).
+- window.DS4C={routing:false,expert_cache:false,prewarm:false} and the
+  routing section renders "not available for this architecture".
+- Unknown paths still 404 (routing table intact).
+- Swap direction inkling -> deepseek4, full choreography: models list
+  shows DeepSeek entries loadable:yes (wrapper armed) and laguna/
+  deepseek4-dspark honestly loadable:no; select returned 200
+  {"status":"swapping"}; the env file was rewritten to
+  DS4_MODEL=/data/gguf/DeepSeek-V4-Flash-MXFP4_MOE.gguf and
+  DS4_ARCH=deepseek4; the server drained and exited 42.
+- Reverse direction (deepseek4 -> inkling) is the same shared code path
+  in ds4_server.c (M9, commit b83d8a5) and its binary now REBUILDS
+  clean with the console refactor, but it could not be exercised at
+  runtime here: starting ds4-server needs an 82 GB DeepSeek model
+  resident beside production. It needs the operator window; the
+  coordinator has already verified its list/select_enabled side from
+  production.
+Production was untouched throughout (prod=200 after).
+
+Staged for the operator (nothing installed by me):
+  /opt/accretion/bin/ds4-inkling-server.new  (console + M13 kernels)
+  /opt/accretion/bin/ds4-server.new          (console refactor)
+  sudo install -m 755 /opt/accretion/bin/ds4-inkling-server.new \
+      /opt/accretion/bin/ds4-inkling-server
+  sudo install -m 755 /opt/accretion/bin/ds4-server.new \
+      /opt/accretion/bin/ds4-server
+  sudo systemctl restart ds4-server
+  curl -s -o /dev/null -w '%{http_code}\n' localhost:8000/    # expect 200
+  # then in a browser: STATUS shows inkling/cuda/resident/65536, MODELS
+  # lists both families, and picking a DeepSeek model swaps back with the
+  # console still present on the other side.
+Known cosmetic: building the CUDA TU into the server emits four
+"declared but never referenced" remarks for the CLI-only bench/selftest
+helpers (they are used by ds4-inkling-cuda's main, compiled out here).
+Harmless; left alone rather than restructuring working code late.
