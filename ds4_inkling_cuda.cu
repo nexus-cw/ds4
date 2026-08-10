@@ -100,6 +100,24 @@ static bool ink_layer_is_fast(int il) {
     return il >= g_fast_lo && il <= g_fast_hi;
 }
 
+/* M12: restrict the fast path to one quant TYPE, which for this artifact
+ * separates the two activation distributions feeding it:
+ *   iq2 -> gate_exps/up_exps, whose input is the post-rmsnorm hidden
+ *          state (well-conditioned, roughly gaussian)
+ *   iq3 -> down_exps, whose input is the post-SiLU expert hidden vector
+ *          (heavy-tailed: one outlier sets the per-32-block int8 scale and
+ *          crushes the resolution of the other 31 values)
+ * INK_FAST_TYPES=both (default) | iq2 | iq3 */
+static bool g_fast_iq2 = true, g_fast_iq3 = true;
+
+static void ink_fast_types_parse(void) {
+    const char *v = getenv("INK_FAST_TYPES");
+    if (!v || !v[0] || !strcmp(v, "both")) return;
+    if (!strcmp(v, "iq2")) { g_fast_iq2 = true;  g_fast_iq3 = false; return; }
+    if (!strcmp(v, "iq3")) { g_fast_iq2 = false; g_fast_iq3 = true;  return; }
+    ink_die("INK_FAST_TYPES: expected both|iq2|iq3");
+}
+
 static void *ink_cuda_upload(const void *src, size_t bytes) {
     void *dst = NULL;
     CUDA_CHECK(cudaMalloc(&dst, bytes));
@@ -139,6 +157,7 @@ extern "C" void ink_cuda_init(void) {
     bool want_fast = (fa && fa[0] && strcmp(fa, "0") != 0);
     if (want_fast) { g_fast_lo = 0; g_fast_hi = 1 << 30; }
     ink_fast_layers_parse();
+    ink_fast_types_parse();
     g_exact_dequant = 1;   /* per-layer value is set in ink_forward_gpu */
 }
 
@@ -1042,7 +1061,9 @@ extern "C" void ink_cuda_matvec_group(const ink_tensor *t, const uint8_t *const 
      * fast path by default; INK_EXACT_DEQUANT=1 forces the exact float
      * path everywhere (this is also what --selftest always uses,
      * regardless of the env var -- see ink_run_selftest). */
-    bool fast = !g_exact_dequant && (t->type == INK_T_IQ2_XXS || t->type == INK_T_IQ3_XXS);
+    bool fast = !g_exact_dequant &&
+                ((t->type == INK_T_IQ2_XXS && g_fast_iq2) ||
+                 (t->type == INK_T_IQ3_XXS && g_fast_iq3));
     uint32_t nsub = (uint32_t)(in / 32);
     ink_bench_begin();
     for (uint32_t g0 = 0; g0 < n_group; g0 += INK_GROUP_MAX) {
