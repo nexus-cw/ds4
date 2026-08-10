@@ -307,12 +307,28 @@ __device__ __forceinline__ void dq32_q5_K(const uint8_t *rowp, uint32_t sg, floa
     uint32_t shift = 2 * (local_sg / 2);
     uint8_t u1 = (uint8_t)(1u << shift), u2 = (uint8_t)(2u << shift);
     bool hi = (local_sg & 1) != 0;
+    /* hi selects which of u1/u2 applies for the WHOLE subgroup (loop-
+     * invariant, same algebraic hoist as dq32_q6_K's qh_shift) --
+     * hbit = hi ? (qh[l]&u2) : (qh[l]&u1) becomes (qh[l] & umask). */
+    uint8_t umask = hi ? u2 : u1;
     float dsc = d * sc, dmnm = mn * m;
+    /* M13 item 2: wide (memcpy-safe) 32-bit reads, same technique as
+     * dq32_q6_K -- 8 groups of 4 bytes instead of 32 separate byte loads
+     * for both ql and b->qh; extracting byte `sub` back out gives the
+     * exact same value ql[g*4+sub]/qh[g*4+sub] would have. */
 #pragma unroll
-    for (int l = 0; l < 32; l++) {
-        uint8_t nib = hi ? (ql[l] >> 4) : (ql[l] & 0xF);
-        uint8_t hbit = hi ? ((b->qh[l] & u2) ? 16 : 0) : ((b->qh[l] & u1) ? 16 : 0);
-        w[l] = dsc * (nib + hbit) - dmnm;
+    for (uint32_t g = 0; g < 8; g++) {
+        uint32_t qlw = ink_load_u32(ql + g * 4);
+        uint32_t qhw = ink_load_u32(b->qh + g * 4);
+#pragma unroll
+        for (uint32_t sub = 0; sub < 4; sub++) {
+            uint32_t l = g * 4 + sub;
+            uint8_t qlb = (uint8_t)(qlw >> (8 * sub));
+            uint8_t qhb = (uint8_t)(qhw >> (8 * sub));
+            uint8_t nib = hi ? (qlb >> 4) : (qlb & 0xF);
+            uint8_t hbit = (qhb & umask) ? 16 : 0;
+            w[l] = dsc * (nib + hbit) - dmnm;
+        }
     }
 }
 
@@ -405,7 +421,11 @@ __device__ __forceinline__ void dq32_iq2_s(const uint8_t *rowp, uint32_t sg, flo
 #pragma unroll
         for (uint32_t j = 0; j < 8; j++) {
             uint8_t gbyte = (uint8_t)((gridv >> (8 * j)) & 0xFF);
-            w[l4 * 8 + j] = dl * (float)gbyte * ((sign_byte & tb.kmask_iq2xs[j]) ? -1.f : 1.f);
+            /* M13 item 3 (bonus): same sign-bit XOR already used by
+             * dq32_iq2_xxs/dq32_iq3_xxs since M8 -- bitwise identical to
+             * the compare+select*-1.f this replaces, not previously
+             * applied here. */
+            w[l4 * 8 + j] = ink_signed(dl * (float)gbyte, (sign_byte & tb.kmask_iq2xs[j]) != 0);
         }
     }
 }
@@ -737,26 +757,66 @@ __device__ __forceinline__ void ink_matvec_row_warp(uint32_t type, const uint8_t
 
     for (uint64_t row = warp_global; row < out; row += nwarp_total) {
         const uint8_t *rowp = rowbase + (size_t)row * rowstride_blocks * bb;
-        float acc = 0.0f;
-        for (uint32_t sg = lane; sg < nsub; sg += 32) {
+        /* M13 item 1: 2-way ILP.  The original loop was a single
+         * accumulator with a dependent dequant->dot->acc+= chain per
+         * subgroup, which serializes issue of the NEXT subgroup's dequant
+         * ALU behind THIS subgroup's `acc +=` even though they don't
+         * actually depend on each other.  Splitting the lane's own
+         * stride-32 subgroup sequence into two independent accumulators
+         * (acc0 takes subgroups sg, sg+64, sg+128, ...; acc1 takes
+         * sg+32, sg+96, sg+160, ...) lets the compiler/scheduler overlap
+         * subgroup B's dequant with subgroup A's FMA chain, since acc0 and
+         * acc1 have no dependency on each other until the final merge.
+         *
+         * SUMMATION ORDER, stated explicitly: the per-lane partial sum is
+         * no longer a single left-to-right accumulation over ALL of the
+         * lane's subgroups in ascending sg order.  It is now two
+         * independent left-to-right accumulations -- one over the
+         * even-position subgroups of the lane's sequence, one over the
+         * odd-position ones -- added together in one fixed final step
+         * (acc0 + acc1) before the (unchanged) warp-shuffle reduction
+         * tree.  This is a bounded, deterministic reassociation of the
+         * SAME set of terms (same 32-wide dequant per subgroup, same
+         * float4 loads, same per-element products) -- not a new
+         * approximation and not run-to-run nondeterministic (no atomics,
+         * no data-dependent branching in the split) -- of the same kind
+         * already accepted for the warp-level reduction and the float4
+         * grouping within one subgroup's 32-wide dot. */
+        float acc0 = 0.0f, acc1 = 0.0f;
+        uint32_t sg = lane;
+        for (; sg + 32 < nsub; sg += 64) {
+            float w0[32], w1[32];
+            ink_dq_load32(type, rowp, sg, w0, tb);
+            ink_dq_load32(type, rowp, sg + 32, w1, tb);
+            /* see the (removed) single-chain comment above for the
+             * alignment argument -- unchanged, applies identically to
+             * both offsets since sg and sg+32 are both multiples of 32. */
+            const float4 *xp4a = reinterpret_cast<const float4 *>(xsrc + (size_t)sg * 32);
+            const float4 *xp4b = reinterpret_cast<const float4 *>(xsrc + (size_t)(sg + 32) * 32);
+#pragma unroll
+            for (int l4 = 0; l4 < 8; l4++) {
+                float4 xva = xp4a[l4];
+                float4 xvb = xp4b[l4];
+                acc0 += w0[l4 * 4 + 0] * xva.x + w0[l4 * 4 + 1] * xva.y
+                      + w0[l4 * 4 + 2] * xva.z + w0[l4 * 4 + 3] * xva.w;
+                acc1 += w1[l4 * 4 + 0] * xvb.x + w1[l4 * 4 + 1] * xvb.y
+                      + w1[l4 * 4 + 2] * xvb.z + w1[l4 * 4 + 3] * xvb.w;
+            }
+        }
+        /* leftover: at most one more subgroup (nsub/32 parity for this
+         * lane) -- folded into acc0 by fixed convention. */
+        for (; sg < nsub; sg += 32) {
             float w[32];
             ink_dq_load32(type, rowp, sg, w, tb);
-            /* float4 reads instead of 32 scalar loads: xsrc + sg*32 is
-             * always a 128-byte-aligned offset (sg*32 floats) from a base
-             * that is itself >=16-byte aligned (sx is __align__(16)
-             * shared memory; X is ink_malloc()/malloc(), 16-byte aligned
-             * on every platform this runs on), so this is safe
-             * unconditionally, not just when `in` happens to be a nice
-             * multiple -- the alignment comes from sg*32 being a multiple
-             * of 4 floats, which it always is. */
             const float4 *xp4 = reinterpret_cast<const float4 *>(xsrc + (size_t)sg * 32);
 #pragma unroll
             for (int l4 = 0; l4 < 8; l4++) {
                 float4 xv = xp4[l4];
-                acc += w[l4 * 4 + 0] * xv.x + w[l4 * 4 + 1] * xv.y
-                     + w[l4 * 4 + 2] * xv.z + w[l4 * 4 + 3] * xv.w;
+                acc0 += w[l4 * 4 + 0] * xv.x + w[l4 * 4 + 1] * xv.y
+                      + w[l4 * 4 + 2] * xv.z + w[l4 * 4 + 3] * xv.w;
             }
         }
+        float acc = acc0 + acc1;
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
         if (lane == 0) Y[row] = acc;
