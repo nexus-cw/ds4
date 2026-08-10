@@ -108,12 +108,13 @@ extern "C" void ink_cuda_init(void) {
     CUDA_CHECK(cudaStreamCreate(&g_stream));
 
     /* M11 SAFETY: the int8/dp4a fast path DIVERGES from the exact path on
-     * real prompts (see PORT_NOTES.md M11: prompt 2 picked a different
-     * token 0 with a 2.3-logit gap -- systematic distortion, not int8
-     * rounding), so the exact float path is the DEFAULT and the fast path
-     * is opt-in via INK_FAST_DEQUANT=1 while it is under investigation. */
+     * real prompts (PORT_NOTES.md M11: prompt 2 chose a different token 0
+     * with a 2.3-logit gap -- systematic distortion, not int8 rounding),
+     * so the EXACT float path is the default and the fast path is opt-in
+     * via INK_FAST_DEQUANT=1 while it is under investigation. */
     const char *fa = getenv("INK_FAST_DEQUANT");
-    return !(fa && fa[0] && strcmp(fa, "0") != 0);
+    bool want_fast = (fa && fa[0] && strcmp(fa, "0") != 0);
+    g_exact_dequant = want_fast ? 0 : 1;
 }
 
 /* ========================= device dequantizers =========================
