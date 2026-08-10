@@ -77,6 +77,29 @@ extern "C" void ink_cuda_sync(void) {
  * is the fast path. */
 static int g_exact_dequant = 0;
 
+/* M12 bisect support: enable the dp4a fast path for a LAYER RANGE only, so
+ * the FAST-vs-EXACT divergence can be swept layer by layer.
+ *   INK_FAST_LAYERS=none (default) | all | N | LO-HI
+ * INK_FAST_DEQUANT=1 is equivalent to INK_FAST_LAYERS=all.  g_exact_dequant
+ * is re-derived per layer inside ink_forward_gpu(); selftest/bench paths
+ * set it directly and are unaffected (they pass layer -1). */
+static int g_fast_lo = -1, g_fast_hi = -2;   /* empty range */
+
+static void ink_fast_layers_parse(void) {
+    const char *v = getenv("INK_FAST_LAYERS");
+    if (!v || !v[0]) return;
+    if (!strcmp(v, "none")) { g_fast_lo = -1; g_fast_hi = -2; return; }
+    if (!strcmp(v, "all"))  { g_fast_lo = 0;  g_fast_hi = 1 << 30; return; }
+    int lo = 0, hi = 0;
+    if (sscanf(v, "%d-%d", &lo, &hi) == 2)      { g_fast_lo = lo; g_fast_hi = hi; }
+    else if (sscanf(v, "%d", &lo) == 1)         { g_fast_lo = lo; g_fast_hi = lo; }
+    else ink_die("INK_FAST_LAYERS: expected none|all|N|LO-HI");
+}
+
+static bool ink_layer_is_fast(int il) {
+    return il >= g_fast_lo && il <= g_fast_hi;
+}
+
 static void *ink_cuda_upload(const void *src, size_t bytes) {
     void *dst = NULL;
     CUDA_CHECK(cudaMalloc(&dst, bytes));
@@ -114,7 +137,9 @@ extern "C" void ink_cuda_init(void) {
      * via INK_FAST_DEQUANT=1 while it is under investigation. */
     const char *fa = getenv("INK_FAST_DEQUANT");
     bool want_fast = (fa && fa[0] && strcmp(fa, "0") != 0);
-    g_exact_dequant = want_fast ? 0 : 1;
+    if (want_fast) { g_fast_lo = 0; g_fast_hi = 1 << 30; }
+    ink_fast_layers_parse();
+    g_exact_dequant = 1;   /* per-layer value is set in ink_forward_gpu */
 }
 
 /* ========================= device dequantizers =========================
@@ -1446,6 +1471,8 @@ extern "C" void ink_forward_gpu(ink_model *m, const int *tokens, uint32_t n_tok,
     ink_cuda_rmsnorm(x, x, ink_f32(m->tok_norm), nT, n_embd, m->rms_eps);
 
     for (uint32_t il = 0; il < m->n_layer; il++) {
+        /* M12: the fast path is enabled per layer (see ink_fast_layers_parse) */
+        g_exact_dequant = ink_layer_is_fast((int)il) ? 0 : 1;
         ink_layer *l = &m->layers[il];
         const uint32_t n_head_kv = l->n_head_kv;
         const uint32_t kvw = n_head_kv * hd;
@@ -2343,6 +2370,7 @@ int main(int argc, char **argv) {
     int n_predict = 5;
     uint32_t n_ctx = 512;
     bool dump_tokens = false;
+    const char *logits_out = NULL;
     int selftest_layer = -1;
     bool resident = false;
     uint64_t resident_budget = 0;
@@ -2369,6 +2397,7 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "-n") && i + 1 < argc) n_predict = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-c") && i + 1 < argc) n_ctx = (uint32_t)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--logits-out") && i + 1 < argc) logits_out = argv[++i];
         else if (!strcmp(argv[i], "--dump-tokens")) dump_tokens = true;
         else if (!strcmp(argv[i], "--selftest") && i + 1 < argc) selftest_layer = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--resident")) resident = true;
@@ -2462,6 +2491,14 @@ int main(int argc, char **argv) {
             if (logits[i] > bestv) { bestv = logits[i]; best = (int)i; }
         }
         ink_detokenize(&m.tk, best, buf, sizeof(buf));
+        if (logits_out) {
+            FILE *lf = fopen(logits_out, t == 0 ? "wb" : "ab");
+            if (lf) {
+                fwrite(&best, sizeof(int), 1, lf);
+                fwrite(logits, sizeof(float), m.n_vocab, lf);
+                fclose(lf);
+            }
+        }
         printf("GEN %d: id=%d logit=%.6f text='%s'\n", t, best, bestv, buf);
         fflush(stdout);
         if (best == m.tk.eos) break;
