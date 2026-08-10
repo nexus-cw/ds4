@@ -680,3 +680,90 @@ roughly one extra sweep step of headroom, not a category change; fp16
 activations would abandon dp4a (which is the entire point of the
 exercise). Nothing shipped this round: exact remains the default, and
 no binary was deployed.
+
+## M13: numerics-preserving round -- expert pool +16-49%, identity held
+
+Changes (all in ink_matvec_row_warp + three dq32_*, shared by the exact
+single AND grouped kernels; no fast/dp4a path, quantizer or server
+touched):
+1. 2-way ILP: the lane's dependent dequant->dot->acc chain became two
+   independent accumulators over paired subgroups (sg, sg+32), merged in
+   fixed order before the unchanged shuffle reduction. This is a bounded
+   deterministic REASSOCIATION, not bit-identical -- of the same kind
+   already present in the warp reduction and the float4 grouping.
+2. dq32_q5_K: ql/qh read as 8x4-byte words instead of 32 byte loads,
+   loop-invariant nibble-mask selection hoisted.
+3. dq32_iq2_s: sign-bit XOR (bitwise identical to *-1.f), which the
+   other IQ dequantizers have had since M8.
+Declined by the builder, reasoning accepted: cross-block activation
+dedup (shared memory is per-block; needs a persistent/two-pass kernel)
+and dynamic extern __shared__ sizing (unverifiable blind; silent shared
+corruption is exactly what this round guards against).
+
+IDENTITY GATE -- PASS:
+  selftest matrix (layers 0, 2): all PASS at unchanged tight bounds.
+  planets prompt: top-1 id 290 -> 290, logit 14.516440 -> 14.516437,
+                  full-vector max|dlogit| = 2.06e-05
+  france prompt:  top-1 id 12650 -> 12650, logit 18.536530 -> 18.536531,
+                  full-vector max|dlogit| = 7.63e-06
+Both deltas are fp-reassociation noise, below the selftest's own
+gpu_vs_cpu spread (~4e-05). No token changed.
+
+SPEED, grouped 6-expert at decode shape (rotating over 12 distinct
+expert sets so nothing sits in L2):
+  gate_exps IQ2_XXS  45.30 -> 56.16 GB/s  (+24%)
+  up_exps   IQ2_XXS  48.80 -> 56.61       (+16%)
+  down_exps IQ3_XXS  41.81 -> 62.39       (+49%)
+Per 6-expert set per layer: 1.0132 ms -> 0.7691 ms, i.e. the routed
+expert pool is 24% cheaper. Over 40 MoE layers that is ~40.5 ms ->
+~30.8 ms, saving ~9.8 ms of an 81.5 ms decode.
+
+MEASUREMENT WARNING (recorded in the harness output too): the
+SINGLE-TENSOR bench numbers moved the OTHER way -- wq/wo Q5_K 175 ->
+142 GB/s, gate_exps 70 -> 60. That is the builder's register-pressure
+risk showing up exactly where it should: a single 2-19 MB slice hit 20x
+is L2-RESIDENT, so 2-way ILP costs registers/occupancy while hiding
+latency that does not exist in that regime. Real decode streams six
+experts chosen fresh per layer out of a 76 GiB arena with no reuse --
+the rotating grouped table is the representative one. Earlier notes'
+single-tensor GB/s figures were partly measuring cache and should be
+read with that caveat.
+
+Projected: ~9.8 ms saved on the expert pool, plus whatever the Q5_K
+wide loads give attention in the streaming regime (unmeasurable here
+because the single-tensor bench is in-cache) => ~70-72 ms CLI decode,
+~10.2-10.6 t/s through the API vs 9.2 measured (+11-15%). NOT measured
+end-to-end: the permission layer denies systemctl restart, so the
+staged binary could not be exercised through the API.
+
+Where the time sits afterward, and the bandwidth question: nothing is
+bandwidth-bound yet. The expert pool now runs at 56-62 GB/s against a
+225 GB/s device ceiling, and the dp4a path -- which removes dequant ALU
+entirely -- reaches only 63-66 GB/s on the same shapes. That
+convergence is the informative part: after M13 the exact path is within
+7-11% of the ALU-free path on gate/up and has CAUGHT it on down_exps
+(62.4 vs 62.8). So dequant ALU is no longer the dominant cost; whatever
+now limits both paths is shared (memory latency/occupancy at these
+shapes), and dp4a's remaining advantage has essentially evaporated --
+another reason not to revisit it.
+Next lever, if more decode speed is wanted, is therefore NOT more ALU
+work on these kernels: it is occupancy/latency (persistent kernels,
+dynamic shared sizing, or fusing gate+up so one weight stream feeds two
+outputs), or the prepare-time MXFP4 repack. I would measure a resident
+end-to-end run first -- three of the last four rounds' projections were
+distorted by benchmarking artifacts, and only the API number settles it.
+
+Operator steps to measure M13 through the API:
+  sudo install -m 755 /opt/accretion/bin/ds4-inkling-server.new \
+      /opt/accretion/bin/ds4-inkling-server
+  sudo systemctl restart ds4-server
+  curl -s localhost:8000/v1/capabilities        # backend must be "cuda"
+  curl -s -X POST localhost:8000/v1/chat/completions -H Content-Type:application/json \
+    -d '{"messages":[{"role":"user","content":"Capital of France?"}],"max_tokens":3,"temperature":0}'
+    # expect content "The user" (unchanged from M10 -- identity gate)
+  time curl -s -X POST localhost:8000/v1/chat/completions -H Content-Type:application/json \
+    -d '{"messages":[{"role":"user","content":"Write one paragraph about rivers."}],"max_tokens":32,"temperature":0}'
+    # decode t/s: expect ~10.2-10.6 vs 9.2 baseline
+If decode does NOT improve, revert ONLY the ILP hunk (keep the Q5_K
+wide loads and the iq2_s sign XOR, which are strict wins) -- the ILP is
+the only change whose benefit depends on the streaming regime.
