@@ -107,8 +107,13 @@ extern "C" void ink_cuda_init(void) {
 
     CUDA_CHECK(cudaStreamCreate(&g_stream));
 
-    const char *ex = getenv("INK_EXACT_DEQUANT");
-    g_exact_dequant = (ex && strcmp(ex, "0") != 0 && ex[0] != '\0') ? 1 : 0;
+    /* M11 SAFETY: the int8/dp4a fast path DIVERGES from the exact path on
+     * real prompts (see PORT_NOTES.md M11: prompt 2 picked a different
+     * token 0 with a 2.3-logit gap -- systematic distortion, not int8
+     * rounding), so the exact float path is the DEFAULT and the fast path
+     * is opt-in via INK_FAST_DEQUANT=1 while it is under investigation. */
+    const char *fa = getenv("INK_FAST_DEQUANT");
+    return !(fa && fa[0] && strcmp(fa, "0") != 0);
 }
 
 /* ========================= device dequantizers =========================
@@ -1749,7 +1754,7 @@ static void ink_selftest_fast_check(const char *name, const ink_tensor *t, uint6
     ink_cuda_sync();
     g_exact_dequant = prev;
 
-    double maxabs = 0.0, maxrel = 0.0, sumabs = 0.0;
+    double maxabs = 0.0, maxrel = 0.0, sumabs = 0.0, sumsq = 0.0, ref_absmax = 0.0;
     uint64_t n = 0;
     for (uint32_t g2 = 0; g2 < NG; g2++) {
         ink_matvec(t, bases[g2], in, out, x1, yc); /* CPU f32 exact reference */
@@ -1759,11 +1764,16 @@ static void ink_selftest_fast_check(const char *name, const ink_tensor *t, uint6
             double rel = a / fmax(fabs(ref), 1e-6);
             if (a > maxabs) maxabs = a;
             if (rel > maxrel) maxrel = rel;
-            sumabs += a; n++;
+            if (fabs(ref) > ref_absmax) ref_absmax = fabs(ref);
+            sumabs += a; sumsq += ref * ref; n++;
         }
         free(ys_g[g2]);
     }
+    double ref_rms = n ? sqrt(sumsq / (double)n) : 0.0;
     bool loose_ok = maxrel <= 5e-3;
+    printf("group-matvec(%s,6,FAST-dp4a) ref_rms=%.4g ref_absmax=%.4g "
+           "err/ref_rms=%.3g\n", name, ref_rms, ref_absmax,
+           ref_rms > 0 ? (sumabs / (double)(n ? n : 1)) / ref_rms : 0.0);
     printf("group-matvec(%s,6,FAST-dp4a) maxabsdiff=%.3g maxreldiff=%.3g meanabsdiff=%.3g "
            "%s (INFO only -- loose bound 5e-3 rel, does not affect PASS/FAIL)\n",
            name, maxabs, maxrel, n ? sumabs / (double)n : 0.0, loose_ok ? "within-loose-bound" : "OUTSIDE-loose-bound");
