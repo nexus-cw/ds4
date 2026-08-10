@@ -2171,7 +2171,15 @@ static void ink_bench_group6(const char *name, const ink_tensor *t, const uint8_
     int saved_exact = g_exact_dequant;
     g_exact_dequant = force_exact ? 1 : 0;
     const uint32_t NG = 6;
-    size_t span = (size_t)NG * out * row_bytes;
+    /* CACHE-DEFEAT: benching the same 6 experts 20x measures L2 residency,
+     * not memory bandwidth (a 2 MB expert slice lives in L2 all run, which
+     * is why single-tensor numbers here read 70-175 GB/s while real decode
+     * -- which walks 6 experts chosen fresh per layer out of an 82 GB model
+     * -- never sees that). Stage INK_BENCH_SETS distinct expert sets and
+     * rotate through them so each timed iteration touches memory the
+     * previous ones did not. */
+#define INK_BENCH_SETS 12
+    size_t span = (size_t)NG * INK_BENCH_SETS * out * row_bytes;
 
     uint8_t *mbase = NULL;
     const uint8_t *base_for_bench = live_base;
@@ -2201,7 +2209,10 @@ static void ink_bench_group6(const char *name, const ink_tensor *t, const uint8_
         if (!ys[g]) { fprintf(stderr, "  (skip %s-group6: cudaMallocManaged failed)\n", name); g_exact_dequant = saved_exact; return; }
     }
 
-    for (int i = 0; i < 5; i++) ink_cuda_matvec_group(t, bases, in, out, xs, ys, NG);
+    /* rotate over the staged sets: iteration i uses set (i % INK_BENCH_SETS) */
+    const uint8_t *set_bases[6];
+    for (uint32_t g = 0; g < NG; g++) set_bases[g] = bases[g];
+    for (int i = 0; i < 5; i++) ink_cuda_matvec_group(t, set_bases, in, out, xs, ys, NG);
     ink_cuda_sync();
 
     double total_ms = 0.0;
@@ -2209,8 +2220,12 @@ static void ink_bench_group6(const char *name, const ink_tensor *t, const uint8_
         cudaEvent_t s, e;
         CUDA_CHECK(cudaEventCreate(&s));
         CUDA_CHECK(cudaEventCreate(&e));
+        for (uint32_t g = 0; g < NG; g++) {
+            set_bases[g] = base_for_bench +
+                ((size_t)(i % INK_BENCH_SETS) * NG + g) * out * row_bytes;
+        }
         CUDA_CHECK(cudaEventRecord(s, g_stream));
-        ink_cuda_matvec_group(t, bases, in, out, xs, ys, NG);
+        ink_cuda_matvec_group(t, set_bases, in, out, xs, ys, NG);
         CUDA_CHECK(cudaEventRecord(e, g_stream));
         CUDA_CHECK(cudaEventSynchronize(e));
         float ms = 0.0f;
