@@ -601,3 +601,82 @@ running the fast path in ONE layer at a time to see whether error
 accumulates smoothly or jumps -- that discriminates accumulation from
 bug); then SIMD sign construction; then extend dp4a to the K-quants,
 which is where the remaining decode time actually is.
+
+## M12: divergence bisect -- verdict ACCUMULATION, not a bug
+
+Harness: INK_FAST_LAYERS=none|all|N|LO-HI gates the dp4a path per layer,
+INK_FAST_TYPES=both|iq2|iq3 gates it per quant type (for this artifact
+iq2 = gate/up, iq3 = down), --logits-out dumps the full logits vector so
+every step is diffed against the all-exact reference. One generated
+token per run (the logits after prefill are what matter).
+
+Sweep, prompt "The three largest planets in the solar system are"
+(reference top-1 id=290 ' the', logit 14.5164):
+  fast layers   top1     logit     max|dlogit|   token
+  none          290      14.5164   0.00000       same
+  0             290      14.5164   0.00000       same
+  0-1           290      14.5164   0.00000       same
+  0-3           79575    13.9833   2.66460       CHANGED
+  0-7           279      10.7750   5.46189       CHANGED
+  0-15          976      12.2558   7.42159       CHANGED
+  0-31          976      12.2265   7.37926       CHANGED
+  all           976      12.2241   7.39743       CHANGED
+Same sweep, "The capital of France is": token NEVER changes, max|dlogit|
+stays in 0.18-0.60 -- a high-confidence prompt absorbs the perturbation.
+
+Follow-ups (all layers unless noted), planets prompt:
+  iq2 only (gate/up)   top1 290 same   max|dlogit| 1.59518
+  iq3 only (down)      top1 290 same   max|dlogit| 2.12886
+  layers 32-41 only    top1 290 same   max|dlogit| 0.06307
+  layers 20-41 only    top1 290 same   max|dlogit| 0.09527
+  both types, all      top1 976 CHANGED max|dlogit| 7.39743
+
+VERDICT: accumulation. Five independent pieces of evidence, no
+discontinuity anywhere:
+1. Layers 0-1 are the DENSE blocks -- no expert matvecs, and the delta
+   is exactly 0.00000, so the gating is sound and nothing leaks.
+2. Growth across the sweep is monotone then saturating (2.66 -> 5.46 ->
+   7.42 -> 7.38 -> 7.40). A bug in one layer/expert/edge case would show
+   as a jump at a specific step; there is none.
+3. Neither quant type dominates (1.60 vs 2.13) -- inconsistent with a
+   format-specific coding defect in one dequantizer. It also refutes my
+   own heavy-tail hypothesis: post-SiLU inputs (iq3) are only modestly
+   worse than post-rmsnorm inputs (iq2), not categorically worse.
+4. The effect is governed by DEPTH POSITION, smoothly: the last 10
+   layers cost 0.063, the last 22 cost 0.095, all 40 cost 7.40. Error
+   injected early is amplified by the remaining layers; error injected
+   late has no depth left to amplify it. A bug would not track position
+   this cleanly.
+5. The two types are strongly super-additive (1.60 + 2.13 = 3.7 alone,
+   7.40 together), the signature of nonlinear amplification through a
+   deep 2-bit model rather than additive noise.
+So the int8 activation floor (measured 0.30% per matvec on synthetic
+data) is real and irreducible at this precision, and 40 MoE layers of a
+2-bit model amplify it past the point where top-1 survives on
+lower-confidence prompts.
+
+IS dp4a USABLE ANYWHERE? Yes, but the honest win is small:
+- SAFE: late layers. Layers 20-41 (22 of 40 MoE layers, ~55% of expert
+  traffic) move the logits by 0.095 and change no token on either
+  prompt. The output head (Q4_K, the very last matvec) is by the same
+  argument the safest place of all -- nothing downstream to amplify.
+- NOT SAFE: early/middle layers, at any precision int8 can offer.
+- Expected gain if we took the safe part: expert pool ~39ms of an
+  81.5ms decode, 55% of it at +40% => ~6ms, i.e. ~75ms CLI / ~9.8 t/s
+  through the API, +7% over 9.2. Adding the head is maybe +3ms more.
+Recommendation: do NOT adopt dp4a for a ~7-10% gain that costs a
+behavioural change we would have to re-validate on every prompt class.
+Spend the next round on the numerics-PRESERVING levers instead, which
+are untouched and which the exact path also benefits from: ILP and
+occupancy (rows-per-warp, wider per-thread work) on the exact kernels,
+which still sit at 42-54 GB/s against a 225 GB/s device ceiling -- a 4x
+gap that costs nothing in accuracy to attack. Revisit dp4a only if a
+late-layers-only mode is wanted after that, and only with the sweep
+above rerun as its gate.
+
+Higher-precision activations: not promising. The failure is depth
+amplification of a per-matvec error, so a 2x-finer activation grid buys
+roughly one extra sweep step of headroom, not a category change; fp16
+activations would abandon dp4a (which is the entire point of the
+exercise). Nothing shipped this round: exact remains the default, and
+no binary was deployed.
