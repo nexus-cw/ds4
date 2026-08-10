@@ -2202,6 +2202,13 @@ static void ink_bench_one_tensor(const char *name, const ink_tensor *t, const ui
     }
     double ms_per = total_ms / 20.0;
     double gbps = ms_per > 0 ? (bytes / 1.0e9) / (ms_per / 1000.0) : 0.0;
+    /* NOTE: single-tensor numbers here are L2-RESIDENT (one ~2-19 MB slice
+     * hammered 20x) and therefore optimistic -- real decode streams six
+     * experts chosen fresh per layer out of a 76 GiB arena with no reuse.
+     * They also move the WRONG way under M13's 2-way ILP, which trades
+     * registers for latency hiding that an in-cache benchmark has no
+     * latency to hide. Read the rotating grouped table below for
+     * decode-representative rates. */
     printf("%-24s type=%2u bytes=%-12zu ms/iter=%.4f GB/s=%.2f\n",
            name, t->type, bytes, ms_per, gbps);
 
