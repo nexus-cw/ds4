@@ -686,6 +686,12 @@ static ink_model g_model;
 static int g_end_message_id = -1;
 static uint32_t g_max_tokens_cap = 512;
 static int g_sessions = 2;
+/* Wall-clock ceiling on one request, measured from arrival so queue wait
+ * counts; 0 disables it.  A caller-side timeout cannot bound the work on
+ * its own: a peer that has given up but stays connected -- an intermediary
+ * that does not propagate cancellation, say -- holds its session for the
+ * whole generation.  This is the backstop that does not trust the client. */
+static double g_max_request_seconds = 0.0;
 static bool g_resident = false;
 static const char *g_model_path;
 static char g_model_realpath[PATH_MAX];
@@ -1016,11 +1022,12 @@ static void handle_capabilities(int fd) {
     sbuf_appendf(&out,
         "\",\"architecture\":\"inkling\",\"parameters\":%llu,\"file_bytes\":%llu},"
         "\"context\":{\"configured\":%u,\"trained\":%llu},"
-        "\"serving\":{\"resident\":%s,\"sessions\":%d,\"backend\":\"%s\"},"
+        "\"serving\":{\"resident\":%s,\"sessions\":%d,\"max_request_seconds\":%.0f,\"backend\":\"%s\"},"
         "\"apis\":{\"openai_chat_completions\":true,\"sse_streaming\":true}",
         (unsigned long long)params, (unsigned long long)g_model.gg.map_len,
         g_model.n_ctx, (unsigned long long)trained,
-        g_resident ? "true" : "false", g_sessions, backend_name());
+        g_resident ? "true" : "false", g_sessions, g_max_request_seconds,
+        backend_name());
     const char *tp = getenv("DS4_CAPS_THROUGHPUT_JSON");
     if (tp && tp[0] == '{') {
         sbuf_appendz(&out, ",\"throughput\":");
@@ -1534,6 +1541,33 @@ static bool client_gone(int fd) {
     return false;
 }
 
+static bool job_expired(const job *j) {
+    return g_max_request_seconds > 0.0 &&
+           (ink_now_sec() - j->t0) > g_max_request_seconds;
+}
+
+/* Close out a job that hit the deadline.  Split out because it fires from
+ * three places (queued too long, mid-prefill, mid-decode) and the wire
+ * format differs once streaming headers have already gone out. */
+static void deadline_reply(job *j, bool headers_sent) {
+    char msg[192];
+    snprintf(msg, sizeof(msg),
+             "deadline_exceeded: request exceeded the server limit of %.0fs "
+             "(--max-request-seconds / DS4_MAX_REQUEST_SECONDS)",
+             g_max_request_seconds);
+    j->finish_reason = "deadline_exceeded";
+    if (j->stream) {
+        if (!headers_sent) sse_send_headers(j->fd);
+        sse_error_event(j->fd, msg);
+        send_all(j->fd, "data: [DONE]\n\n", 14);
+        j->status = 200;
+    } else {
+        http_send_error_typed(j->fd, 503, "Service Unavailable",
+                              "deadline_exceeded", msg);
+        j->status = 503;
+    }
+}
+
 /* Runs entirely on the single worker thread: the only code in this file
  * that touches g_model's mutable engine state (KV cache, shortconv state).
  * Writes the full HTTP/SSE response directly to j->fd. */
@@ -1548,6 +1582,16 @@ static void run_job(job *j) {
     long id_num = ++g_req_counter;
     snprintf(j->id, sizeof(j->id), "chatcmpl-%ld", id_num);
     long now = (long)time(NULL);
+
+    /* Already past the deadline while queued: answer now rather than start
+     * work whose caller has waited longer than the limit permits. */
+    if (job_expired(j)) {
+        slot->state = 0;
+        j->prompt_tokens = j->n_tokens;
+        j->completion_tokens = 0;
+        deadline_reply(j, false);
+        return;
+    }
 
     /* Defensive re-check: the connection thread already validated this
      * before enqueueing (ctx never changes at runtime), so this should be
@@ -1581,6 +1625,14 @@ static void run_job(job *j) {
          * slot stays busy for the entire sweep with nobody left to read the
          * answer.  One poll() per chunk is microseconds against a chunk of
          * tens of ms or more. */
+        if (job_expired(j)) {
+            free(logits);
+            slot->state = 0;
+            j->prompt_tokens = j->n_tokens;
+            j->completion_tokens = 0;
+            deadline_reply(j, false);
+            return;
+        }
         if (client_gone(j->fd)) {
             free(logits);
             slot->state = 0;
@@ -1616,6 +1668,7 @@ static void run_job(job *j) {
     bool ok = true;
     bool corrupt = false;
     bool aborted = false;
+    bool timed_out = false;
     if (j->stream) {
         ok = sse_send_headers(j->fd);
         if (ok) ok = sse_first_frame(j->fd, j->id, now);
@@ -1632,6 +1685,7 @@ static void run_job(job *j) {
          * non-streaming path buffers to the end and never notices at all.
          * Check explicitly so both bail at the same point. */
         if (client_gone(j->fd)) { aborted = true; break; }
+        if (job_expired(j)) { timed_out = true; break; }
         /* never emit token 0 off a NaN-poisoned vector: stop this request */
         if (!ink_logits_ok(logits, g_model.n_vocab, g_model.n_vocab_unpadded,
                            "server decode")) { corrupt = true; break; }
@@ -1670,6 +1724,15 @@ static void run_job(job *j) {
          * tells an abandoned request apart from a real failure. */
         j->finish_reason = "client_disconnect";
         j->status = 499;
+        sbuf_free(&text);
+        return;
+    }
+
+    if (timed_out) {
+        /* Streaming has already sent headers and frames, so the deadline
+         * has to close the stream with an error event; non-streaming can
+         * still return a real 503. */
+        deadline_reply(j, j->stream);
         sbuf_free(&text);
         return;
     }
@@ -1902,6 +1965,8 @@ int main(int argc, char **argv) {
     uint32_t max_tokens_cap = 512;
     int sessions = 2;
     bool have_sessions_flag = false;
+    double max_request_seconds = 0.0;
+    bool have_deadline_flag = false;
     bool resident = false;
     bool force_cpu = false;
     uint64_t resident_budget_bytes = 0;
@@ -1913,6 +1978,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-H") && i + 1 < argc) host = argv[++i];
         else if (!strcmp(argv[i], "-t") && i + 1 < argc) max_tokens_cap = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "-s") && i + 1 < argc) { sessions = atoi(argv[++i]); have_sessions_flag = true; }
+        else if (!strcmp(argv[i], "--max-request-seconds") && i + 1 < argc) {
+            max_request_seconds = atof(argv[++i]);
+            have_deadline_flag = true;
+        }
         else if (!strcmp(argv[i], "--cpu")) force_cpu = true;
         else if (!strcmp(argv[i], "--resident")) resident = true;
         else if (!strcmp(argv[i], "--resident-budget") && i + 1 < argc) {
@@ -1921,14 +1990,14 @@ int main(int argc, char **argv) {
         } else {
             fprintf(stderr,
                 "usage: ds4-inkling-server -m model.gguf [-c CTX] [-p PORT] [-H HOST] "
-                "[-t MAX_TOKENS_CAP] [-s SESSIONS] [--resident] [--resident-budget GiB] [--cpu]\n");
+                "[-t MAX_TOKENS_CAP] [-s SESSIONS] [--max-request-seconds S] [--resident] [--resident-budget GiB] [--cpu]\n");
             return 1;
         }
     }
     if (!model_path) {
         fprintf(stderr,
             "usage: ds4-inkling-server -m model.gguf [-c CTX] [-p PORT] [-H HOST] "
-            "[-t MAX_TOKENS_CAP] [-s SESSIONS] [--resident] [--resident-budget GiB] [--cpu]\n");
+            "[-t MAX_TOKENS_CAP] [-s SESSIONS] [--max-request-seconds S] [--resident] [--resident-budget GiB] [--cpu]\n");
         return 1;
     }
     if (!have_ctx_flag) {
@@ -1939,9 +2008,15 @@ int main(int argc, char **argv) {
         const char *e = getenv("DS4_SESSIONS");
         if (e && e[0]) sessions = atoi(e);
     }
+    if (!have_deadline_flag) {
+        const char *e = getenv("DS4_MAX_REQUEST_SECONDS");
+        if (e && e[0]) max_request_seconds = atof(e);
+    }
+    if (max_request_seconds < 0.0) max_request_seconds = 0.0;
     if (sessions < 1) sessions = 1;
     g_max_tokens_cap = max_tokens_cap;
     g_sessions = sessions;
+    g_max_request_seconds = max_request_seconds;
     g_resident = resident;
     g_model_path = model_path;
 
@@ -2030,8 +2105,14 @@ int main(int argc, char **argv) {
     if (listen(lfd, 64) < 0) diesys("listen");
     g_listen_fd = lfd;
 
-    fprintf(stderr, "ds4-inkling-server: listening on http://%s:%d (sessions=%d, max_tokens cap %u)\n",
-            host, port, g_sessions, g_max_tokens_cap);
+    if (g_max_request_seconds > 0.0)
+        fprintf(stderr, "ds4-inkling-server: listening on http://%s:%d "
+                "(sessions=%d, max_tokens cap %u, max request %.0fs)\n",
+                host, port, g_sessions, g_max_tokens_cap, g_max_request_seconds);
+    else
+        fprintf(stderr, "ds4-inkling-server: listening on http://%s:%d "
+                "(sessions=%d, max_tokens cap %u, no request deadline)\n",
+                host, port, g_sessions, g_max_tokens_cap);
 
     while (!g_stop) {
         int fd = accept(lfd, NULL, NULL);
