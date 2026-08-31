@@ -40,6 +40,7 @@
 #include <limits.h>
 #include <math.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -1511,6 +1512,28 @@ static void handle_models_select(int fd, const http_request *hr) {
 
 /* ========================= chat completions (job) ======================= */
 
+/* Has the peer hung up?  A job holds its session slot for its whole
+ * lifetime, so an abandoned request keeps a slot busy until generation ends
+ * on its own -- on a long prefill that is hours, and g_sessions of them
+ * wedge the server for everyone.  Non-destructive: POLLHUP/POLLERR cover a
+ * closed or reset socket, and a readable socket is only "gone" if a peek
+ * sees EOF, so a pipelined byte is left in the buffer untouched.  Avoids
+ * POLLRDHUP so the file still builds without _GNU_SOURCE. */
+static bool client_gone(int fd) {
+    struct pollfd p;
+    p.fd = fd; p.events = POLLIN; p.revents = 0;
+    if (poll(&p, 1, 0) <= 0) return false;
+    if (p.revents & (POLLHUP | POLLERR | POLLNVAL)) return true;
+    if (p.revents & POLLIN) {
+        char c;
+        ssize_t n = recv(fd, &c, 1, MSG_PEEK);
+        if (n == 0) return true;
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+            return true;
+    }
+    return false;
+}
+
 /* Runs entirely on the single worker thread: the only code in this file
  * that touches g_model's mutable engine state (KV cache, shortconv state).
  * Writes the full HTTP/SSE response directly to j->fd. */
@@ -1554,6 +1577,19 @@ static void run_job(job *j) {
     double prefill_t0 = ink_now_sec();
     const int chunk = engine_prefill_chunk();
     for (int i = 0; i < j->n_tokens; i += chunk) {
+        /* A long prefill is where an abandoned request costs the most: the
+         * slot stays busy for the entire sweep with nobody left to read the
+         * answer.  One poll() per chunk is microseconds against a chunk of
+         * tens of ms or more. */
+        if (client_gone(j->fd)) {
+            free(logits);
+            slot->state = 0;
+            j->prompt_tokens = j->n_tokens;
+            j->completion_tokens = 0;
+            j->finish_reason = "client_disconnect";
+            j->status = 499;
+            return;
+        }
         int n = j->n_tokens - i < chunk ? j->n_tokens - i : chunk;
         bool last = (i + n == j->n_tokens);
         engine_forward_batch(&g_model, j->tokens + i, (uint32_t)n, (uint32_t)i, last ? logits : NULL);
@@ -1579,6 +1615,7 @@ static void run_job(job *j) {
 
     bool ok = true;
     bool corrupt = false;
+    bool aborted = false;
     if (j->stream) {
         ok = sse_send_headers(j->fd);
         if (ok) ok = sse_first_frame(j->fd, j->id, now);
@@ -1590,6 +1627,11 @@ static void run_job(job *j) {
     uint32_t pos = (uint32_t)j->n_tokens;
 
     for (long t = 0; ok && t < j->max_tokens; t++) {
+        /* The streaming path would eventually notice a dead peer through a
+         * failed frame write, but only after paying for the token; the
+         * non-streaming path buffers to the end and never notices at all.
+         * Check explicitly so both bail at the same point. */
+        if (client_gone(j->fd)) { aborted = true; break; }
         /* never emit token 0 off a NaN-poisoned vector: stop this request */
         if (!ink_logits_ok(logits, g_model.n_vocab, g_model.n_vocab_unpadded,
                            "server decode")) { corrupt = true; break; }
@@ -1620,6 +1662,17 @@ static void run_job(job *j) {
     j->prompt_tokens = prompt_tokens;
     j->completion_tokens = completion_tokens;
     j->finish_reason = finish_reason;
+
+    if (aborted) {
+        /* Nobody to answer: write nothing to a dead socket and just return,
+         * which lets the connection thread release the slot immediately.
+         * 499 mirrors nginx's "client closed request" so the access log
+         * tells an abandoned request apart from a real failure. */
+        j->finish_reason = "client_disconnect";
+        j->status = 499;
+        sbuf_free(&text);
+        return;
+    }
 
     if (corrupt) {
         /* Mid-generation corruption: streaming already sent frames, so the
